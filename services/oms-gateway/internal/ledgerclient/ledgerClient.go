@@ -165,6 +165,58 @@ func (client *LedgerClient) PostMarginFundingRepaymentJournalEntry(
 	return client.postSingleAccountJournalEntry(clientAccountIdentifier, amountInMinorUnits, humanReadableDescription, false)
 }
 
+// PostDividendCreditJournalEntry posts a real balanced journal entry
+// crediting an account's cash for a dividend payout — FEATURES.md §17's
+// DRIP feature (internal/drip). Mechanically identical to
+// PostMarginFundingDisbursementJournalEntry (the client account is
+// DEBITED/increased, the clearing account CREDITED/decreased — real cash
+// arriving in the client's account, exactly like a disbursement), reusing
+// the same postSingleAccountJournalEntry machinery and the same
+// firm-clearing-acct clearing account this package already uses
+// everywhere else — kept as its own named method (not a bare alias) so a
+// reader of internal/drip's call site sees an honest, dividend-specific
+// name rather than a margin-funding one.
+func (client *LedgerClient) PostDividendCreditJournalEntry(
+	clientAccountIdentifier string,
+	amountInMinorUnits int64,
+	humanReadableDescription string,
+) error {
+	return client.postSingleAccountJournalEntry(clientAccountIdentifier, amountInMinorUnits, humanReadableDescription, true)
+}
+
+// PostLoanAgainstSecuritiesDisbursementJournalEntry posts a real balanced
+// journal entry disbursing a Loan Against Securities (LAS) cash advance —
+// FEATURES.md §17's LAS product (internal/loanagainstsecurities).
+// Mechanically identical to PostMarginFundingDisbursementJournalEntry
+// (client account DEBITED/increased, clearing account CREDITED/decreased
+// — real cash arriving in the client's account) but kept as its own named
+// method, exactly like PostDividendCreditJournalEntry above, so a reader
+// of internal/loanagainstsecurities' call site sees an honest,
+// LAS-specific name rather than a margin-funding one — LAS is a distinct,
+// longer-tenure loan PRODUCT even though the underlying ledger mechanics
+// (and the reused firm-clearing-acct clearing account — see
+// marginFundingClearingAccountIdentifier's own gap note below) are the
+// same shape.
+func (client *LedgerClient) PostLoanAgainstSecuritiesDisbursementJournalEntry(
+	clientAccountIdentifier string,
+	amountInMinorUnits int64,
+	humanReadableDescription string,
+) error {
+	return client.postSingleAccountJournalEntry(clientAccountIdentifier, amountInMinorUnits, humanReadableDescription, true)
+}
+
+// PostLoanAgainstSecuritiesRepaymentJournalEntry posts the reverse of
+// PostLoanAgainstSecuritiesDisbursementJournalEntry: the client account is
+// CREDITED (decreased) and the clearing account DEBITED (increased),
+// paying down real LAS principal.
+func (client *LedgerClient) PostLoanAgainstSecuritiesRepaymentJournalEntry(
+	clientAccountIdentifier string,
+	amountInMinorUnits int64,
+	humanReadableDescription string,
+) error {
+	return client.postSingleAccountJournalEntry(clientAccountIdentifier, amountInMinorUnits, humanReadableDescription, false)
+}
+
 // marginFundingClearingAccountIdentifier mirrors
 // marginfunding.FirmMarginFundingClearingAccountIdentifier — duplicated
 // as a plain string constant here (rather than importing internal/

@@ -151,3 +151,105 @@ func TestPostMarginFundingDisbursementSurfacesLedgerRejection(t *testing.T) {
 		t.Fatal("expected an error when the ledger rejects the entry")
 	}
 }
+
+func TestPostDividendCreditDebitsClientAccountFromClearingAccount(t *testing.T) {
+	var capturedRequest PostJournalEntryWireRequest
+
+	fakeLedgerServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&capturedRequest)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(PostJournalEntryWireResponse{WasJournalEntryPosted: true})
+	}))
+	defer fakeLedgerServer.Close()
+
+	client := NewLedgerClient(fakeLedgerServer.URL)
+	postError := client.PostDividendCreditJournalEntry("acct-001", 1_500, "dividend credit for DEMO-EQ")
+
+	if postError != nil {
+		t.Fatalf("expected successful post, got: %v", postError)
+	}
+	if len(capturedRequest.DebitLines) != 1 || capturedRequest.DebitLines[0].LedgerAccountIdentifier != "acct-001" || capturedRequest.DebitLines[0].AmountInMinorUnits != 1_500 {
+		t.Fatalf("expected client account debited (increased) 1500, got %+v", capturedRequest.DebitLines)
+	}
+	if len(capturedRequest.CreditLines) != 1 || capturedRequest.CreditLines[0].LedgerAccountIdentifier != marginFundingClearingAccountIdentifier {
+		t.Fatalf("expected clearing account credited (decreased), got %+v", capturedRequest.CreditLines)
+	}
+}
+
+func TestPostDividendCreditSurfacesLedgerRejection(t *testing.T) {
+	fakeLedgerServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(PostJournalEntryWireResponse{
+			WasJournalEntryPosted: false,
+			ErrorMessage:          "referenced ledger account does not exist: acct-001",
+		})
+	}))
+	defer fakeLedgerServer.Close()
+
+	client := NewLedgerClient(fakeLedgerServer.URL)
+	postError := client.PostDividendCreditJournalEntry("acct-001", 1_000, "test")
+
+	if postError == nil {
+		t.Fatal("expected an error when the ledger rejects the entry")
+	}
+}
+
+func TestPostLoanAgainstSecuritiesDisbursementDebitsClientAccountFromClearingAccount(t *testing.T) {
+	var capturedRequest PostJournalEntryWireRequest
+
+	fakeLedgerServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&capturedRequest)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(PostJournalEntryWireResponse{WasJournalEntryPosted: true})
+	}))
+	defer fakeLedgerServer.Close()
+
+	client := NewLedgerClient(fakeLedgerServer.URL)
+	postError := client.PostLoanAgainstSecuritiesDisbursementJournalEntry("acct-001", 75_000, "LAS disbursement")
+
+	if postError != nil {
+		t.Fatalf("expected successful post, got: %v", postError)
+	}
+	if len(capturedRequest.DebitLines) != 1 || capturedRequest.DebitLines[0].LedgerAccountIdentifier != "acct-001" || capturedRequest.DebitLines[0].AmountInMinorUnits != 75_000 {
+		t.Fatalf("expected client account debited (increased) 75000, got %+v", capturedRequest.DebitLines)
+	}
+}
+
+func TestPostLoanAgainstSecuritiesRepaymentCreditsClientAccountToClearingAccount(t *testing.T) {
+	var capturedRequest PostJournalEntryWireRequest
+
+	fakeLedgerServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&capturedRequest)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(PostJournalEntryWireResponse{WasJournalEntryPosted: true})
+	}))
+	defer fakeLedgerServer.Close()
+
+	client := NewLedgerClient(fakeLedgerServer.URL)
+	postError := client.PostLoanAgainstSecuritiesRepaymentJournalEntry("acct-001", 25_000, "LAS repayment")
+
+	if postError != nil {
+		t.Fatalf("expected successful post, got: %v", postError)
+	}
+	if len(capturedRequest.CreditLines) != 1 || capturedRequest.CreditLines[0].LedgerAccountIdentifier != "acct-001" || capturedRequest.CreditLines[0].AmountInMinorUnits != 25_000 {
+		t.Fatalf("expected client account credited (decreased) 25000, got %+v", capturedRequest.CreditLines)
+	}
+}
+
+func TestPostLoanAgainstSecuritiesDisbursementSurfacesLedgerRejection(t *testing.T) {
+	fakeLedgerServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(PostJournalEntryWireResponse{
+			WasJournalEntryPosted: false,
+			ErrorMessage:          "referenced ledger account does not exist: acct-001",
+		})
+	}))
+	defer fakeLedgerServer.Close()
+
+	client := NewLedgerClient(fakeLedgerServer.URL)
+	postError := client.PostLoanAgainstSecuritiesDisbursementJournalEntry("acct-001", 1_000, "test")
+
+	if postError == nil {
+		t.Fatal("expected an error when the ledger rejects the entry")
+	}
+}

@@ -153,6 +153,8 @@ func main() {
 	httpRequestMultiplexer.HandleFunc("/wallets/withdraw", buildWalletWithdrawHandler(multiCurrencyWalletRegistry))
 	httpRequestMultiplexer.HandleFunc("/wallets/convert", buildWalletConvertHandler(multiCurrencyWalletRegistry))
 	httpRequestMultiplexer.HandleFunc("/wallets", buildWalletListHandler(multiCurrencyWalletRegistry))
+	httpRequestMultiplexer.HandleFunc("/admin/snapshot", buildAdminSnapshotHandler(ledgerBook))
+	httpRequestMultiplexer.HandleFunc("/admin/restore", buildAdminRestoreHandler(ledgerBook))
 
 	listenAddress := ":8082"
 	log.Printf(
@@ -1137,5 +1139,78 @@ func buildWalletListHandler(registry *multicurrencywallet.MultiCurrencyWalletReg
 			})
 		}
 		respondWithLedgerJson(responseWriter, http.StatusOK, wireBalances)
+	}
+}
+
+// ---------------------------------------------------------------------
+// Backup / restore (FEATURES.md §13, "[P1] Automated backups + tested
+// restore procedure for ledger DB") — see
+// internal/doubleentry/snapshotRestore.go's package doc: with no real
+// Postgres in this environment, a full in-memory JSON snapshot of every
+// account balance and every posted journal entry IS the backup
+// mechanism, not a supplementary one. scripts/backupLedgerSnapshot.sh
+// calls GET /admin/snapshot on a schedule/on demand and writes the
+// result to services/ledger/backups/ as a timestamped file;
+// POST /admin/restore is how an operator (or the restore-drill test)
+// loads one of those files back in.
+// ---------------------------------------------------------------------
+
+// buildAdminSnapshotHandler is GET /admin/snapshot: returns the COMPLETE
+// current in-memory ledger state (every account balance, every posted
+// journal entry, in post order) as JSON — exactly
+// doubleentry.LedgerBookSnapshot's shape, so the response body can be
+// saved to disk and later POSTed back to /admin/restore unmodified.
+func buildAdminSnapshotHandler(ledgerBook *doubleentry.InMemoryDoubleEntryLedgerBook) http.HandlerFunc {
+	return func(responseWriter http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodGet {
+			http.Error(responseWriter, "only GET is supported", http.StatusMethodNotAllowed)
+			return
+		}
+
+		snapshot := ledgerBook.CaptureSnapshot()
+		respondWithLedgerJson(responseWriter, http.StatusOK, snapshot)
+	}
+}
+
+type adminRestoreWireResponse struct {
+	WasRestored          bool   `json:"wasRestored"`
+	RestoredAccountCount int    `json:"restoredAccountCount,omitempty"`
+	RestoredEntryCount   int    `json:"restoredEntryCount,omitempty"`
+	ErrorMessage         string `json:"errorMessage,omitempty"`
+}
+
+// buildAdminRestoreHandler is POST /admin/restore: accepts a
+// doubleentry.LedgerBookSnapshot JSON body (the exact shape
+// GET /admin/snapshot returns) and atomically replaces THIS running
+// ledger process's entire in-memory state with it — not a new process,
+// not a merge. Safe under concurrent requests: the actual swap happens
+// inside doubleentry.RestoreFromSnapshot, under the same mutex every
+// other ledger mutation goes through.
+func buildAdminRestoreHandler(ledgerBook *doubleentry.InMemoryDoubleEntryLedgerBook) http.HandlerFunc {
+	return func(responseWriter http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodPost {
+			http.Error(responseWriter, "only POST is supported", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var snapshot doubleentry.LedgerBookSnapshot
+		if decodeError := json.NewDecoder(request.Body).Decode(&snapshot); decodeError != nil {
+			respondWithLedgerJson(responseWriter, http.StatusBadRequest, adminRestoreWireResponse{
+				ErrorMessage: fmt.Sprintf("malformed snapshot payload: %v", decodeError),
+			})
+			return
+		}
+
+		ledgerBook.RestoreFromSnapshot(snapshot)
+		log.Printf(
+			"ledger state restored from snapshot: %d accounts, %d journal entries",
+			len(snapshot.AccountBalances), len(snapshot.PostedJournalEntriesInPostOrder),
+		)
+
+		respondWithLedgerJson(responseWriter, http.StatusOK, adminRestoreWireResponse{
+			WasRestored:          true,
+			RestoredAccountCount: len(snapshot.AccountBalances),
+			RestoredEntryCount:   len(snapshot.PostedJournalEntriesInPostOrder),
+		})
 	}
 }

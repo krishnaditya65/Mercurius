@@ -2355,4 +2355,237 @@ Seven items built sequentially inside one agent run.
   matching-core thread panics; blocking push/pop use a plain spin loop
   rather than spin-then-park.
 
+## Entry 59 — apps/web + oms-gateway: options chain UI, notifications, opt-in strategy following (FEATURES.md §11)
+
+Third parallel-agent round, finishing FEATURES.md §§11,12,13,15,17,18 per
+explicit user instruction ("whatever can be written and done, finish
+them" — 14/16 deliberately excluded, not requested). Four initial lanes,
+plus two follow-up passes needed to work through oms-gateway's large
+§15/§17 backlog to near-completion.
+
+- Real `apps/web` options-chain page calling oms-gateway's real
+  `GET /options/chain` (live Greeks, real PCR) — verified live, including
+  a clean 502 (not a crash) when quant-engine was killed mid-session.
+- Real Web Notifications API integration for order-fill and price-alert
+  events, driven by real polling against oms-gateway's audit trail and
+  market-data's existing price-alerts feature — the entire data-plumbing
+  path proven live end-to-end; the actual `Notification.requestPermission()`
+  / browser-popup step itself couldn't be exercised (no interactive
+  browser available to the build agent), documented honestly rather than
+  claimed. Margin-call notifications have no real event-driven backend
+  trigger (oms-gateway's margin state isn't event-driven) — shipped as an
+  explicitly-labeled best-effort heuristic, not a real margin call.
+- New `internal/strategyfollowing` in oms-gateway: real opt-in
+  follow/unfollow relationship graph + an admin-verified strategy
+  registry — explicitly NO order mirroring/copying, disclosed and
+  documented as follow/unfollow only. 18 tests. Verified live: follower
+  counts, unfollow, and rejection of following an unverified strategy id.
+- `apps/web` has no test runner (`package.json` has no Jest/Vitest/
+  Playwright) — documented honestly rather than fabricated; rigor
+  substituted with `tsc --noEmit`/`lint`/`build` all clean plus live
+  verification.
+- **This lane's edits to `oms-gateway/cmd/server/main.go` landed
+  concurrently with the §12 lane and the api-gateway lane's
+  chaos-testing/FIX-conformance additions to the same service — verified
+  independently by the orchestrating session afterward that all three
+  coexist correctly with zero lost work** (see the wrap-up note at the
+  end of this entry group).
+
+## Entry 60 — oms-gateway: mark-to-market, auto-liquidation, exposure limits, connectivity kill-switch (FEATURES.md §12)
+
+- `internal/marktomarket`: real weighted-average cost-basis P&L tracking
+  fed by real fills, scoped to leveraged accounts only (outstanding
+  margin-funding principal or pledged quantity). 13 tests. Live: bought
+  20 shares @₹100, pledged 10, pushed price ₹110 → exactly ₹20,000
+  unrealized P&L; an unleveraged account correctly showed none.
+- `internal/autoliquidation`: real graduated WARNING(80%)/URGENT(90%)/
+  LIQUIDATION(100%+) utilization classification, with real reducing
+  MARKET SELL orders submitted through the exact live order-submission
+  pipeline ONLY at the LIQUIDATION threshold. 15 tests, hand-worked
+  sizing verified. Live: WARNING correctly submitted zero orders; a real
+  breach to 117.6% utilization genuinely submitted and filled a real
+  26-share reducing sell.
+- `internal/exposurelimits`: real pre-trade per-account AND per-segment
+  notional caps, rejecting with a machine-readable code identifying
+  which limit tripped. 12 tests including a 200-goroutine concurrency
+  test (exactly 100 of 200 succeed against a 1000-unit cap). Live:
+  exact-shortfall rejection message verified.
+- `internal/connectivitykillswitch`: real MANUAL + AUTO-triggered
+  (3-consecutive-failures) trading halt — blocks new submissions,
+  deliberately never blocks cancellation. 12 tests. **Bug found and
+  fixed**: the initial design had no way to self-heal once auto-engaged,
+  since the halt itself blocked the only connectivity signal (the order
+  path) — fixed by adding an independent background prober untouched by
+  the halt gate. Live: 3 consecutive matching-engine failures auto-halted
+  trading; a separate zero-traffic run showed the background prober
+  alone both engaging AND self-healing the switch.
+- Full sweep: `gofmt`/`go vet`/`go build` clean, `go test -race ./...`
+  green across the entire service (52 new tests, zero regressions).
+
+## Entry 61 — oms-gateway: execution algos, options payoff diagram (FEATURES.md §15, first pass)
+
+- `internal/executionalgos`: real TWAP/VWAP/POV parent-order slicing.
+  Largest-remainder apportionment (never loses/duplicates a share to
+  rounding); deterministic `PollDueSlices(now)` scheduler (no sleeping in
+  tests); POV participates in real observed volume with a max-clip cap.
+  13 tests. Live: TWAP 1000/4-slice → exactly 250×4; VWAP weights 1:4:3:2
+  → exactly 100/400/200/300; POV 10%/50-cap → 30 then a capped 50 —
+  every number matched the unit tests exactly.
+- `internal/payoffdiagram`: exact piecewise-linear options payoff
+  analysis (not sampling) — max/min payoff provably attained at spot=0
+  or a strike, breakevens via exact linear interpolation. 15 tests,
+  textbook cases matched exactly: long straddle (breakevens 90/110,
+  unbounded profit), long strangle (breakevens 84/116), bull call spread
+  (max profit/loss both 5, breakeven 105), naked short call (unbounded
+  loss), cash-secured short put (loss capped at 94 at spot=0).
+- Full sweep: green across the whole service, confirmed after both items.
+
+## Entry 62 — oms-gateway: multi-leg options, basket orders, impact-cost estimator, portfolio margining, SLB desk, extended-hours sessions, DRIP, loan against securities (FEATURES.md §15+§17, second pass)
+
+- `internal/multilegoptions`: real named-strategy leg-shape validation
+  (STRADDLE/STRANGLE/BULL_CALL_SPREAD/BEAR_PUT_SPREAD/IRON_CONDOR/
+  BUTTERFLY) with atomic execution — real compensating-order rollback if
+  a later leg is rejected. 27 tests. **Bug found and fixed**: iron
+  condor's buy/sell direction checks were inverted. Live: a valid
+  straddle's both legs accepted; an invalid shape rejected pre-
+  submission; an exposure-limit-triggered mid-execution rollback
+  demonstrated live, including surfacing the rollback's own failure mode.
+- `internal/basketorders`: net-cash-constrained, non-atomic aggregate
+  execution across N instruments, quantity- or weight-mode constituents.
+  20 tests.
+- `internal/impactcostestimator`: real walk-the-book slippage estimate
+  over a caller-supplied depth snapshot (matching-engine/market-data
+  have no queryable depth endpoint yet — documented honestly). 13 tests,
+  hand-worked numbers matched exactly.
+- `internal/marginengine` extended with real portfolio/cross-margining —
+  illustrative correlation-table netting benefit atop the existing SPAN+
+  exposure calculator. 21 tests. Live hand-worked: ₹72,800 net margin
+  from ₹1,17,000 gross.
+- `internal/securitieslendingborrowing`: real lend/borrow state machine,
+  two independent mutex-guarded ledgers, real day-count fee formula. 20
+  tests.
+- `internal/marketsession` extended with real PRE_MARKET/POST_MARKET
+  phases enforcing LIMIT-only order acceptance for real in
+  `processOrderSubmission`. 13 tests. Live: a market order rejected
+  pre-market, a limit order accepted and filled.
+- `internal/drip`: real dividend-credit + toggleable auto-reinvestment
+  through the real order path; 2 new `ledgerclient` tests for the
+  dividend-credit journal entry. 12 tests. Live: exact math verified.
+- `internal/loanagainstsecurities`: a distinct, stricter-LTV, longer-
+  tenure loan product against pledged securities (vs. margin funding's
+  trading-advance model) — real disbursement/repayment via ledger. 21
+  tests plus 3 new `ledgerclient` tests. Live: 50% LTV cap of ₹42,500 →
+  ₹21,250 disbursement, exact.
+- **Fractional share investing (§17) explicitly NOT attempted** — its
+  blast radius (`internal/orders.OrderQuantity uint64` and every
+  consumer) was judged too structurally invasive for this pass without
+  risking the "don't break any existing integer-quantity test"
+  constraint. README documents a recommended additive approach (a
+  parallel `MilliShareQuantity` field, mirroring the precedent set by
+  `OrderExecutionType`) for a future pass.
+- Full sweep confirmed green after every item across both passes; all 8
+  completed items plus the 2 from Entry 61 bring §15 to 8/8 and add DRIP
+  + LAS to §17.
+
+## Entry 63 — new `services/api-gateway`: SLO alerting, secrets abstraction, ledger backup/restore, DR runbook, chaos/load testing, tiered rate limiting, public dev API, webhooks, white-label tenancy, FIX conformance suite, TCA, illustrative account aggregator (FEATURES.md §13, §18)
+
+- New Go service (module `mercurius/apiGateway`, port :8089), 9 internal
+  packages, real reverse proxy in front of ledger/oms-gateway/mutual-
+  funds/market-data/quant-engine. 113 tests.
+- `internal/sloalerting`: continuous-breach evaluator (unit-testable
+  with synthetic samples) + a live `MetricsPoller` against oms-gateway's
+  audit trail, market-data's `/trades`, and a real matching-engine TCP
+  dial — `GET /alerts`.
+- `internal/secretsprovider` + `config/secretsAccessMatrix.yaml`: a real
+  working env-var-backed provider behind a real interface (swappable for
+  Vault/AWS Secrets Manager later, documented as such) plus a concrete,
+  real per-service access matrix — not fabricated cloud-IAM enforcement
+  that doesn't exist here.
+- **Ledger backup/restore**: additive `GET /admin/snapshot` /
+  `POST /admin/restore` in `ledger`'s `internal/doubleentry`
+  (`snapshotRestore.go`), a real backup script, and a real restore DRILL
+  test — snapshot, mutate further, restore, assert state matches the
+  snapshot exactly (not the further-mutated state) — proven live against
+  a real running ledger process, not just unit-tested.
+- `DR_RUNBOOK.md` (repo root): concrete per-tier RTO/RPO targets, a real
+  runnable failover drill exercising what's actually exercisable here
+  (kill a service, confirm documented fail-open behavior, restore via
+  the backup capability), explicit boundary that a true multi-region DR
+  failover needs cloud infrastructure this environment doesn't have.
+- Real chaos/load testing scripts in `oms-gateway/scripts/
+  chaosLoadTesting/`: 150 concurrent workers producing real p50/p95/p99
+  latencies, plus a real kyc-onboarding kill mid-load confirming the
+  documented fail-open behavior holds under genuine concurrent pressure,
+  not just a single request.
+- `internal/ratelimiter`: real token-bucket rate limiting, RETAIL/
+  INSTITUTIONAL/SANDBOX tiers. Live: a 20-burst retail key hit real 429s
+  exactly on schedule; an institutional key handled 60/60 successfully.
+- `internal/apikeymanager`: real key issuance/revocation, real 401 on
+  invalid/revoked keys — the same mechanism backs the public developer
+  API (§18) and the rate-limit tiers (§13) together.
+- `internal/webhookdelivery`: real URL registration + real retry-on-
+  failure delivery, tested against real `httptest` receivers AND a real
+  end-to-end proof (a real Python receiver, a real oms-gateway order
+  triggering real delivery).
+- `internal/tenantconfig`: real multi-tenant branding + isolated
+  per-tenant rate limiters — the platform primitive a white-label
+  offering needs, explicitly not a complete commercial BaaS product
+  (separate legal/compliance entities per tenant is out of scope).
+- FIX conformance suite added to `oms-gateway`'s existing
+  `internal/dmagateway`: 15 real subtests producing a real pass/fail
+  report against this repo's own illustrative FIX-inspired protocol —
+  explicitly NOT a real FIX 4.2/4.4 certification.
+- `internal/tca`: real implementation-shortfall and arrival-price-
+  slippage math; honest gap noted (oms-gateway has no price-history
+  endpoint yet) with fixture-sourced data clearly flagged
+  `dataSourceIsLive: false` in the response.
+- `internal/accountaggregator`: real merge math combining a mocked
+  "external institution" holdings fixture with this platform's real
+  holdings into one unified view — `isExternalDataFromRealAaNetwork`
+  hardcoded false, no real Account Aggregator network reachable here.
+- Blue/green matching-engine primitive: a real WAL-copy + replay parity
+  proof (byte-identical reconstructed state), with an explicit,
+  documented boundary that real traffic-cutover infrastructure (load
+  balancer reconfiguration) doesn't exist here.
+- Full sweep: `services/api-gateway`, `services/ledger`, and
+  `services/oms-gateway` all `gofmt`/`go vet`/`go build`/`go test -race`
+  clean; `services/matching-engine` `cargo build --release`/`cargo test
+  --release` clean (52/52).
+
+## Entry 64 — quant-engine: ESG/sustainability scoring and screening (FEATURES.md §17)
+
+- New `esgScoringEngine.py`: a real documented weighted-average
+  composite formula (Environmental 0.40 / Social 0.30 / Governance
+  0.30, summing to exactly 1.0) over an illustrative 6-symbol dataset,
+  plus real screening/ranking/sector-exclusion logic. 26 tests + 4 new
+  live-HTTP tests (30 new, 216 total for the service, up from 186).
+  Hand-worked: E=70/S=60/G=80 → composite exactly 70.0.
+- `POST /esg/screen` wired into the existing HTTP server. Verified live:
+  the hand-worked composite reproduced exactly over HTTP; combined
+  criteria (minimum composite + sector exclusion + an unknown symbol)
+  correctly ranked, excluded, and flagged-unknown in one response; 400
+  on a missing required field.
+- **Known gap, documented loudly**: the ESG dataset itself is entirely
+  fabricated/illustrative — NOT sourced from any real rating agency
+  (MSCI, Sustainalytics, ISS ESG, Refinitiv/Bloomberg ESG). The SCORING
+  MATH and SCREENING LOGIC are real and correctly implemented; the
+  underlying data is not.
+- Full sweep: 216/216 passing, zero regressions.
+
+## Entry 65 — housekeeping: verified three concurrent oms-gateway lanes coexist correctly
+
+Entries 59, 60, and 63 all independently edited `services/oms-gateway`
+(strategy-following routes, the four §12 risk packages, and the chaos-
+testing script tree + FIX conformance suite respectively) in the same
+window. Before proceeding to the follow-up §15/§17 passes (entries 61,
+62), the orchestrating session independently re-verified — not just
+trusted the agents' own reports — that all three sets of changes coexist
+in `cmd/server/main.go` with no lost work: confirmed every new package
+import, every new route registration, and a full green `gofmt`/`go vet`/
+`go build`/`go test ./... -race` sweep across the whole service, plus
+the same for `services/ledger` (touched by entry 63's backup/restore
+subagent) and `services/matching-engine` (touched by entry 63's
+blue/green subagent). No conflicts found; no corrective action was
+needed beyond this verification pass itself.
+
 <!-- Append new entries below this line as work continues. -->

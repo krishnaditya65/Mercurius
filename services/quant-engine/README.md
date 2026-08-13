@@ -6,10 +6,11 @@ Research-tier component — see `ARCHITECTURE.md` §6 and §8 in the repo root.
 ## deterministic backtest engine, GARCH(1,1) volatility forecasting, a
 ## correlation matrix engine, VaR/stress-testing, a volatility surface
 ## builder, a strategy deployment lifecycle state machine, a
-## market-making sandbox, and an illustrative sentiment trading hook are
-## all real and tested; HTTP service covers pricing/Greeks/IV plus risk,
-## arbitrage, GARCH forecast, correlation matrix, VaR, and market-making
-## sandbox endpoints
+## market-making sandbox, an illustrative sentiment trading hook, and an
+## ESG scoring/screening engine (illustrative dataset, real scoring math)
+## are all real and tested; HTTP service covers pricing/Greeks/IV plus
+## risk, arbitrage, GARCH forecast, correlation matrix, VaR,
+## market-making sandbox, and ESG screening endpoints
 
 What's real:
 - `src/quantengine/blackScholesOptionPricer.py` — call/put pricing, all
@@ -110,6 +111,24 @@ What's real:
   (inventory persists across calls) — the HTTP layer guards it with an
   explicit lock (see below); every other quant-engine module remains a
   pure, stateless computation.
+- `src/quantengine/esgScoringEngine.py` — ESG (Environmental/Social/
+  Governance) composite scoring and screening. **Read the module
+  docstring in full before treating any score here as real research.**
+  `ILLUSTRATIVE_ESG_DATASET_BY_SYMBOL` is a STATIC, HAND-FABRICATED set of
+  per-symbol E/S/G sub-scores for six illustrative demo symbols (reusing
+  this repo's existing `DEMO-EQ` / `SIM-AAPL` demo-symbol convention from
+  `services/oms-gateway` and `services/market-data`, plus two invented
+  `SIM-` symbols carrying controversial-sector flags) — it is NOT sourced
+  from MSCI, Sustainalytics, ISS ESG, Refinitiv, Bloomberg ESG, or any
+  other real rating agency; nobody researched these companies' actual
+  ESG practices. What IS real: `calculateCompositeEsgScore` — a real,
+  documented weighted average (Environmental 40%, Social 30%, Governance
+  30%, weights summing to exactly 1.0) — and
+  `screenCandidateSymbolsAgainstEsgCriteria` — real minimum-score-per-
+  pillar filtering, real controversial-sector exclusion (a symbol
+  carrying ANY excluded flag is rejected regardless of its scores), and
+  real descending ranking by composite score, with unknown symbols and
+  criteria-failing symbols reported separately from the ranked results.
 - `src/quantengine/illustrativeSentimentTradingHook.py` — **read the
   module docstring in full before using any part of this file.** A TOY,
   hand-built positive/negative word-list lexicon scorer — explicitly
@@ -150,18 +169,27 @@ What's real:
     in-process `MarketMakingSandbox` instance guarded by an explicit
     `threading.Lock`, unlike every other endpoint above (and below),
     which remains a pure, stateless computation per request.
+  - `POST /esg/screen` — ESG screening/ranking over a caller-supplied
+    `candidateSymbols` list against optional minimum-composite,
+    minimum-per-pillar, and controversial-sector-exclusion criteria.
+    Returns `rankedResults` (descending by composite score),
+    `excludedSymbols` (known symbols that failed a criterion), and
+    `unknownSymbols` (candidates with no illustrative ESG profile) —
+    **the underlying per-symbol dataset is illustrative/fabricated; the
+    scoring formula and screening logic are real** (see
+    `esgScoringEngine.py` above).
   - Every response carries a permissive CORS header so `apps/web` can
     call it directly (same "wrong once real auth exists" caveat as
     oms-gateway's and market-data's CORS middleware).
   - The backtest runner, pairs-trading strategy, volatility surface
     builder, strategy lifecycle state machine, and sentiment trading
     hook are NOT exposed over HTTP — they're verified via pytest only
-    (see below). GARCH forecast, correlation matrix, VaR, and the
-    market-making sandbox WERE additionally verified with real `curl`
-    requests against a live running process (hand-worked values
-    round-tripped exactly — see git history / build notes for the
-    transcript).
-- 186 passing tests total across `tests/`:
+    (see below). GARCH forecast, correlation matrix, VaR, the
+    market-making sandbox, and ESG screening WERE additionally verified
+    with real `curl` requests against a live running process
+    (hand-worked values round-tripped exactly — see git history / build
+    notes for the transcript).
+- 216 passing tests total across `tests/`:
   - 7 in `test_blackScholesOptionPricer.py` (known reference-value
     checks, put-call parity, Greek sanity bounds, gamma call/put
     equality, an IV solver round-trip)
@@ -207,11 +235,17 @@ What's real:
     edge cases including case-insensitivity and no substring-matching,
     the kill switch defaulting OFF, and suggestion generation once
     explicitly enabled)
-  - 22 in `test_httpServer.py` (live HTTP requests against a real
+  - 26 in `test_esgScoringEngine.py` (the hand-worked composite-score
+    weighted-average example, sub-score range validation, single- and
+    multi-criterion screening including minimum composite/pillar scores
+    and sector exclusion overriding a high score, unknown-symbol and
+    empty-candidate-list edge cases, tie-break-by-symbol ranking)
+  - 26 in `test_httpServer.py` (live HTTP requests against a real
     `ThreadingHTTPServer` on an ephemeral port, including
     `/risk/statistics`, `/arbitrage/scan`, `/volatility/garch-forecast`,
-    `/correlation/matrix`, `/risk/value-at-risk`, and the three
-    `/market-making/*` endpoints, several with hand-worked values)
+    `/correlation/matrix`, `/risk/value-at-risk`, the three
+    `/market-making/*` endpoints, and `/esg/screen`, several with
+    hand-worked values)
 
 What's not built yet (see FEATURES.md §6, §7, §22):
 - Portfolio-level Greeks aggregation (the HTTP API above is single-
@@ -255,6 +289,17 @@ before treating any of them as production-grade):
 - **The sentiment trading hook is a toy lexicon, full stop** — see its
   module docstring. It never places a real order under any
   configuration; the kill switch defaults OFF.
+- **The ESG dataset is fabricated, full stop** (`esgScoringEngine.py`).
+  `ILLUSTRATIVE_ESG_DATASET_BY_SYMBOL` covers exactly six illustrative
+  demo symbols with hand-picked E/S/G sub-scores — it is NOT sourced from
+  MSCI, Sustainalytics, ISS ESG, Refinitiv, Bloomberg ESG, or any other
+  real ESG data vendor, and a real vendor integration is not attempted
+  anywhere in this module. The 40/30/30 pillar weighting is a documented,
+  fixed methodology choice, not derived from or claiming to match any
+  specific real rating agency's proprietary methodology. The composite
+  formula and the screening/ranking logic ARE real and correctly
+  implemented — see the module docstring for the exact split of what's
+  real versus illustrative.
 
 ## Important constraint
 
@@ -329,4 +374,12 @@ curl -X POST http://127.0.0.1:8085/market-making/simulate-fill -d '{
   "symbol": "AAPL", "takerSide": "BID", "quantity": 20.0
 }'
 curl -X POST http://127.0.0.1:8085/market-making/inventory -d '{"symbol": "AAPL"}'
+
+# ESG screening — illustrative fixture dataset, real scoring/screening math.
+# DEMO-EQ has E=70,S=60,G=80 -> composite = 0.4*70+0.3*60+0.3*80 = 70.0 exactly.
+curl -X POST http://127.0.0.1:8085/esg/screen -d '{
+  "candidateSymbols": ["DEMO-EQ", "SIM-AAPL", "SIM-MSFT", "SIM-JPM", "SIM-THERMAL-COAL-CO", "SIM-TOBACCO-CO"],
+  "minimumCompositeEsgScore": 60.0,
+  "excludedControversialSectorFlags": ["TOBACCO", "THERMAL_COAL"]
+}'
 ```

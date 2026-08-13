@@ -328,10 +328,20 @@ What's real:
   and a Logout handshake. Sequence-number tracking is real, mutex-guarded
   per-connection state: an out-of-sequence message (or one that arrives
   before Logon) is genuinely REJECTed and the connection is closed,
-  matching real FIX session behavior. 23 tests (protocol parsing, every
-  session-state transition table-driven via `SessionHandler.HandleLine`
-  with a fake `submitOrder`, plus one real end-to-end test over an actual
-  TCP socket). Verified live with a standalone Python TCP client
+  matching real FIX session behavior. 25 top-level test functions
+  (protocol parsing, every session-state transition table-driven via
+  `SessionHandler.HandleLine` with a fake `submitOrder`, plus real
+  end-to-end tests over an actual TCP socket) — including
+  `conformanceSuite_test.go`, a real, executable **conformance test
+  suite** for FEATURES.md §18's "FIX protocol certification suite"
+  line item: 11 distinct, named checklist behaviors (Logon at the
+  correct starting sequence, double-Logon refusal, sequence gaps both
+  ahead and behind expected, pre-Logon message rejection, accept/reject
+  execution-report paths including 7 malformed-field sub-cases, Logout,
+  malformed wire input, and unknown-MsgType-doesn't-close-session), a
+  subset re-run against a real live `Server` TCP listener for extra
+  evidence, and a captured pass/fail run written to
+  `internal/dmagateway/CONFORMANCE_REPORT.md`. Verified live with a standalone Python TCP client
   (`dma_test_client.py`) against a real running oms-gateway: a full
   Logon→NewOrderSingle→ExecutionReport→Logout happy path; a huge order
   that the REAL risk engine genuinely rejected (`OrdStatus=REJECTED`
@@ -419,6 +429,587 @@ What's real:
   being hit at exactly 50,000 and the next order rejected, and an
   untagged order sailing through unaffected — every rejection also
   landed in `GET /audit-trail` as `STRATEGY_LIMIT_REJECTED`.
+
+- **Real-time Mark-to-Market engine across leveraged positions**
+  (`internal/marktomarket`, FEATURES.md §12): a real, weighted-average
+  cost-basis tracker fed by the exact same fill events
+  `internal/positions` consumes (plus the executed price), and a real
+  HTTP PUSH endpoint (`POST /mark-to-market/price`) for the current
+  market price of an instrument — see the package doc's design-choice
+  note on why push, not pull: oms-gateway has no live price feed anywhere
+  yet (the same documented gap the pre-trade risk check's market-order
+  TODO already calls out). `GET /mark-to-market?accountId=...` returns
+  real unrealized P&L per position and per account — but ONLY for
+  accounts this service considers LEVERAGED (outstanding margin-funding
+  principal from `internal/marginfunding`, or any pledged quantity at all
+  from `internal/marginpledge`); an unleveraged account gets a clear
+  `isLeveragedAccount:false` with an empty position list rather than a
+  potentially-misleading P&L for exposure this endpoint isn't scoped to
+  report. Cost basis is real weighted-average math: adding to a position
+  blends the new fill into the existing average, a partial close leaves
+  the average untouched, and a full direction reversal (long flips short
+  or vice versa) restarts the average at the reversing fill's price — the
+  position's economic identity genuinely changed. The single signed
+  formula `netQuantity * (marketPrice - averageEntryPrice)` is correct
+  for both long and short positions, hand-verified in tests for both
+  signs. 13 tests including the weighted-average, partial-close,
+  direction-reversal, and short-position-profits-on-price-drop cases, plus
+  a concurrency test. Verified live: buying 20 DEMO-EQ @ ₹100.00 (a REAL
+  fill against a real running matching-engine), pledging 10 of them
+  (making the account leveraged), then pushing a market price of ₹110.00
+  produced exactly `unrealizedPnLInMinorUnits: 20000` (20 × ₹10.00) —
+  matching the hand-worked math exactly — while a second, unleveraged
+  account correctly showed `isLeveragedAccount:false` and no P&L at all
+  despite also holding a position.
+  **Known gaps**: no continuous/subscribed price feed (push-only, see
+  above); positions with a live quantity but no market price ever pushed
+  are silently omitted from the response rather than reported as
+  "MTM unavailable"; in-memory only.
+
+- **Auto-liquidation on margin breach, with graduated warnings first**
+  (`internal/autoliquidation`, FEATURES.md §12): given an account's real
+  margin utilization — `outstandingMarginFundingPrincipal /
+  totalPledgedCollateralValue`, assembled from real
+  `internal/marginfunding` and `internal/marginpledge` state — this
+  emits graduated states: `NORMAL` below 80%, `WARNING` at 80%, `URGENT`
+  at 90%, and `LIQUIDATION` at 100%+ (all configurable via
+  `autoliquidation.Thresholds`). `GET /auto-liquidation/status?
+  accountId=...` is a PURE read (`autoliquidation.ClassifyUtilization`)
+  that never acts, even at `LIQUIDATION` — only `POST
+  /auto-liquidation/evaluate` can actually liquidate, and it only does so
+  when genuinely breached: at `WARNING`/`URGENT` it is provably a no-op
+  (dedicated tests assert zero calls to the order-submission callback).
+  At `LIQUIDATION`, it computes exactly how much notional must be sold to
+  bring the account back down to a configurable target (75% by default),
+  walks the account's LONG positions largest-notional-first, and submits
+  REAL reducing MARKET SELL orders through the EXACT SAME
+  `processOrderSubmission` pipeline every other order path (HTTP submit,
+  DMA gateway) reuses — via a plain Go closure, nothing duplicated, so a
+  liquidation order is genuinely risk-checked, audited, and reaches
+  matching-engine like any other order. 15 tests including a fully
+  hand-worked liquidation-sizing case (₹1,20,000 outstanding against
+  ₹1,00,000 pledged → 120% utilization → target 75% of ₹1,00,000 =
+  ₹75,000 → shortfall ₹45,000 → sells exactly 45 shares @ ₹1,000 to fully
+  cover it), a largest-position-first ordering test, a
+  rejected-submission-doesn't-reduce-shortfall test, and a concurrency
+  test. Verified live: pledging 100 DEMO-EQ shares then borrowing 82% of
+  capacity showed `riskState:"WARNING"` and a `POST
+  /auto-liquidation/evaluate` call genuinely submitted ZERO orders
+  (position unchanged before/after); unpledging 30 of those shares (not
+  blocked — utilized-derivative-margin was never set for this account,
+  see `internal/marginpledge`'s own documented gap) dropped the real
+  pledged collateral value and pushed utilization to a genuine 117.6%,
+  showing `riskState:"LIQUIDATION"`; the subsequent evaluate call
+  genuinely submitted a real 26-share MARKET SELL through the real order
+  pipeline (`wasAccepted:true`, sequenced, logged in the audit trail) —
+  proving this is real order submission with real consequences, not a
+  simulation.
+  **Known gaps**: (1) short positions are never liquidated (only long
+  positions are sold down — covering a short needs a BUY order, an
+  intentionally excluded scope boundary); (2) no automatic
+  scheduler/poller triggers evaluation — this build only evaluates on an
+  explicit `POST /auto-liquidation/evaluate` call, the same
+  admin-toggle-not-a-real-clock pattern `internal/marketsession` already
+  uses; (3) a liquidation order that's accepted by the pipeline can still
+  fail to actually fill if there's no real resting liquidity on the other
+  side of the book at that instant — exactly like any other real market
+  order, not a guarantee unique to this feature (this is why the live
+  verification above shows the order accepted but doesn't claim a fill:
+  there was no counterparty resting an opposite-side order at that
+  moment); (4) a position with no pushed `internal/marktomarket` price is
+  skipped entirely during liquidation sizing (reported in
+  `skippedPositionsMissingPrice`), which can leave an account
+  under-liquidated if that was its only holding.
+
+- **Per-user, per-segment exposure limits (configurable by risk team)**
+  (`internal/exposurelimits`, FEATURES.md §12): a real pre-trade check,
+  run right alongside `internal/riskengine`'s own margin check (actually
+  BEFORE it in the gate order, right after the strategy-limits gate — no
+  reason to touch KYC/freeze/margin for an order the risk team has
+  already capped out on exposure grounds). `POST /exposure-limits/
+  configure` sets an account's total notional exposure cap and/or its cap
+  within one instrument "segment" (`EQUITY`/`FUTURES_AND_OPTIONS`/
+  `CURRENCY`/`OTHER` — an ILLUSTRATIVE, symbol-suffix-derived
+  classification since this repo has no real instrument-master segment
+  taxonomy, see the package doc). An order that would push either the
+  account-wide running total OR the segment-specific running total past
+  its CONFIGURED limit (an unconfigured account/segment is completely
+  unconstrained, same convention `internal/algolimits` already uses) is
+  rejected with a clear, specific machine-readable reason —
+  `ACCOUNT_EXPOSURE_LIMIT_EXCEEDED` or `SEGMENT_EXPOSURE_LIMIT_EXCEEDED`
+  — identifying exactly which limit was breached, never an ambiguous
+  generic rejection. `GET /exposure-limits?accountId=...&segment=...`
+  shows configured limits and current usage. 12 tests including
+  exact-at-limit-allowed, over-by-one-rejected, independent-per-segment,
+  independent-per-account, rejection-doesn't-mutate-running-totals, and a
+  concurrency test proving 200 simultaneous 10-unit reservations against
+  a 1000-unit limit yield exactly 100 successes. Verified live:
+  configuring `acct-001` with a 50,000-unit account cap AND a
+  30,000-unit `EQUITY` segment cap, a 20,000-unit order succeeded and
+  the status endpoint showed exactly 20,000 used in both totals; a
+  follow-up 15,000-unit order (would total 35,000 against the 30,000
+  segment cap) was genuinely rejected with `SEGMENT_EXPOSURE_LIMIT_EXCEEDED`
+  and the exact shortfall numbers in the message; a separate account
+  configured with ONLY a 25,000-unit account-wide cap (no segment cap)
+  was rejected on a second order specifically with
+  `ACCOUNT_EXPOSURE_LIMIT_EXCEEDED` once its running total would have
+  hit 30,000 — proving the two limit types are independently enforced
+  and independently identified.
+  **Known gaps**: (1) "exposure" here is a cumulative RESERVATION model
+  (every accepted order's notional accumulates and is never
+  automatically released — the same simplification
+  `internal/algolimits` already uses for its own daily notional cap),
+  NOT a live mark-to-market net position value — `ReleaseExposure` exists
+  and is tested but nothing calls it automatically yet; (2) segment
+  classification is ILLUSTRATIVE (a symbol-suffix convention), not a
+  real exchange segment taxonomy; (3) the reservation happens BEFORE
+  KYC/freeze/margin/matching-engine, so an order that's later rejected by
+  any of those gates (or that reaches matching-engine but never fills)
+  still permanently consumes exposure capacity — a documented
+  conservative-but-imprecise tradeoff, the same one
+  `internal/algolimits` already accepts for its own reservation.
+
+- **Circuit breaker / kill-switch at the exchange-connectivity layer**
+  (`internal/connectivitykillswitch`, FEATURES.md §12): a real,
+  mutex-guarded kill switch, checked FIRST — before even the strategy
+  resource-limits gate — on every single order submission
+  (`processOrderSubmission`). When engaged (either way below), EVERY new
+  order submission is rejected immediately with a clear
+  `TRADING_HALTED` error; `buildCancelOrderHandler` deliberately never
+  consults it at all, so existing resting orders can always still be
+  cancelled, per FEATURES.md §12. Two independent engagement paths, both
+  real: (1) a manual admin toggle — `POST
+  /connectivity-kill-switch/engage` (body `{"reason":"..."}`) and `POST
+  /connectivity-kill-switch/disengage`; (2) a real, health-check-driven
+  AUTO trigger that engages the SAME switch after 3 consecutive
+  matching-engine connectivity FAILURES (genuine transport/dial errors,
+  deliberately distinguished from a legitimate business rejection
+  matching-engine itself returns, which never counts against the
+  streak) — fed from TWO real sources: every live order's real
+  matching-engine hand-off attempt, AND a genuinely independent
+  background goroutine (`main()`) that polls matching-engine every 2
+  seconds via its existing `QueryOrderStatusAndAwaitResult` method,
+  regardless of order flow. That second source is load-bearing, not
+  decorative: without an independent prober, once trading is halted
+  every new order is rejected BEFORE it ever reaches
+  `matchingEngineClient`, so the very act of halting would make
+  self-recovery impossible to ever observe. A manual engagement and an
+  auto engagement are tracked as fully independent flags —
+  `DisengageManually` only clears the manual one; if matching-engine is
+  still genuinely failing, the AUTO flag alone keeps trading halted
+  regardless, so an admin can't accidentally re-open trading into a
+  still-broken downstream. The AUTO flag clears itself automatically the
+  moment a connectivity check succeeds again. `GET
+  /connectivity-kill-switch/status` shows the full real state. 12 tests
+  including an exact-threshold-transition test (only the 3rd consecutive
+  failure trips it, proven via the transition-return-value), a
+  success-resets-and-clears test, a manual-disengage-does-NOT-clear-
+  active-auto-engagement test, and a concurrency test. Verified live
+  with a real running matching-engine killed mid-session: three
+  consecutive real connectivity failures via order submission
+  auto-engaged the switch (`isAutoEngaged:true`) and the very next order
+  submission was rejected with `TRADING_HALTED` without even attempting
+  matching-engine; a manual engage/disengage cycle was independently
+  verified to halt and resume order submission while a genuine
+  `orders/cancel` call against a non-existent order kept returning its
+  ordinary (non-`TRADING_HALTED`) error throughout, proving cancellation
+  is never gated. Separately, with NO order traffic at all, killing
+  matching-engine and waiting ~8 seconds showed the background prober
+  alone auto-engage the switch (`consecutiveFailureCount:6,
+  isAutoEngaged:true`); restarting matching-engine and waiting a few
+  more seconds showed the very same switch self-clear
+  (`isTradingHalted:false, consecutiveFailureCount:0`) with zero admin
+  intervention — proving the self-heal path genuinely works, not just
+  the halt path.
+  **Known gaps**: (1) the failure threshold (3) and probe interval (2s)
+  are hardcoded in `cmd/server/main.go`, not configurable via any
+  endpoint; (2) the background prober queries a hardcoded `DEMO-EQ`/seq
+  `0` — a real build would probe something that can never legitimately
+  fail to distinguish "matching-engine down" from "this specific
+  instrument/order genuinely doesn't exist", though in practice
+  `QueryOrderStatusAndAwaitResult`'s Go error is already scoped to
+  transport failures only, so this is a low-risk simplification, not a
+  correctness bug; (3) in-memory only — an oms-gateway restart always
+  starts fully disengaged, even if the operator meant to leave trading
+  halted.
+
+- **Execution algos: TWAP / VWAP / POV** (`internal/executionalgos`,
+  FEATURES.md §15): real algorithmic slicing of one large parent order
+  into many smaller child orders, released over time. Three real
+  strategies, all deterministically testable (every clock/volume input
+  is an explicit parameter — nothing sleeps or reads the wall clock
+  internally, same discipline as `internal/algolimits`' token bucket):
+  (1) **TWAP** — `BuildTwapSchedule` splits the parent quantity into N
+  equal-sized slices (remainder distributed by the largest-remainder/
+  Hamilton apportionment method so slices always sum EXACTLY to the
+  parent quantity — no rounding drift) at N equally-spaced points in
+  time from `startTime` to `endTime` inclusive; (2) **VWAP** —
+  `BuildVwapSchedule` splits the parent quantity across a caller-supplied
+  historical/assumed intraday volume curve, proportionally to each
+  bucket's `historicalVolumeWeight` (weights need not pre-sum to 1 — 
+  normalized internally), again via largest-remainder apportionment, and
+  releases each slice at its bucket's own time; (3) **POV** — a
+  `PovScheduler` has no pre-built time grid at all: it consumes real-time
+  observed CUMULATIVE market volume readings via
+  `OnVolumeObservation(now, cumulativeVolume)` and, for each observation,
+  releases a child slice sized at `participationRate * (volume traded
+  since the previous observation)`, hard-capped by both a configured
+  `maxClipSizeQuantity` and whatever of the parent order remains
+  unsliced — the first observation only establishes a baseline (no slice
+  yet, since there's no "volume since last observation"). A
+  `Scheduler` wraps a TWAP/VWAP plan with real, mutex-guarded
+  release-tracking: `PollDueSlices(now)` returns only NEWLY due slices on
+  each call, so polling on any cadence (or twice at the same `now`) never
+  double-releases a slice. 13 tests including hand-worked numeric cases
+  (1000 qty / 4 TWAP slices = exactly 250 each; 1001 qty / 4 slices =
+  one slice of 251 and three of 250, proving the remainder never gets
+  lost or duplicated; VWAP weights 1:4:3:2 over 1000 qty = exactly
+  100/400/300/200; POV with 10% participation and a 50-unit cap turns a
+  300-unit volume delta into a 30-unit slice and an 800-unit delta into
+  a 50-unit slice capped by `maxClipSizeQuantity`, and separately proves
+  a POV slice additionally caps at the parent's remaining quantity so
+  the very last slice can complete the order exactly instead of
+  overshooting it) plus a concurrency-safe `Scheduler` double-poll test.
+  Wired into `cmd/server/main.go` via `executionAlgoOrderRegistry` (an
+  in-memory, mutex-guarded map from a generated `algoOrderId` to its live
+  scheduler) and six real endpoints:
+  `POST /execution-algos/twap/create`, `POST /execution-algos/vwap/create`,
+  `POST /execution-algos/pov/create`, `POST /execution-algos/poll`
+  (TWAP/VWAP — drives `PollDueSlices` forward with a caller-supplied
+  `now`), `POST /execution-algos/pov/observe-volume` (feeds one
+  cumulative-volume reading), and `GET /execution-algos/status`. Verified
+  live against a real running server: created a 1000-share TWAP order
+  over a 30-minute window in 4 slices (got back exactly 250/250/250/250
+  at 10:00/10:10/10:20/10:30), polled at 10:15 and got back exactly the
+  two due slices (index 0 and 1, `remainingQuantity:500`), polled again
+  at the same `now` and got back `dueSlices:null` (no double-release);
+  created a VWAP order with curve weights 1:4:3:2 and got back exactly
+  100/400/200/300 in bucket-time order; created a POV order (10%
+  participation, 50-unit cap), fed volume observations of 10000 (baseline,
+  `newSlice:null`), then 10300 (delta 300 → `newSlice.quantity:30`,
+  `remainingQuantity:970`), then 11100 (delta 800 → capped at
+  `newSlice.quantity:50`, `remainingQuantity:920`) — every live number
+  matched the hand-worked unit-test expectations exactly; a status query
+  against an unknown `algoOrderId` correctly returned 404.
+  **Known gaps**: (1) this package computes WHAT to release and WHEN —
+  it does NOT itself submit the resulting `ChildOrderSlice` values as
+  real `orders.OrderSubmissionRequest` calls; wiring a background
+  scheduler loop that actually polls and submits is future work; (2) no
+  persistence — an oms-gateway restart loses every in-flight algo
+  order's schedule/state; (3) VWAP's volume curve is entirely
+  caller-supplied (illustrative), not sourced from any real historical
+  volume feed; (4) POV has no real-time market-volume feed wired in
+  either — a caller has to supply `cumulativeMarketVolume` readings
+  itself (e.g. from `matchingengineclient`'s depth/trade data, which this
+  build doesn't automatically bridge in).
+
+- **Options strategy payoff diagram** (`internal/payoffdiagram`,
+  FEATURES.md §15): real math — max profit, max loss, and every
+  breakeven spot price — for an arbitrary set of option legs (any mix of
+  calls/puts, strikes, buy/sell, quantities), computed EXACTLY, not by
+  sampling. The approach leans on a real structural fact about option
+  payoffs: at expiry, total payoff is piecewise LINEAR in the underlying
+  spot price with kinks only at each leg's strike, and the domain is
+  bounded below at spot=0 (a real price can't go negative) but unbounded
+  above — so (1) any finite max/min is provably attained at spot=0 or at
+  one of the strikes (a line has no interior extremum), never needing to
+  scan every price; (2) whether profit/loss is unbounded is exactly
+  determined by the slope of the one ray beyond the highest strike; (3)
+  breakevens are found by exact linear interpolation within whichever
+  segment changes sign, not a numerical root-finder. `ComputePayoffDiagram`
+  is a pure, stateless function of the leg slice — safe to call fresh on
+  every request as legs are added, per FEATURES.md's own "computed live"
+  framing. 15 tests, most against textbook hand-worked numbers: a long
+  straddle (buy call+put, same strike 100, premium 5 each) — max loss
+  exactly 10 (=combined premium), max profit unbounded, breakevens
+  exactly 90 and 110 (=strike ± total premium); a long strangle (call
+  strike 110 @ 3, put strike 90 @ 3) — max loss exactly 6 over the flat
+  region between strikes, breakevens exactly 84 and 116; a bull call
+  spread (buy 100 @ 8, sell 110 @ 3) — max profit exactly 5 (=spread
+  width 10 − net debit 5), max loss exactly 5 (=net debit), single
+  breakeven exactly 105 (=lower strike + net debit); plus a naked short
+  call (unbounded loss), a cash-secured short put (loss BOUNDED at
+  spot=0, not unbounded — max loss exactly 94 = strike − premium), and
+  full input-validation coverage. Wired into `cmd/server/main.go` as a
+  single stateless `POST /payoff-diagram/compute` endpoint (post the
+  full current leg set, get back `maxProfitInMinorUnits`/
+  `maxProfitIsUnbounded`/`maxLossInMinorUnits`/`maxLossIsUnbounded`/
+  `breakevenPricesInMinorUnits`). Verified live against a real running
+  server: the long straddle example returned exactly
+  `maxLossInMinorUnits:10, maxProfitIsUnbounded:true,
+  breakevenPricesInMinorUnits:[90,110]`; the bull call spread example
+  returned exactly `maxProfitInMinorUnits:5, maxLossInMinorUnits:5,
+  breakevenPricesInMinorUnits:[105]` — both matching the unit tests'
+  hand-worked numbers exactly; an empty-legs request correctly returned
+  400.
+  **Known gaps**: (1) at-expiry payoff only — no time-value/theta-decay
+  curve for an intermediate date before expiry (a real "payoff diagram
+  as of today" needs an options-pricing model, which this package
+  deliberately doesn't attempt); (2) no direct coupling to
+  `internal/multilegoptions`' leg type or `internal/optionschain`'s
+  synthetic chain — a caller has to translate either into this package's
+  `OptionLeg` shape itself.
+
+- **Multi-leg options strategy builder with atomic all-or-nothing
+  execution** (`internal/multilegoptions`, FEATURES.md §15): `POST
+  /multileg-options/execute` accepts a named strategy shape
+  (`STRADDLE`/`STRANGLE`/`BULL_CALL_SPREAD`/`BEAR_PUT_SPREAD`/
+  `IRON_CONDOR`/`BUTTERFLY`) and a leg set, and `multilegoptions.
+  ValidateStrategyShape` genuinely checks the legs match that strategy's
+  real textbook definition — leg count, call/put mix, buy/sell direction,
+  relative strike ordering, and quantity relationships (e.g. a straddle
+  must be one CALL + one PUT at the SAME strike, same quantity, same
+  direction; a butterfly's three strikes must be EQUALLY spaced with the
+  body quantity exactly double each wing's) — before any leg is submitted.
+  Execution is genuinely atomic: each leg is submitted through the EXACT
+  SAME `processOrderSubmission` pipeline every other order path reuses
+  (via a plain Go closure — nothing duplicated); if any leg is rejected,
+  every previously-accepted leg is rolled back with a REAL, genuinely-
+  submitted opposite-side compensating order for the same quantity — not
+  a no-op. 27 tests including full shape-validation coverage for all six
+  strategies and atomic-execution tests (all-accepted, a rejected-second-
+  leg genuinely rolling back the first, a rollback-that-itself-fails
+  surfacing loudly, a shape-invalid request submitting zero legs). Verified
+  live: a valid long straddle had both legs accepted; an invalid two-CALL
+  "straddle" was rejected before any submission; a straddle where the
+  second leg breached a configured exposure limit showed the first leg
+  genuinely accepted then genuinely rolled back — including the
+  rollback's OWN attempt being independently exposure-limited and that
+  failure surfacing in `rollbackErrorMessage`, and the account's real
+  position correctly settling back to empty.
+  **HONEST SCOPE BOUNDARY**: matching-engine has no real listed OPTIONS
+  instrument — each leg submits as an ordinary LIMIT order (at the leg's
+  premium as price) against its own caller-supplied `instrumentSymbol`,
+  using the option-shape fields purely for validation math (borrowed
+  conceptually from `internal/payoffdiagram`'s leg idea, not its type).
+  Rollback is best-effort (a real compensating order, not a database
+  transaction) — see the package doc for the full contract.
+
+- **Basket/program order execution** (`internal/basketorders`,
+  FEATURES.md §15): `POST /basket-orders/execute` accepts (symbol, side,
+  quantity-or-weight) constituent tuples plus a
+  `netCashConstraintInMinorUnits`, computes the basket's real net cash
+  (buys' notional minus sells' notional, weight-mode quantities derived
+  from the constraint), and — if within the constraint — submits every
+  constituent through the exact same order-submission path, tracking real
+  aggregate fill status (`ALL_ACCEPTED`/`PARTIALLY_ACCEPTED`/
+  `NONE_ACCEPTED`) and per-constituent filled quantity. Deliberately NOT
+  atomic (contrast `internal/multilegoptions` above) — a rejected
+  constituent doesn't stop the rest of the basket from being submitted, a
+  real program-trade tolerance FEATURES.md itself only asks "tracking
+  aggregate fill status" for. A basket that would breach its OWN stated
+  cash constraint is rejected wholesale, with ZERO submissions, before
+  ever touching the order pipeline. 20 tests including quantity-mode and
+  weight-mode resolution (hand-worked: 60%/40% weights over a 100,000
+  budget → exactly 600/200 shares at 100/200 reference prices), exact-
+  at-constraint-allowed, buy+sell net-offsetting cash, and a
+  partially-accepted aggregate-status test. Verified live: a 5-share
+  quantity-mode basket genuinely filled against the real order book; a
+  basket breaching its net cash constraint was rejected with zero
+  submissions; a 100%-weight basket resolved to the same real fill.
+  **Known gap**: `ReferencePriceInMinorUnits` is caller-supplied (no live
+  price feed — the same documented gap this codebase repeats everywhere).
+
+- **Pre-trade impact-cost / slippage estimator**
+  (`internal/impactcostestimator`, FEATURES.md §15): `POST
+  /impact-cost/estimate` takes a hypothetical order size and a real order
+  book depth snapshot (bid/ask price levels), and walks the book — best
+  price first, consuming each level's quantity before moving to the next,
+  exactly like a real matching engine crossing a marketable order — to
+  compute the real, quantity-weighted average fill price and the
+  resulting slippage against the best available price. 13 tests including
+  hand-worked multi-level walks (10 @ 10000 + 20 @ 10100 = exactly
+  10066.67 average for a 30-unit buy), a sell walking bids descending,
+  depth-insufficient-for-full-size correctly capping the fillable
+  quantity, and strict bid-descending/ask-ascending ordering validation.
+  Verified live: a 30-unit buy against a real 3-level book returned
+  exactly the hand-worked `10033.33` average (for the smaller 15-unit
+  case tested) and `33.33` slippage; a 100-unit buy against 60 total ask
+  depth correctly capped `quantityFillable` at 60 with
+  `depthInsufficientForFullSize:true`; malformed (unsorted) depth was
+  rejected with a specific error.
+  **LOUD, REPEATED KNOWN GAP**: oms-gateway has NO way to query a real,
+  live order book depth snapshot — matching-engine only PUSHES its full
+  depth fire-and-forget to `market-data` (verified by reading both
+  services' code before writing this package: `internal/
+  matchingengineclient` has no depth-query method at all, and
+  market-data's own HTTP API has no full-depth-ladder endpoint either,
+  only trades/candles/an L1-only WS feed). The depth snapshot is therefore
+  an explicit, CALLER-SUPPLIED request field — the same "the real
+  computation exists, the live feed to source its input doesn't" pattern
+  `internal/executionalgos`' VWAP/POV inputs already established.
+
+- **Portfolio margining / cross-margining across correlated asset
+  classes** (`internal/marginengine`'s `portfolioCrossMargining.go`,
+  FEATURES.md §15): `POST /margin/calculate-portfolio-margin` extends the
+  existing SPAN+exposure calculator with a real netting-benefit
+  computation for a multi-position portfolio: for every pair of positions
+  in DIFFERENT asset classes with OPPOSITE direction (long vs. short) and
+  a POSITIVE illustrative correlation, `nettingBenefit = correlation *
+  min(standaloneMarginA, standaloneMarginB)`, summed and subtracted from
+  the portfolio's gross standalone margin — floored at the single largest
+  standalone margin in the book (a real portfolio scheme never nets below
+  what its riskiest single leg alone would require). 21 tests including a
+  fully hand-worked two-leg example (long EQUITY ₹5,00,000 notional +
+  short INDEX_FUTURES ₹4,00,000 notional, correlation 0.85 → gross
+  margin ₹1,17,000, netting benefit exactly ₹44,200, net margin exactly
+  ₹72,800), same-direction/same-asset-class/uncorrelated-pair zero-benefit
+  cases, and the largest-standalone-margin floor. Verified live: the exact
+  same hand-worked example returned `grossMarginInMinorUnits:117000,
+  totalNettingBenefitInMinorUnits:44200,
+  netPortfolioMarginInMinorUnits:72800` from the real running server.
+  **LOUD, REPEATED KNOWN GAP**, same caliber as the pre-existing SPAN
+  calculator's own warning: the correlation table is a MADE-UP,
+  order-of-magnitude illustration, NOT a real historical-correlation
+  study or exchange cross-margining eligibility list; same-asset-class
+  netting isn't modeled at all (would need a real covariance-matrix / VaR
+  calculation). NOT exchange-certified, NOT SEBI-compliant.
+
+- **Securities Lending & Borrowing (SLB) desk**
+  (`internal/securitieslendingborrowing`, FEATURES.md §15): a real,
+  mutex-guarded state machine — the same pattern as `internal/
+  marginpledge`'s `PledgeBook` — with TWO independent ledgers. `POST
+  /securities-lending/lend` moves quantity of a symbol the lending
+  account actually holds (server-looked-up from `internal/positions`,
+  never client-asserted) out of its freely-sellable holding into a real
+  `LendingRecord`; `POST /securities-lending/recall` reverses it
+  (partially or fully). `POST /securities-lending/borrow` records a
+  borrow — deliberately requiring NO prior holding (the entire point of
+  borrowing, e.g. to cover a short); `POST /securities-lending/return`
+  reverses it. `GET /securities-lending?accountId=...` shows both ledgers.
+  A real, hand-checkable day-count fee-accrual formula
+  (`CalculateIllustrativeAccruedFee`) mirrors `internal/marginfunding`'s
+  own interest formula. 20 tests including accumulation across calls,
+  insufficient-holding rejection, independent lending/borrowing ledgers on
+  the SAME account/symbol, hand-worked full-year and half-year fee
+  accrual, and a concurrency test proving exactly 50 of 100 simultaneous
+  1-share lends succeed against a 50-share holding. Verified live: lending
+  1 DEMO-EQ share (a real held position) succeeded and showed up in the
+  status endpoint; lending more than held was genuinely rejected; a
+  separate account borrowed 5 shares with zero prior holding; recall and
+  return both correctly zeroed out their records.
+  **Known gaps**: (1) illustrative lending/borrowing fee rates (2%/5%
+  p.a.), not sourced from any real securities-lending market; (2) not
+  wired into the order-submission SELL gate the way `internal/
+  marginpledge`'s pledged quantity is (a lent-out holding can still be
+  sold in this build — a real build would add the same
+  `PLEDGED_QUANTITY_UNAVAILABLE`-style gate); (3) no lender-to-borrower
+  matching/auction (two independent books, not a matched market).
+
+- **Pre-market / post-market session support with distinct matching
+  rules** (`internal/marketsession`'s `sessionPhaseRules.go`, FEATURES.md
+  §15): a new, additive `SessionPhase` (`CLOSED`/`PRE_MARKET`/`REGULAR`/
+  `POST_MARKET`, independent of the pre-existing `isMarketOpen` boolean
+  that already drives AMO queueing — see the file's doc comment for why
+  they're deliberately separate state) with REAL, enforced rules: `POST
+  /market-session/set-phase` sets it, and `processOrderSubmission` (so
+  EVERY order path — HTTP submit, DMA gateway, cover orders, multi-leg,
+  baskets, auto-liquidation — inherits it for free) genuinely rejects any
+  non-plain-LIMIT order (MARKET, SL/SL-M, ICEBERG/FOK/IOC) during
+  `PRE_MARKET` or `POST_MARKET` with `SESSION_PHASE_RULE_VIOLATION` —
+  mirroring a real exchange's pre-open call-auction and after-hours
+  closing sessions, both order-collection-and-single-match windows where a
+  market/stop order genuinely doesn't make sense. `REGULAR` and `CLOSED`
+  are both no-ops for this NEW gate (`CLOSED`'s real rejection stays owned
+  by the pre-existing `isMarketOpen`/AMO mechanism, avoiding two competing
+  "is it closed" checks). 13 tests including phase-transition validation,
+  full rule coverage per phase (every order shape allowed in REGULAR,
+  only plain LIMIT in PRE_MARKET/POST_MARKET, CLOSED as a no-op for this
+  gate), and independence from `isMarketOpen`. Verified live: setting
+  `PRE_MARKET` genuinely rejected a MARKET order
+  (`SESSION_PHASE_RULE_VIOLATION`) while a plain LIMIT order in the same
+  phase was accepted and genuinely filled; switching to `REGULAR` then
+  let the identical MARKET order through and fill.
+  **Known gap**: an operator wanting fully realistic session behavior must
+  set BOTH `isMarketOpen` (for AMO queueing) and `sessionPhase` (for these
+  new rules) — they are not automatically coupled, a deliberate choice to
+  avoid silently changing `isMarketOpen`'s pre-existing, already-tested
+  behavior.
+
+- **Dividend Reinvestment Plan (DRIP), auto-compounding toggle**
+  (`internal/drip`, FEATURES.md §17): `POST /drip/toggle` sets a real,
+  mutex-guarded per-account auto-reinvestment toggle (default OFF —
+  unconfigured/untoggled accounts are unaffected, the same convention
+  `internal/algolimits`/`internal/exposurelimits` already use). `POST
+  /drip/process-dividend` looks up the account's REAL held quantity
+  (`internal/positions`, never client-asserted), computes the exact
+  dividend cash credit (`quantityHeld * dividendPerShareInMinorUnits`),
+  posts it through a REAL balanced ledger journal entry
+  (`internal/ledgerclient`'s new `PostDividendCreditJournalEntry`,
+  mechanically mirroring the margin-funding disbursement pattern) and
+  updates the local risk cache immediately — then, if auto-reinvest is
+  ON and a reinvestment reference price was supplied, computes a real
+  whole-share reinvestment quantity (`drip.CalculateReinvestmentQuantity`
+  — exact integer division, leftover cash reported) and submits a REAL BUY
+  order through the EXACT SAME `processOrderSubmission` pipeline every
+  other order path reuses. 12 tests (in `internal/drip`) plus 2 new tests
+  in `internal/ledgerclient` for the dividend journal entry, including
+  hand-worked credit/reinvestment-quantity math and per-account toggle
+  independence. Verified live: crediting a real ₹5.00/share dividend on a
+  real 10-share holding credited exactly 500 minor units with auto-
+  reinvest OFF; toggling ON and re-crediting the same dividend computed
+  `reinvestmentQuantity:5` at a supplied ₹1.00 reference price
+  (500/100 = 5 exactly) and genuinely submitted a real BUY order through
+  the real pipeline.
+  **Known gaps**: (1) no live price feed — the reinvestment reference
+  price is caller-supplied, the same documented gap this codebase repeats
+  everywhere; (2) whole-share reinvestment only — leftover cash isn't
+  automatically carried forward to the next dividend event, and this
+  package deliberately does NOT integrate with any fractional-share
+  feature; (3) in-memory only.
+
+- **Loan Against Securities (LAS)** (`internal/loanagainstsecurities`,
+  FEATURES.md §17): modeled closely on `internal/marginfunding` (the same
+  mutex-guarded two-phase reserve-then-disburse-then-rollback-on-failure
+  flow), but a genuinely DISTINCT, longer-tenure loan product: capped at
+  only `illustrativeLoanToValuePercent` (50%) of pledged collateral value
+  — deliberately STRICTER than margin funding's own cap at the FULL
+  pledged value — with a recorded (informational)
+  `tenureInMonths`. `POST /loan-against-securities/request` reserves
+  principal against the account's real pledged collateral
+  (`internal/marginpledge`), then disburses REAL cash via a new
+  `internal/ledgerclient.PostLoanAgainstSecuritiesDisbursementJournalEntry`
+  balanced journal entry, rolling the reservation back if disbursement
+  fails. `POST /loan-against-securities/repay` — unlike margin funding's
+  own still-unwired repayment gap — posts a REAL repayment journal entry
+  and pays down real outstanding principal, itself rolling back (via the
+  new `RestorePrincipalAfterFailedRepaymentLedgerPosting`) if that ledger
+  posting fails. `GET /loan-against-securities?accountId=...` shows
+  outstanding principal, tenure, LTV cap, and remaining capacity. 21 tests
+  including a hand-worked LTV cap (₹1,00,000 pledged × 50% = exactly
+  ₹50,000 cap), exact-boundary-allowed, accumulation-caps-correctly,
+  repayment, restore-after-failed-repayment, and a concurrency test
+  proving exactly 50 of 100 simultaneous ₹10,000 requests succeed against
+  a ₹5,00,000 LTV cap — plus 3 new `internal/ledgerclient` tests for the
+  LAS disbursement/repayment journal entries. Verified live: pledging 5
+  DEMO-EQ shares (₹42,500 real margin value) showed an exact
+  `loanToValueCapInMinorUnits:21250` (50% of 42500); a ₹10,000 loan was
+  approved (real disbursement, real outstanding-principal figure); a
+  ₹9,00,000 request was genuinely rejected against the real cap; a
+  ₹5,000 repayment correctly reduced outstanding principal to exactly
+  ₹5,000.
+  **Known gaps**: same caliber as `internal/marginfunding`'s own — (1)
+  illustrative LTV (50%) and interest rate (9% p.a.) are made-up, not from
+  any real lender's rate card; (2) `tenureInMonths` is recorded but not
+  enforced by any clock-driven maturity/expiry logic (no real trading
+  calendar exists in this build); (3) interest accrual is a real, tested
+  formula but not wired to run automatically or post any interest journal
+  entry; (4) reuses `firm-clearing-acct` rather than a dedicated LAS
+  clearing account, the same ledger-account-provisioning boundary
+  `internal/marginfunding` already documents; (5) in-memory only.
+
+**Not attempted this round**: FEATURES.md §17's fractional share
+investing (milli-share integer precision through order submission +
+positions) — explicitly time-boxed out given its risk profile (touches
+`internal/orders`' core `OrderQuantity uint64` field and every consumer of
+it, with an explicit "do not break any existing integer-quantity test"
+constraint) rather than attempted partially and left in an inconsistent
+state. A future pass should introduce a `MilliShareQuantity` (or similar)
+field alongside the existing integer `OrderQuantity` — additive, backward
+compatible — and thread it through `internal/positions`' net-quantity
+tracking and matching-engine's wire protocol, exactly the same additive
+pattern `internal/orders`' `OrderExecutionType` field already used for
+Iceberg/FOK/IOC.
 
 What's a placeholder:
 - The matching-engine hand-off is synchronous TCP+JSON, one connection
@@ -669,3 +1260,180 @@ curl "localhost:8081/algo-limits?strategyId=algo-1"
 
 go test ./...
 ```
+
+# Mark-to-Market: push a current price, then check leveraged unrealized P&L
+curl -X POST localhost:8081/mark-to-market/price -d '{
+  "instrumentSymbol": "DEMO-EQ",
+  "priceInMinorUnits": 11000
+}'
+curl "localhost:8081/mark-to-market?accountId=acct-001"
+
+# Auto-liquidation: pure status read never acts, even at LIQUIDATION
+curl "localhost:8081/auto-liquidation/status?accountId=acct-001"
+# admin/scheduler-triggerable evaluate — only actually liquidates (real
+# reducing MARKET SELL orders through the real order path) if genuinely
+# at LIQUIDATION (100%+ utilization); a no-op at WARNING/URGENT/NORMAL
+curl -X POST localhost:8081/auto-liquidation/evaluate -d '{
+  "accountIdentifier": "acct-001"
+}'
+
+# Exposure limits: configure a real per-account + per-segment cap, then
+# watch a breaching order get rejected with a specific, identifying reason
+curl -X POST localhost:8081/exposure-limits/configure -d '{
+  "accountIdentifier": "acct-001",
+  "segment": "EQUITY",
+  "accountLimitInMinorUnits": 50000,
+  "segmentLimitInMinorUnits": 30000
+}'
+curl "localhost:8081/exposure-limits?accountId=acct-001&segment=EQUITY"
+
+# Connectivity kill switch: manual admin engage/disengage halts/resumes
+# ALL new order submissions (cancellation is never gated); an independent
+# background prober also auto-engages/self-heals on real matching-engine
+# connectivity — see internal/connectivitykillswitch's package doc.
+curl "localhost:8081/connectivity-kill-switch/status"
+curl -X POST localhost:8081/connectivity-kill-switch/engage -d '{
+  "reason": "admin-initiated trading halt"
+}'
+curl -X POST localhost:8081/connectivity-kill-switch/disengage
+
+# Execution algos — TWAP: 1000 shares over a 30-minute window in 4 slices
+curl -X POST localhost:8081/execution-algos/twap/create -d '{
+  "instrumentSymbol": "RELIANCE",
+  "orderSideIsBuyNotSell": true,
+  "totalQuantity": 1000,
+  "startTime": "2026-08-14T10:00:00Z",
+  "endTime": "2026-08-14T10:30:00Z",
+  "numberOfSlices": 4
+}'
+# -> note "algoOrderId" in the response, then poll it forward:
+curl -X POST localhost:8081/execution-algos/poll -d '{
+  "algoOrderId": "TWAP-1",
+  "now": "2026-08-14T10:15:00Z"
+}'
+
+# Execution algos — VWAP: weighted by a supplied historical volume curve
+curl -X POST localhost:8081/execution-algos/vwap/create -d '{
+  "instrumentSymbol": "INFY",
+  "orderSideIsBuyNotSell": true,
+  "totalQuantity": 1000,
+  "volumeCurve": [
+    {"bucketReleaseTime": "2026-08-14T09:15:00Z", "historicalVolumeWeight": 1},
+    {"bucketReleaseTime": "2026-08-14T10:15:00Z", "historicalVolumeWeight": 4},
+    {"bucketReleaseTime": "2026-08-14T11:15:00Z", "historicalVolumeWeight": 2},
+    {"bucketReleaseTime": "2026-08-14T12:15:00Z", "historicalVolumeWeight": 3}
+  ]
+}'
+
+# Execution algos — POV: 10% participation, capped at 50 units/slice
+curl -X POST localhost:8081/execution-algos/pov/create -d '{
+  "instrumentSymbol": "SBIN",
+  "orderSideIsBuyNotSell": true,
+  "totalQuantity": 1000,
+  "participationRate": 0.1,
+  "maxClipSizeQuantity": 50
+}'
+# -> note "algoOrderId", then feed real-time cumulative volume readings:
+curl -X POST localhost:8081/execution-algos/pov/observe-volume -d '{
+  "algoOrderId": "POV-3",
+  "now": "2026-08-14T10:01:00Z",
+  "cumulativeMarketVolume": 10300
+}'
+curl "localhost:8081/execution-algos/status?algoOrderId=POV-3"
+
+# Options payoff diagram — long straddle: max loss 10, unbounded profit,
+# breakevens at 90 and 110
+curl -X POST localhost:8081/payoff-diagram/compute -d '{
+  "legs": [
+    {"optionType": "CALL", "strikePriceInMinorUnits": 100, "premiumInMinorUnits": 5, "isBuyNotSell": true, "quantity": 1},
+    {"optionType": "PUT", "strikePriceInMinorUnits": 100, "premiumInMinorUnits": 5, "isBuyNotSell": true, "quantity": 1}
+  ]
+}'
+# bull call spread: max profit 5, max loss 5, breakeven 105
+curl -X POST localhost:8081/payoff-diagram/compute -d '{
+  "legs": [
+    {"optionType": "CALL", "strikePriceInMinorUnits": 100, "premiumInMinorUnits": 8, "isBuyNotSell": true, "quantity": 1},
+    {"optionType": "CALL", "strikePriceInMinorUnits": 110, "premiumInMinorUnits": 3, "isBuyNotSell": false, "quantity": 1}
+  ]
+}'
+
+# Multi-leg options: a valid long straddle -- both legs submitted
+# atomically through the real order-submission path
+curl -X POST localhost:8081/multileg-options/execute -d '{
+  "clientAccountIdentifier": "acct-001",
+  "strategy": "STRADDLE",
+  "legs": [
+    {"instrumentSymbol":"DEMO-EQ","optionType":"CALL","strikePriceInMinorUnits":100,"premiumInMinorUnits":50,"isBuyNotSell":true,"quantity":2},
+    {"instrumentSymbol":"DEMO-EQ","optionType":"PUT","strikePriceInMinorUnits":100,"premiumInMinorUnits":50,"isBuyNotSell":true,"quantity":2}
+  ]
+}'
+
+# Basket/program order: buy multiple constituents as one logical unit,
+# capped by a net cash constraint
+curl -X POST localhost:8081/basket-orders/execute -d '{
+  "basketIdentifier": "basket-1",
+  "clientAccountIdentifier": "acct-001",
+  "netCashConstraintInMinorUnits": 100000,
+  "constituents": [
+    {"instrumentSymbol":"DEMO-EQ","isBuyNotSell":true,"quantity":5,"referencePriceInMinorUnits":10000}
+  ]
+}'
+
+# Pre-trade impact-cost / slippage estimator: walk-the-book against a
+# caller-supplied depth snapshot (see the honest "no live depth feed"
+# gap in internal/impactcostestimator's package doc)
+curl -X POST localhost:8081/impact-cost/estimate -d '{
+  "snapshot": {
+    "instrumentSymbol": "DEMO-EQ",
+    "bidLevels": [{"priceInMinorUnits":9900,"quantity":10},{"priceInMinorUnits":9800,"quantity":20}],
+    "askLevels": [{"priceInMinorUnits":10000,"quantity":10},{"priceInMinorUnits":10100,"quantity":20}]
+  },
+  "isBuyNotSell": true,
+  "hypotheticalQuantity": 15
+}'
+
+# Portfolio margining / cross-margining -- illustrative correlation table,
+# NOT exchange-certified
+curl -X POST localhost:8081/margin/calculate-portfolio-margin -d '{
+  "positions": [
+    {"assetClass":"EQUITY","contractNotionalValueInMinorUnits":500000,"isLongNotShort":true},
+    {"assetClass":"INDEX_FUTURES","contractNotionalValueInMinorUnits":400000,"isLongNotShort":false}
+  ]
+}'
+
+# Securities Lending & Borrowing desk
+curl -X POST localhost:8081/securities-lending/lend -d '{
+  "clientAccountIdentifier":"acct-001","instrumentSymbol":"DEMO-EQ","quantity":1,"referencePriceInMinorUnits":10000
+}'
+curl -X POST localhost:8081/securities-lending/borrow -d '{
+  "clientAccountIdentifier":"acct-003","instrumentSymbol":"DEMO-EQ","quantity":5,"referencePriceInMinorUnits":10000
+}'
+curl "localhost:8081/securities-lending?accountId=acct-001"
+
+# Pre-market/post-market session rules: only plain LIMIT orders accepted
+curl -X POST localhost:8081/market-session/set-phase -d '{"phase":"PRE_MARKET"}'
+curl -X POST localhost:8081/orders/submit -d '{
+  "clientAccountIdentifier":"acct-001","instrumentSymbol":"DEMO-EQ","orderSideIsBuyNotSell":true,
+  "orderIsMarketOrderNotLimit":true,"orderQuantity":1
+}'
+# -> rejected with SESSION_PHASE_RULE_VIOLATION; a plain LIMIT order in
+# the same phase is accepted
+curl -X POST localhost:8081/market-session/set-phase -d '{"phase":"REGULAR"}'
+
+# DRIP: toggle auto-reinvest, then process a real dividend event
+curl -X POST localhost:8081/drip/toggle -d '{"clientAccountIdentifier":"acct-001","enabled":true}'
+curl -X POST localhost:8081/drip/process-dividend -d '{
+  "clientAccountIdentifier":"acct-001","instrumentSymbol":"DEMO-EQ","dividendPerShareInMinorUnits":50,
+  "reinvestmentReferencePriceInMinorUnits":100
+}'
+
+# Loan Against Securities: pledge collateral first (see the margin-pledge
+# example above), then draw a longer-tenure loan capped at a stricter
+# loan-to-value ratio than margin funding's own cap
+curl -X POST localhost:8081/loan-against-securities/request -d '{
+  "clientAccountIdentifier":"acct-001","requestedAmountInMinorUnits":10000,"tenureInMonths":12
+}'
+curl "localhost:8081/loan-against-securities?accountId=acct-001"
+curl -X POST localhost:8081/loan-against-securities/repay -d '{
+  "clientAccountIdentifier":"acct-001","amountInMinorUnits":5000
+}'

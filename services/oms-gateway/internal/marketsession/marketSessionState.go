@@ -19,6 +19,12 @@ import "sync"
 type MarketSessionState struct {
 	mutexGuardingIsOpen sync.RWMutex
 	isMarketOpen        bool
+
+	// sessionPhase: FEATURES.md §15's pre-market/post-market extension —
+	// see sessionPhaseRules.go. Deliberately independent of isMarketOpen
+	// above (guarded by the same mutex, but a distinct field) — see that
+	// file's doc comment for why.
+	sessionPhase SessionPhase
 }
 
 // NewMarketSessionState starts CLOSED — matches the intuition that a

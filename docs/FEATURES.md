@@ -182,30 +182,30 @@ onto an internal one later is expensive.
 - [ ] 🚧 `[P0]` Auth, dashboard, portfolio summary
 - [ ] 🚧 `[P1]` Order ticket (equities), MF investing flow, SIP management
 - [ ] 🚧 `[P1]` Watchlists, alerts (price/technical triggers)
-- [ ] `[P2]` Options chain (simplified retail view)
-- [ ] `[P2]` Push notifications: order fills, price alerts, margin calls
-- [ ] `[P3]` Social/copy-trading: follow verified strategies or traders (opt-in, disclosed)
+- [ ] 🚧 `[P2]` Options chain (simplified retail view)
+- [ ] 🚧 `[P2]` Push notifications: order fills, price alerts, margin calls
+- [ ] 🚧 `[P3]` Social/copy-trading: follow verified strategies or traders (opt-in, disclosed)
 
 ## 12. Risk, Margin & Surveillance
 
 - [ ] 🚧 `[P1]` Pre-trade risk checks: balance/margin sufficiency, position limits
-- [ ] `[P2]` Real-time Mark-to-Market engine across leveraged positions
-- [ ] `[P2]` Auto-liquidation on margin breach, with graduated warnings first
-- [ ] `[P2]` Per-user, per-segment exposure limits (configurable by risk team)
-- [ ] `[P4]` Circuit breaker / kill-switch at the exchange-connectivity layer
+- [ ] 🚧 `[P2]` Real-time Mark-to-Market engine across leveraged positions
+- [ ] 🚧 `[P2]` Auto-liquidation on margin breach, with graduated warnings first
+- [ ] 🚧 `[P2]` Per-user, per-segment exposure limits (configurable by risk team)
+- [ ] 🚧 `[P4]` Circuit breaker / kill-switch at the exchange-connectivity layer
 
 ## 13. Platform, DevOps & Observability (absent from the original brief — non-negotiable for anything handling money)
 
 - [ ] 🚧 `[P0]` CI/CD per service, environment promotion (dev → staging → prod)
 - [ ] 🚧 `[P0]` Structured logging + centralized log aggregation
 - [ ] 🚧 `[P0]` Metrics/tracing (latency histograms on the execution path especially)
-- [ ] `[P1]` Alerting on SLO breach (feed staleness, order-reject spikes, matching latency)
-- [ ] `[P1]` Secrets management, least-privilege IAM per service
-- [ ] `[P1]` Automated backups + tested restore procedure for ledger DB
-- [ ] `[P2]` Disaster recovery: documented RTO/RPO, DR region failover drill
-- [ ] `[P2]` Chaos/load testing on the OMS and matching path before go-live
-- [ ] `[P2]` API gateway rate limiting, quota tiers (retail vs. institutional)
-- [ ] `[P3]` Blue/green or canary deploys for the matching engine specifically
+- [ ] 🚧 `[P1]` Alerting on SLO breach (feed staleness, order-reject spikes, matching latency)
+- [ ] 🚧 `[P1]` Secrets management, least-privilege IAM per service
+- [ ] 🚧 `[P1]` Automated backups + tested restore procedure for ledger DB
+- [ ] 🚧 `[P2]` Disaster recovery: documented RTO/RPO, DR region failover drill
+- [ ] 🚧 `[P2]` Chaos/load testing on the OMS and matching path before go-live
+- [ ] 🚧 `[P2]` API gateway rate limiting, quota tiers (retail vs. institutional)
+- [ ] 🚧 `[P3]` Blue/green or canary deploys for the matching engine specifically
 
 ## 14. Customer Support & Ops Tooling
 
@@ -219,21 +219,21 @@ onto an internal one later is expensive.
 
 ## 15. Advanced Execution & Trading Sophistication
 
-- [ ] `[P3]` Execution algos for institutional/large orders: VWAP, TWAP, POV
+- [ ] 🚧 `[P3]` Execution algos for institutional/large orders: VWAP, TWAP, POV
       (Percentage of Volume), Implementation Shortfall
-- [ ] `[P3]` Multi-leg options strategy builder (straddle, strangle, spreads,
+- [ ] 🚧 `[P3]` Multi-leg options strategy builder (straddle, strangle, spreads,
       iron condor, butterfly) with atomic all-or-nothing execution
-- [ ] `[P3]` Options strategy payoff diagram (max profit/loss, breakevens
+- [ ] 🚧 `[P3]` Options strategy payoff diagram (max profit/loss, breakevens
       computed live as legs are added)
-- [ ] `[P3]` Basket/program order execution (buy/sell N instruments as one
+- [ ] 🚧 `[P3]` Basket/program order execution (buy/sell N instruments as one
       logical order with net cash constraint)
-- [ ] `[P3]` Pre-trade impact-cost / slippage estimator ("what-if" simulator
+- [ ] 🚧 `[P3]` Pre-trade impact-cost / slippage estimator ("what-if" simulator
       before order submission, using current DOM depth)
-- [ ] `[P4]` Portfolio margining / cross-margining across correlated asset
+- [ ] 🚧 `[P4]` Portfolio margining / cross-margining across correlated asset
       classes (equities + derivatives netted, not siloed)
-- [ ] `[P4]` Securities Lending & Borrowing (SLB) desk for short-sellers and
+- [ ] 🚧 `[P4]` Securities Lending & Borrowing (SLB) desk for short-sellers and
       idle-holding yield generation
-- [ ] `[P4]` Pre-market / post-market / extended-hours session support with
+- [ ] 🚧 `[P4]` Pre-market / post-market / extended-hours session support with
       distinct matching rules
 
 ## 16. AI, Data & Research
@@ -256,9 +256,9 @@ onto an internal one later is expensive.
 ## 17. Wealth & Product Breadth
 
 - [ ] `[P3]` Fractional share investing
-- [ ] `[P3]` Dividend Reinvestment Plans (DRIP), auto-compounding toggle
-- [ ] `[P3]` ESG/sustainability scoring and screening filters
-- [ ] `[P3]` Loan Against Securities (LAS) — instant credit line against holdings
+- [ ] 🚧 `[P3]` Dividend Reinvestment Plans (DRIP), auto-compounding toggle
+- [ ] 🚧 `[P3]` ESG/sustainability scoring and screening filters
+- [ ] 🚧 `[P3]` Loan Against Securities (LAS) — instant credit line against holdings
 - [ ] `[P4]` Global markets access (US/international stocks via GDR/ADR or
       partner brokerage rails)
 - [ ] `[P4]` Retirement account wrappers (NPS/IRA-equivalent, tax-advantaged
@@ -270,17 +270,17 @@ onto an internal one later is expensive.
 
 ## 18. Platform, Ecosystem & Institutional Tooling
 
-- [ ] `[P3]` Public developer API with sandbox, API-key management, tiered
+- [ ] 🚧 `[P3]` Public developer API with sandbox, API-key management, tiered
       rate limits (this is how Zerodha's Kite Connect and Alpaca monetize
       the platform beyond retail commissions)
-- [ ] `[P3]` Webhook system for order/portfolio events (for third-party
+- [ ] 🚧 `[P3]` Webhook system for order/portfolio events (for third-party
       integrations, accounting software, tax tools)
-- [ ] `[P4]` White-label / Broker-as-a-Service offering for fintechs
-- [ ] `[P4]` FIX protocol certification suite for institutional onboarding
-- [ ] `[P4]` Transaction Cost Analysis (TCA) dashboards — post-trade best
+- [ ] 🚧 `[P4]` White-label / Broker-as-a-Service offering for fintechs
+- [ ] 🚧 `[P4]` FIX protocol certification suite for institutional onboarding
+- [ ] 🚧 `[P4]` Transaction Cost Analysis (TCA) dashboards — post-trade best
       execution reporting for institutional clients (regulatory requirement
       in many markets: MiFID II-style best-ex proof)
-- [ ] `[P4]` Account Aggregator integration — pull holdings from other
+- [ ] 🚧 `[P4]` Account Aggregator integration — pull holdings from other
       brokers/banks for a unified net-worth view (where a regulatory AA
       framework exists)
 
@@ -423,6 +423,7 @@ Mercurius/
 │   ├── ledger/              # Go/Postgres — double-entry accounting, settlement
 │   ├── kyc-onboarding/      # Go — identity verification workflows
 │   ├── mutual-funds/        # Go — AMC routing, SIP/lumpsum, step-up SIPs
+│   ├── api-gateway/         # Go — rate limiting, API keys, webhooks, TCA, SLO alerting
 │   └── backoffice/          # admin panel API
 ├── apps/
 │   ├── web/                 # Next.js retail app

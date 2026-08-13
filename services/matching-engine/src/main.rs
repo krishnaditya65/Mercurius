@@ -47,7 +47,14 @@ use wireProtocol::{
 };
 
 const TRADED_INSTRUMENT_SYMBOL: &str = "DEMO-EQ";
-const MATCHING_ENGINE_TCP_LISTEN_ADDRESS: &str = "127.0.0.1:9101";
+/// Default TCP listen address, overridable via the
+/// `MATCHING_ENGINE_TCP_LISTEN_ADDRESS` env var — same override pattern as
+/// `DEFAULT_WRITE_AHEAD_LOG_FILE_PATH`/`MATCHING_ENGINE_WAL_FILE_PATH`
+/// below. Needed so a second ("green") instance can run side by side with
+/// a first ("blue") one on the same host without a port clash — see
+/// `services/matching-engine/scripts/` and `BLUE_GREEN_DRILL.md` for the
+/// drill that exercises this.
+const DEFAULT_MATCHING_ENGINE_TCP_LISTEN_ADDRESS: &str = "127.0.0.1:9101";
 const MARKET_DATA_TCP_ADDRESS: &str = "127.0.0.1:9102";
 /// Default WAL file path, relative to the process's working directory.
 /// Overridable via the `MATCHING_ENGINE_WAL_FILE_PATH` env var (used by
@@ -108,9 +115,11 @@ fn main() {
 
     let writeAheadLogFilePath = std::env::var("MATCHING_ENGINE_WAL_FILE_PATH")
         .unwrap_or_else(|_| DEFAULT_WRITE_AHEAD_LOG_FILE_PATH.to_string());
+    let matchingEngineTcpListenAddress = std::env::var("MATCHING_ENGINE_TCP_LISTEN_ADDRESS")
+        .unwrap_or_else(|_| DEFAULT_MATCHING_ENGINE_TCP_LISTEN_ADDRESS.to_string());
 
     println!(
-        "matching-engine listening on {MATCHING_ENGINE_TCP_LISTEN_ADDRESS}, trading {TRADED_INSTRUMENT_SYMBOL} \
+        "matching-engine listening on {matchingEngineTcpListenAddress}, trading {TRADED_INSTRUMENT_SYMBOL} \
          (TCP+JSON bridge — see wireProtocol.rs for what's a placeholder here). WAL file: {writeAheadLogFilePath}"
     );
 
@@ -148,7 +157,7 @@ fn main() {
         .spawn(move || runMatchingCoreLoop(orderBookForInstrument, ingressConsumer, egressProducer))
         .expect("failed to spawn matching-core thread");
 
-    let tcpListener = TcpListener::bind(MATCHING_ENGINE_TCP_LISTEN_ADDRESS)
+    let tcpListener = TcpListener::bind(&matchingEngineTcpListenAddress)
         .expect("failed to bind matching-engine TCP listener");
 
     // The network thread (this one, `main`'s own thread): accepts

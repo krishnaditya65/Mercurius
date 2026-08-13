@@ -23,6 +23,8 @@
 // per project convention.
 
 import { useEffect, useState } from "react";
+import Link from "next/link";
+import NotificationCenterSection from "./notificationCenter/notificationCenterSection";
 
 const omsGatewayBaseUrl = process.env.NEXT_PUBLIC_OMS_GATEWAY_BASE_URL ?? "http://localhost:8081";
 const marketDataBaseUrl = process.env.NEXT_PUBLIC_MARKET_DATA_BASE_URL ?? "http://localhost:9103";
@@ -73,6 +75,10 @@ export default function RetailTradingDashboardPage() {
         <p className="text-sm text-neutral-500">
           Talks directly to oms-gateway&apos;s real endpoints — see FEATURES.md §11 for the full retail app scope.
         </p>
+        <nav className="mt-2 flex gap-4 text-sm underline">
+          <Link href="/optionsChain">Options chain</Link>
+          <Link href="/strategies">Follow strategies</Link>
+        </nav>
       </div>
 
       <AccountSection />
@@ -81,6 +87,7 @@ export default function RetailTradingDashboardPage() {
       <MarketSessionSection />
       <PositionsSection />
       <OrderLookupSection />
+      <NotificationCenterSection />
     </main>
   );
 }

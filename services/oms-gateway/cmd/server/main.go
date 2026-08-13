@@ -18,31 +18,45 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"sync"
 	"time"
 
 	"mercurius/omsgateway/internal/algolimits"
 	"mercurius/omsgateway/internal/amoqueue"
 	"mercurius/omsgateway/internal/audittrail"
+	"mercurius/omsgateway/internal/autoliquidation"
 	"mercurius/omsgateway/internal/backofficeclient"
+	"mercurius/omsgateway/internal/basketorders"
 	"mercurius/omsgateway/internal/chargescalculator"
+	"mercurius/omsgateway/internal/connectivitykillswitch"
 	"mercurius/omsgateway/internal/dmagateway"
+	"mercurius/omsgateway/internal/drip"
+	"mercurius/omsgateway/internal/executionalgos"
+	"mercurius/omsgateway/internal/exposurelimits"
 	"mercurius/omsgateway/internal/httplogging"
 	"mercurius/omsgateway/internal/idempotency"
+	"mercurius/omsgateway/internal/impactcostestimator"
 	"mercurius/omsgateway/internal/kycclient"
 	"mercurius/omsgateway/internal/ledgerclient"
+	"mercurius/omsgateway/internal/loanagainstsecurities"
 	"mercurius/omsgateway/internal/marginengine"
 	"mercurius/omsgateway/internal/marginfunding"
 	"mercurius/omsgateway/internal/marginpledge"
 	"mercurius/omsgateway/internal/marketsession"
+	"mercurius/omsgateway/internal/marktomarket"
 	"mercurius/omsgateway/internal/matchingengineclient"
 	"mercurius/omsgateway/internal/metrics"
+	"mercurius/omsgateway/internal/multilegoptions"
 	"mercurius/omsgateway/internal/optionschain"
 	"mercurius/omsgateway/internal/orders"
 	"mercurius/omsgateway/internal/papertrading"
+	"mercurius/omsgateway/internal/payoffdiagram"
 	"mercurius/omsgateway/internal/positions"
 	"mercurius/omsgateway/internal/quantengineclient"
 	"mercurius/omsgateway/internal/riskengine"
+	"mercurius/omsgateway/internal/securitieslendingborrowing"
 	"mercurius/omsgateway/internal/sequencing"
+	"mercurius/omsgateway/internal/strategyfollowing"
 )
 
 // demoTrackedAccountIdentifiers is the set of accounts this skeleton
@@ -87,6 +101,15 @@ func main() {
 	paperPositionBook := positions.NewPositionBook()
 	pledgeBook := marginpledge.NewPledgeBook()
 	fundingBook := marginfunding.NewFundingBook()
+	// loanAgainstSecuritiesBook: FEATURES.md §17 LAS — see
+	// internal/loanagainstsecurities' package doc.
+	loanAgainstSecuritiesBook := loanagainstsecurities.NewLoanBook()
+	// securitiesLendingBorrowingDesk: FEATURES.md §15 SLB desk — see
+	// internal/securitieslendingborrowing's package doc.
+	securitiesLendingBorrowingDesk := securitieslendingborrowing.NewDesk()
+	// dripToggleRegistry: FEATURES.md §17 DRIP auto-compounding toggle —
+	// see internal/drip's package doc.
+	dripToggleRegistry := drip.NewToggleRegistry()
 	// algoLimitsRegistry: FEATURES.md §7 strategy resource limits &
 	// circuit breakers. The default config (used by any strategyId that
 	// never gets an explicit override via POST /algo-limits/configure)
@@ -96,6 +119,32 @@ func main() {
 	// compatible with every pre-existing client that never sets
 	// strategyIdentifier at all.
 	algoLimitsRegistry := algolimits.NewRegistry(algolimits.StrategyLimitConfig{})
+	// executionAlgoOrderRegistry: FEATURES.md §15 execution algos
+	// (TWAP/VWAP/POV) — see internal/executionalgos' package doc for the
+	// scheduling engine itself; this registry is the HTTP-layer glue that
+	// tracks each created parent order's live scheduler by an
+	// algoOrderId so PollDueSlices/OnVolumeObservation can be driven over
+	// separate requests.
+	executionAlgoOrderRegistry := newExecutionAlgoOrderRegistry()
+	// strategyFollowingRegistry: FEATURES.md §11 social/copy-trading —
+	// opt-in follow/unfollow ONLY, see internal/strategyfollowing's
+	// package doc for the explicit "no order mirroring" scope boundary.
+	strategyFollowingRegistry := strategyfollowing.NewRegistry()
+	// markToMarketEngine: FEATURES.md §12 real-time MTM — see
+	// internal/marktomarket's package doc for the push-endpoint and
+	// leveraged-positions-only design choices.
+	markToMarketEngine := marktomarket.NewMarkToMarketEngine()
+	// exposureLimitsRegistry: FEATURES.md §12 per-user, per-segment
+	// exposure limits. Default (unconfigured) is unconstrained for every
+	// account/segment — see internal/exposurelimits' package doc.
+	exposureLimitsRegistry := exposurelimits.NewLimitsRegistry()
+	// connectivityKillSwitch: FEATURES.md §12 exchange-connectivity kill
+	// switch. Auto-engages after 3 consecutive matching-engine hand-off
+	// failures on the real order-submission path — see
+	// internal/connectivitykillswitch's package doc for why that's a
+	// genuine, already-existing integration point rather than a
+	// synthetic heartbeat.
+	connectivityKillSwitch := connectivitykillswitch.NewKillSwitch(3)
 	idempotencyStore := idempotency.NewIdempotencyStore()
 	marketSession := marketsession.NewMarketSessionState()
 	afterMarketOrderQueue := amoqueue.NewAfterMarketOrderQueue()
@@ -125,6 +174,35 @@ func main() {
 		pledgeBook:                    pledgeBook,
 		paperPositionBook:             paperPositionBook,
 		algoLimitsRegistry:            algoLimitsRegistry,
+		markToMarketEngine:            markToMarketEngine,
+		exposureLimitsRegistry:        exposureLimitsRegistry,
+		connectivityKillSwitch:        connectivityKillSwitch,
+		marketSession:                 marketSession,
+	}
+
+	// FEATURES.md §12 auto-liquidation — the reducing-order submission
+	// callback reuses the EXACT SAME processOrderSubmission pipeline
+	// every other order path (HTTP /orders/submit, DMA gateway) uses, via
+	// a plain Go closure — nothing duplicated. A liquidation order is
+	// always a real MARKET SELL, so it fills immediately against
+	// whatever's resting on the other side rather than risking never
+	// triggering a limit-price liquidation at all.
+	submitReducingOrderFunc := func(clientAccountIdentifier string, instrumentSymbol string, quantityToSell int64) (bool, error) {
+		acknowledgement := processOrderSubmission(orderSubmissionDeps, orders.OrderSubmissionRequest{
+			ClientAccountIdentifier:    clientAccountIdentifier,
+			InstrumentSymbol:           instrumentSymbol,
+			OrderSideIsBuyNotSell:      false,
+			OrderIsMarketOrderNotLimit: true,
+			OrderQuantity:              uint64(quantityToSell),
+		})
+		if !acknowledgement.WasOrderAccepted {
+			return false, errors.New(acknowledgement.HumanReadableRejectionReason)
+		}
+		return true, nil
+	}
+	liquidationEngine, liquidationEngineError := autoliquidation.NewLiquidationEngine(autoliquidation.DefaultThresholds(), submitReducingOrderFunc)
+	if liquidationEngineError != nil {
+		log.Fatalf("failed to construct autoliquidation engine: %v", liquidationEngineError)
 	}
 
 	httpRequestMultiplexer := http.NewServeMux()
@@ -138,6 +216,7 @@ func main() {
 	httpRequestMultiplexer.HandleFunc("/market-session/status", buildMarketSessionStatusHandler(marketSession, afterMarketOrderQueue))
 	httpRequestMultiplexer.HandleFunc("/market-session/open", buildMarketSessionOpenHandler(marketSession, afterMarketOrderQueue, orderSubmissionDeps))
 	httpRequestMultiplexer.HandleFunc("/market-session/close", buildMarketSessionCloseHandler(marketSession, auditTrail))
+	httpRequestMultiplexer.HandleFunc("/market-session/set-phase", buildSetSessionPhaseHandler(marketSession))
 	httpRequestMultiplexer.HandleFunc("/audit-trail", buildAuditTrailHandler(auditTrail))
 	httpRequestMultiplexer.HandleFunc("/orders/estimate-charges", buildEstimateChargesHandler())
 	httpRequestMultiplexer.HandleFunc("/metrics", metrics.BuildMetricsHandler(metricsRegistry))
@@ -146,11 +225,47 @@ func main() {
 	httpRequestMultiplexer.HandleFunc("/margin-pledge/set-utilized-margin", buildSetUtilizedMarginHandler(pledgeBook))
 	httpRequestMultiplexer.HandleFunc("/margin-pledge/holdings", buildPledgesForAccountHandler(pledgeBook))
 	httpRequestMultiplexer.HandleFunc("/margin/calculate-span-exposure", buildCalculateSpanExposureMarginHandler())
+	httpRequestMultiplexer.HandleFunc("/margin/calculate-portfolio-margin", buildCalculatePortfolioMarginHandler())
 	httpRequestMultiplexer.HandleFunc("/margin-funding/request", buildMarginFundingRequestHandler(fundingBook, pledgeBook, ledgerClient, preTradeRiskEngine))
 	httpRequestMultiplexer.HandleFunc("/margin-funding", buildMarginFundingStatusHandler(fundingBook, pledgeBook))
+	httpRequestMultiplexer.HandleFunc("/loan-against-securities/request", buildLoanAgainstSecuritiesRequestHandler(loanAgainstSecuritiesBook, pledgeBook, ledgerClient, preTradeRiskEngine))
+	httpRequestMultiplexer.HandleFunc("/loan-against-securities/repay", buildLoanAgainstSecuritiesRepayHandler(loanAgainstSecuritiesBook, ledgerClient, preTradeRiskEngine))
+	httpRequestMultiplexer.HandleFunc("/loan-against-securities", buildLoanAgainstSecuritiesStatusHandler(loanAgainstSecuritiesBook, pledgeBook))
 	httpRequestMultiplexer.HandleFunc("/options/chain", buildOptionsChainHandler(quantEngineClient))
 	httpRequestMultiplexer.HandleFunc("/algo-limits/configure", buildConfigureAlgoLimitsHandler(algoLimitsRegistry))
 	httpRequestMultiplexer.HandleFunc("/algo-limits", buildAlgoLimitsStatusHandler(algoLimitsRegistry))
+	httpRequestMultiplexer.HandleFunc("/strategies", buildListVerifiedStrategiesHandler(strategyFollowingRegistry))
+	httpRequestMultiplexer.HandleFunc("/strategies/admin/verify", buildVerifyStrategyHandler(strategyFollowingRegistry))
+	httpRequestMultiplexer.HandleFunc("/strategies/follow", buildFollowStrategyHandler(strategyFollowingRegistry))
+	httpRequestMultiplexer.HandleFunc("/strategies/unfollow", buildUnfollowStrategyHandler(strategyFollowingRegistry))
+	httpRequestMultiplexer.HandleFunc("/strategies/followers", buildStrategyFollowersHandler(strategyFollowingRegistry))
+	httpRequestMultiplexer.HandleFunc("/strategies/following", buildAccountFollowingHandler(strategyFollowingRegistry))
+	httpRequestMultiplexer.HandleFunc("/mark-to-market/price", buildSetMarkToMarketPriceHandler(markToMarketEngine))
+	httpRequestMultiplexer.HandleFunc("/mark-to-market", buildMarkToMarketHandler(markToMarketEngine, fundingBook, pledgeBook))
+	httpRequestMultiplexer.HandleFunc("/auto-liquidation/status", buildAutoLiquidationStatusHandler(fundingBook, pledgeBook))
+	httpRequestMultiplexer.HandleFunc("/auto-liquidation/evaluate", buildAutoLiquidationEvaluateHandler(liquidationEngine, fundingBook, pledgeBook, positionBook, markToMarketEngine))
+	httpRequestMultiplexer.HandleFunc("/exposure-limits/configure", buildConfigureExposureLimitsHandler(exposureLimitsRegistry))
+	httpRequestMultiplexer.HandleFunc("/exposure-limits", buildExposureLimitsStatusHandler(exposureLimitsRegistry))
+	httpRequestMultiplexer.HandleFunc("/connectivity-kill-switch/engage", buildEngageKillSwitchHandler(connectivityKillSwitch))
+	httpRequestMultiplexer.HandleFunc("/connectivity-kill-switch/disengage", buildDisengageKillSwitchHandler(connectivityKillSwitch))
+	httpRequestMultiplexer.HandleFunc("/connectivity-kill-switch/status", buildKillSwitchStatusHandler(connectivityKillSwitch))
+	httpRequestMultiplexer.HandleFunc("/execution-algos/twap/create", buildCreateTwapExecutionAlgoHandler(executionAlgoOrderRegistry))
+	httpRequestMultiplexer.HandleFunc("/execution-algos/vwap/create", buildCreateVwapExecutionAlgoHandler(executionAlgoOrderRegistry))
+	httpRequestMultiplexer.HandleFunc("/execution-algos/pov/create", buildCreatePovExecutionAlgoHandler(executionAlgoOrderRegistry))
+	httpRequestMultiplexer.HandleFunc("/execution-algos/poll", buildPollExecutionAlgoHandler(executionAlgoOrderRegistry))
+	httpRequestMultiplexer.HandleFunc("/execution-algos/pov/observe-volume", buildObservePovVolumeHandler(executionAlgoOrderRegistry))
+	httpRequestMultiplexer.HandleFunc("/execution-algos/status", buildExecutionAlgoStatusHandler(executionAlgoOrderRegistry))
+	httpRequestMultiplexer.HandleFunc("/payoff-diagram/compute", buildComputePayoffDiagramHandler())
+	httpRequestMultiplexer.HandleFunc("/multileg-options/execute", buildExecuteMultiLegOptionsHandler(orderSubmissionDeps))
+	httpRequestMultiplexer.HandleFunc("/basket-orders/execute", buildExecuteBasketOrderHandler(orderSubmissionDeps))
+	httpRequestMultiplexer.HandleFunc("/impact-cost/estimate", buildEstimateImpactCostHandler())
+	httpRequestMultiplexer.HandleFunc("/securities-lending/lend", buildLendSecurityHandler(securitiesLendingBorrowingDesk, positionBook))
+	httpRequestMultiplexer.HandleFunc("/securities-lending/recall", buildRecallLendingHandler(securitiesLendingBorrowingDesk))
+	httpRequestMultiplexer.HandleFunc("/securities-lending/borrow", buildBorrowSecurityHandler(securitiesLendingBorrowingDesk))
+	httpRequestMultiplexer.HandleFunc("/securities-lending/return", buildReturnBorrowingHandler(securitiesLendingBorrowingDesk))
+	httpRequestMultiplexer.HandleFunc("/securities-lending", buildSecuritiesLendingStatusHandler(securitiesLendingBorrowingDesk))
+	httpRequestMultiplexer.HandleFunc("/drip/toggle", buildSetDripToggleHandler(dripToggleRegistry))
+	httpRequestMultiplexer.HandleFunc("/drip/process-dividend", buildProcessDividendEventHandler(orderSubmissionDeps, dripToggleRegistry))
 
 	// FEATURES.md §3 DMA/FIX gateway (internal/dmagateway) — LOUD WARNING:
 	// NOT FIX-protocol-certified, see that package's doc comment for the
@@ -169,6 +284,29 @@ func main() {
 	go func() {
 		if dmaServerError := dmaServer.ListenAndServe(); dmaServerError != nil {
 			log.Printf("DMA/FIX-inspired gateway failed to start on %s: %v", dmaListenAddress, dmaServerError)
+		}
+	}()
+
+	// FEATURES.md §12 connectivity kill-switch — a real, independent
+	// background connectivity prober. WITHOUT this, the auto-engaged AUTO
+	// flag could never self-clear: once trading is halted, every new
+	// order submission is rejected BEFORE it ever reaches
+	// matchingEngineClient, so RecordConnectivityCheckResult would never
+	// be called again to observe a genuine recovery. This goroutine calls
+	// matchingEngineClient's real QueryOrderStatusAndAwaitResult (a cheap,
+	// already-existing read-only method — a dial/timeout failure is a
+	// genuine Go error from it, a legitimate "order not found" business
+	// response is not) every 2 seconds, completely independent of order
+	// flow, and feeds every result into the SAME kill switch — the real
+	// health-check-driven signal FEATURES.md §12 asks for.
+	go func() {
+		probeTicker := time.NewTicker(2 * time.Second)
+		defer probeTicker.Stop()
+		for range probeTicker.C {
+			_, probeError := matchingEngineClient.QueryOrderStatusAndAwaitResult("DEMO-EQ", 0)
+			if autoEngagedNow := connectivityKillSwitch.RecordConnectivityCheckResult(probeError == nil); autoEngagedNow {
+				log.Printf("connectivity kill switch AUTO-ENGAGED by background connectivity probe: matching-engine unreachable")
+			}
 		}
 	}()
 
@@ -258,6 +396,22 @@ type orderSubmissionDependencies struct {
 	// algoLimitsRegistry: FEATURES.md §7 strategy resource limits — see
 	// main()'s construction comment.
 	algoLimitsRegistry *algolimits.Registry
+	// markToMarketEngine: FEATURES.md §12 real-time MTM — see
+	// main()'s construction comment and internal/marktomarket's package
+	// doc.
+	markToMarketEngine *marktomarket.MarkToMarketEngine
+	// exposureLimitsRegistry: FEATURES.md §12 per-user, per-segment
+	// exposure limits — see main()'s construction comment and
+	// internal/exposurelimits' package doc.
+	exposureLimitsRegistry *exposurelimits.LimitsRegistry
+	// connectivityKillSwitch: FEATURES.md §12 exchange-connectivity kill
+	// switch — see main()'s construction comment and
+	// internal/connectivitykillswitch's package doc.
+	connectivityKillSwitch *connectivitykillswitch.KillSwitch
+	// marketSession: FEATURES.md §15 pre-market/post-market session
+	// support — see internal/marketsession's sessionPhaseRules.go for the
+	// real, distinct order-acceptance rules enforced below.
+	marketSession *marketsession.MarketSessionState
 }
 
 func buildSubmitOrderHandler(
@@ -363,6 +517,63 @@ func processOrderSubmission(
 	dependencies orderSubmissionDependencies,
 	incomingOrderSubmissionRequest orders.OrderSubmissionRequest,
 ) orders.OrderAcknowledgementResponse {
+	// FEATURES.md §12 exchange-connectivity kill-switch — checked BEFORE
+	// EVERYTHING else, including strategy limits: if trading is halted
+	// (manually by an admin, or automatically after repeated
+	// matching-engine connectivity failures — see
+	// internal/connectivitykillswitch's package doc), every new order
+	// submission is rejected immediately with a clear "trading halted"
+	// error, full stop. Cancellation is deliberately NOT gated here — see
+	// buildCancelOrderHandler, which never consults this switch at all,
+	// per FEATURES.md §12's "existing pending orders can still be
+	// cancelled".
+	if dependencies.connectivityKillSwitch.IsTradingHalted() {
+		dependencies.auditTrail.Append(audittrail.Entry{
+			EventType:               audittrail.EventOrderRejected,
+			ClientAccountIdentifier: incomingOrderSubmissionRequest.ClientAccountIdentifier,
+			InstrumentSymbol:        incomingOrderSubmissionRequest.InstrumentSymbol,
+			DetailMessage:           "TRADING_HALTED",
+		})
+		return orders.OrderAcknowledgementResponse{
+			WasOrderAccepted:               false,
+			HumanReadableRejectionReason:   "Trading is currently halted (kill switch engaged) — new order submissions are being rejected. Existing orders can still be cancelled.",
+			MachineReadableRejectionReason: "TRADING_HALTED",
+		}
+	}
+
+	// FEATURES.md §15 pre-market/post-market session rules — checked
+	// right after the kill switch, before strategy limits: a real,
+	// distinct order-acceptance rule (only plain LIMIT orders during
+	// PRE_MARKET/POST_MARKET) enforced for every order path that reuses
+	// processOrderSubmission. REGULAR and CLOSED are both no-ops for this
+	// gate — see internal/marketsession's sessionPhaseRules.go doc for
+	// why CLOSED's real rejection stays owned by the pre-existing
+	// isMarketOpen/AMO mechanism, not duplicated here.
+	if dependencies.marketSession != nil {
+		sessionRuleError := marketsession.ValidateOrderAgainstSessionPhase(
+			dependencies.marketSession.CurrentSessionPhase(),
+			marketsession.OrderShapeForSessionRules{
+				OrderIsMarketOrderNotLimit: incomingOrderSubmissionRequest.OrderIsMarketOrderNotLimit,
+				OrderIsStopLossVariant:     incomingOrderSubmissionRequest.OrderIsStopLossVariant,
+				OrderExecutionType:         incomingOrderSubmissionRequest.OrderExecutionType,
+			},
+			incomingOrderSubmissionRequest.OrderIsAfterMarketOrder,
+		)
+		if sessionRuleError != nil {
+			dependencies.auditTrail.Append(audittrail.Entry{
+				EventType:               audittrail.EventOrderRejected,
+				ClientAccountIdentifier: incomingOrderSubmissionRequest.ClientAccountIdentifier,
+				InstrumentSymbol:        incomingOrderSubmissionRequest.InstrumentSymbol,
+				DetailMessage:           fmt.Sprintf("SESSION_PHASE_RULE_VIOLATION: %v", sessionRuleError),
+			})
+			return orders.OrderAcknowledgementResponse{
+				WasOrderAccepted:               false,
+				HumanReadableRejectionReason:   sessionRuleError.Error(),
+				MachineReadableRejectionReason: "SESSION_PHASE_RULE_VIOLATION",
+			}
+		}
+	}
+
 	// FEATURES.md §7 strategy resource limits & circuit breakers —
 	// checked FIRST, before even KYC: an order tagged with a
 	// strategyIdentifier that trips its configured max-orders/sec or
@@ -396,6 +607,40 @@ func processOrderSubmission(
 				HumanReadableRejectionReason:   fmt.Sprintf("This order was blocked by strategy %q's own resource limits: %v", incomingOrderSubmissionRequest.StrategyIdentifier, limitError),
 				MachineReadableRejectionReason: machineReadableReason,
 			}
+		}
+	}
+
+	// FEATURES.md §12 per-user, per-segment exposure limits — a real
+	// pre-trade check alongside internal/riskengine's own margin check,
+	// run right after the strategy-limits gate and before KYC (same
+	// rationale: no reason to touch KYC/freeze/margin for an order the
+	// risk team has already capped out on exposure grounds). See
+	// internal/exposurelimits' package doc for the "cumulative
+	// reservation, not live net position" and "illustrative segment"
+	// design choices. An account/segment with no configured limit is
+	// completely unaffected — fully backward compatible with every
+	// pre-existing client and test.
+	exposureSegment := exposurelimits.ClassifySegment(incomingOrderSubmissionRequest.InstrumentSymbol)
+	exposureNotionalForLimitCheck := incomingOrderSubmissionRequest.LimitPriceInMinorUnits * int64(incomingOrderSubmissionRequest.OrderQuantity)
+	if exposureError := dependencies.exposureLimitsRegistry.CheckAndReserveExposure(
+		incomingOrderSubmissionRequest.ClientAccountIdentifier,
+		exposureSegment,
+		exposureNotionalForLimitCheck,
+	); exposureError != nil {
+		machineReadableReason := "ACCOUNT_EXPOSURE_LIMIT_EXCEEDED"
+		if errors.Is(exposureError, exposurelimits.ErrSegmentExposureLimitExceeded) {
+			machineReadableReason = "SEGMENT_EXPOSURE_LIMIT_EXCEEDED"
+		}
+		dependencies.auditTrail.Append(audittrail.Entry{
+			EventType:               audittrail.EventOrderRejected,
+			ClientAccountIdentifier: incomingOrderSubmissionRequest.ClientAccountIdentifier,
+			InstrumentSymbol:        incomingOrderSubmissionRequest.InstrumentSymbol,
+			DetailMessage:           fmt.Sprintf("%s: %v", machineReadableReason, exposureError),
+		})
+		return orders.OrderAcknowledgementResponse{
+			WasOrderAccepted:               false,
+			HumanReadableRejectionReason:   fmt.Sprintf("This order was blocked by a risk-team-configured exposure limit: %v", exposureError),
+			MachineReadableRejectionReason: machineReadableReason,
 		}
 	}
 
@@ -594,6 +839,18 @@ func processOrderSubmission(
 		},
 	)
 
+	// FEATURES.md §12 exchange-connectivity kill-switch's real
+	// health-check-driven auto-trigger: this is a genuine connectivity
+	// signal (a TRANSPORT failure — handoffError, e.g. connection
+	// refused/timeout), deliberately distinct from a legitimate business
+	// rejection matching-engine itself returns
+	// (matchingEngineResponse.ErrorMessage) which is not a connectivity
+	// problem at all and must not count against the failure streak. See
+	// internal/connectivitykillswitch's package doc.
+	if autoEngagedNow := dependencies.connectivityKillSwitch.RecordConnectivityCheckResult(handoffError == nil); autoEngagedNow {
+		log.Printf("connectivity kill switch AUTO-ENGAGED: matching-engine hand-off failed too many times in a row — new order submissions are now halted until it recovers or an admin intervenes")
+	}
+
 	switch {
 	case handoffError != nil:
 		// The order already passed risk and was sequenced — it stays
@@ -641,6 +898,19 @@ func processOrderSubmission(
 				tradeExecutionWireEvent.SellingClientAccountId,
 				incomingOrderSubmissionRequest.InstrumentSymbol,
 				tradeExecutionWireEvent.ExecutedQuantity,
+			)
+			// FEATURES.md §12 real-time MTM: every real fill also folds
+			// into internal/marktomarket's cost-basis tracking — the SAME
+			// fill event positionBook just consumed, plus the executed
+			// price marktomarket additionally needs. See that package's
+			// doc for why a live position with no pushed market price yet
+			// simply won't appear in GET /mark-to-market until one is.
+			dependencies.markToMarketEngine.ApplyFill(
+				tradeExecutionWireEvent.BuyingClientAccountId,
+				tradeExecutionWireEvent.SellingClientAccountId,
+				incomingOrderSubmissionRequest.InstrumentSymbol,
+				tradeExecutionWireEvent.ExecutedQuantity,
+				tradeExecutionWireEvent.ExecutedPriceInMinorUnits,
 			)
 			dependencies.auditTrail.Append(audittrail.Entry{
 				EventType:                         audittrail.EventOrderFilled,
@@ -955,7 +1225,35 @@ func buildMarketSessionStatusHandler(
 		respondWithJson(responseWriter, http.StatusOK, map[string]any{
 			"isMarketOpen":            marketSession.IsMarketOpen(),
 			"queuedAfterMarketOrders": afterMarketOrderQueue.QueuedCount(),
+			"sessionPhase":            marketSession.CurrentSessionPhase(),
 		})
+	}
+}
+
+// buildSetSessionPhaseHandler is POST /market-session/set-phase —
+// FEATURES.md §15's pre-market/post-market/extended-hours support. See
+// internal/marketsession's sessionPhaseRules.go for the real,
+// distinct order-acceptance rules this phase now enforces (checked in
+// processOrderSubmission) and the honest note on why this is
+// deliberately independent of the pre-existing isMarketOpen/AMO gate.
+func buildSetSessionPhaseHandler(marketSession *marketsession.MarketSessionState) http.HandlerFunc {
+	return func(responseWriter http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodPost {
+			http.Error(responseWriter, "only POST is supported", http.StatusMethodNotAllowed)
+			return
+		}
+		var wireRequest struct {
+			Phase string `json:"phase"`
+		}
+		if decodeError := json.NewDecoder(request.Body).Decode(&wireRequest); decodeError != nil {
+			http.Error(responseWriter, "malformed set-phase request", http.StatusBadRequest)
+			return
+		}
+		if setError := marketSession.SetSessionPhase(marketsession.SessionPhase(wireRequest.Phase)); setError != nil {
+			http.Error(responseWriter, setError.Error(), http.StatusBadRequest)
+			return
+		}
+		respondWithJson(responseWriter, http.StatusOK, map[string]any{"sessionPhase": marketSession.CurrentSessionPhase()})
 	}
 }
 
@@ -1280,6 +1578,34 @@ func buildCalculateSpanExposureMarginHandler() http.HandlerFunc {
 	}
 }
 
+// buildCalculatePortfolioMarginHandler is POST
+// /margin/calculate-portfolio-margin — FEATURES.md §15's portfolio
+// margining / cross-margining. See
+// internal/marginengine's portfolioCrossMargining.go for the real
+// netting-benefit formula and its loud illustrative-correlation-table
+// warning.
+func buildCalculatePortfolioMarginHandler() http.HandlerFunc {
+	return func(responseWriter http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodPost {
+			http.Error(responseWriter, "only POST is supported", http.StatusMethodNotAllowed)
+			return
+		}
+		var wireRequest struct {
+			Positions []marginengine.Position `json:"positions"`
+		}
+		if decodeError := json.NewDecoder(request.Body).Decode(&wireRequest); decodeError != nil {
+			http.Error(responseWriter, "malformed portfolio margin request", http.StatusBadRequest)
+			return
+		}
+		result, calculationError := marginengine.CalculatePortfolioMargin(wireRequest.Positions)
+		if calculationError != nil {
+			http.Error(responseWriter, calculationError.Error(), http.StatusBadRequest)
+			return
+		}
+		respondWithJson(responseWriter, http.StatusOK, result)
+	}
+}
+
 // marginFundingRequestWireRequest is the payload for
 // POST /margin-funding/request.
 type marginFundingRequestWireRequest struct {
@@ -1404,6 +1730,180 @@ func buildMarginFundingStatusHandler(
 	}
 }
 
+// ---------------------------------------------------------------------
+// Loan Against Securities (LAS) — FEATURES.md §17. See
+// internal/loanagainstsecurities' package doc for the full contract: a
+// genuinely distinct, longer-tenure loan product from margin funding
+// (stricter loan-to-value cap), same two-phase reserve-then-disburse-
+// then-rollback-on-failure flow, real disbursement via
+// internal/ledgerclient.
+// ---------------------------------------------------------------------
+
+type loanAgainstSecuritiesRequestWireRequest struct {
+	ClientAccountIdentifier     string `json:"clientAccountIdentifier"`
+	RequestedAmountInMinorUnits int64  `json:"requestedAmountInMinorUnits"`
+	TenureInMonths              uint32 `json:"tenureInMonths"`
+}
+
+type loanAgainstSecuritiesRequestWireResponse struct {
+	WasLoanApproved                              bool   `json:"wasLoanApproved"`
+	ErrorMessage                                 string `json:"errorMessage,omitempty"`
+	DisbursedAmountInMinorUnits                  int64  `json:"disbursedAmountInMinorUnits,omitempty"`
+	OutstandingPrincipalInMinorUnits             int64  `json:"outstandingPrincipalInMinorUnits,omitempty"`
+	AvailableMarginAfterDisbursementInMinorUnits int64  `json:"availableMarginAfterDisbursementInMinorUnits,omitempty"`
+}
+
+// buildLoanAgainstSecuritiesRequestHandler is POST
+// /loan-against-securities/request — mirrors
+// buildMarginFundingRequestHandler's two-phase reserve-then-disburse-
+// then-rollback-on-failure flow exactly, against
+// internal/loanagainstsecurities.LoanBook's stricter loan-to-value cap
+// instead of margin funding's full-pledged-value cap.
+func buildLoanAgainstSecuritiesRequestHandler(
+	loanBook *loanagainstsecurities.LoanBook,
+	pledgeBook *marginpledge.PledgeBook,
+	ledgerClient *ledgerclient.LedgerClient,
+	preTradeRiskEngine *riskengine.PreTradeRiskEngine,
+) http.HandlerFunc {
+	return func(responseWriter http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodPost {
+			http.Error(responseWriter, "only POST is supported", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var wireRequest loanAgainstSecuritiesRequestWireRequest
+		if decodeError := json.NewDecoder(request.Body).Decode(&wireRequest); decodeError != nil {
+			http.Error(responseWriter, "malformed loan-against-securities request", http.StatusBadRequest)
+			return
+		}
+
+		pledgedMarginValue := pledgeBook.TotalPledgedMarginValueForAccount(wireRequest.ClientAccountIdentifier)
+
+		newOutstanding, requestError := loanBook.RequestLoan(
+			wireRequest.ClientAccountIdentifier,
+			wireRequest.RequestedAmountInMinorUnits,
+			pledgedMarginValue,
+			wireRequest.TenureInMonths,
+		)
+		if requestError != nil {
+			respondWithJson(responseWriter, http.StatusOK, loanAgainstSecuritiesRequestWireResponse{
+				WasLoanApproved: false,
+				ErrorMessage:    requestError.Error(),
+			})
+			return
+		}
+
+		disbursementError := ledgerClient.PostLoanAgainstSecuritiesDisbursementJournalEntry(
+			wireRequest.ClientAccountIdentifier,
+			wireRequest.RequestedAmountInMinorUnits,
+			fmt.Sprintf("LAS disbursement for %s (tenure %d months)", wireRequest.ClientAccountIdentifier, wireRequest.TenureInMonths),
+		)
+		if disbursementError != nil {
+			log.Printf("LAS DISBURSEMENT FAILED for %s — rolling back reservation: %v", wireRequest.ClientAccountIdentifier, disbursementError)
+			loanBook.RollbackReservation(wireRequest.ClientAccountIdentifier, wireRequest.RequestedAmountInMinorUnits)
+			respondWithJson(responseWriter, http.StatusOK, loanAgainstSecuritiesRequestWireResponse{
+				WasLoanApproved: false,
+				ErrorMessage:    fmt.Sprintf("loan was approved but the cash disbursement to the ledger failed: %v", disbursementError),
+			})
+			return
+		}
+
+		preTradeRiskEngine.AdjustAvailableMarginInMinorUnits(wireRequest.ClientAccountIdentifier, wireRequest.RequestedAmountInMinorUnits)
+		availableMarginAfter, _ := preTradeRiskEngine.AvailableMarginInMinorUnits(wireRequest.ClientAccountIdentifier)
+
+		respondWithJson(responseWriter, http.StatusOK, loanAgainstSecuritiesRequestWireResponse{
+			WasLoanApproved:                              true,
+			DisbursedAmountInMinorUnits:                  wireRequest.RequestedAmountInMinorUnits,
+			OutstandingPrincipalInMinorUnits:             newOutstanding,
+			AvailableMarginAfterDisbursementInMinorUnits: availableMarginAfter,
+		})
+	}
+}
+
+type loanAgainstSecuritiesRepayWireRequest struct {
+	ClientAccountIdentifier string `json:"clientAccountIdentifier"`
+	AmountInMinorUnits      int64  `json:"amountInMinorUnits"`
+}
+
+// buildLoanAgainstSecuritiesRepayHandler is POST
+// /loan-against-securities/repay — posts a real repayment journal entry
+// (debiting the account's real ledger balance) and pays down real
+// outstanding LAS principal. Unlike internal/marginfunding (whose own
+// repayment endpoint is a documented gap), this ships a real HTTP route.
+func buildLoanAgainstSecuritiesRepayHandler(
+	loanBook *loanagainstsecurities.LoanBook,
+	ledgerClient *ledgerclient.LedgerClient,
+	preTradeRiskEngine *riskengine.PreTradeRiskEngine,
+) http.HandlerFunc {
+	return func(responseWriter http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodPost {
+			http.Error(responseWriter, "only POST is supported", http.StatusMethodNotAllowed)
+			return
+		}
+		var wireRequest loanAgainstSecuritiesRepayWireRequest
+		if decodeError := json.NewDecoder(request.Body).Decode(&wireRequest); decodeError != nil {
+			http.Error(responseWriter, "malformed loan-against-securities repayment request", http.StatusBadRequest)
+			return
+		}
+
+		newOutstanding, repayError := loanBook.RepayLoan(wireRequest.ClientAccountIdentifier, wireRequest.AmountInMinorUnits)
+		if repayError != nil {
+			http.Error(responseWriter, repayError.Error(), http.StatusBadRequest)
+			return
+		}
+
+		ledgerError := ledgerClient.PostLoanAgainstSecuritiesRepaymentJournalEntry(
+			wireRequest.ClientAccountIdentifier,
+			wireRequest.AmountInMinorUnits,
+			fmt.Sprintf("LAS repayment for %s", wireRequest.ClientAccountIdentifier),
+		)
+		if ledgerError != nil {
+			// The repayment was already applied to the loan book above —
+			// undo it (re-add the principal) since the real cash never
+			// actually left the client's ledger balance.
+			loanBook.RestorePrincipalAfterFailedRepaymentLedgerPosting(wireRequest.ClientAccountIdentifier, wireRequest.AmountInMinorUnits)
+			http.Error(responseWriter, fmt.Sprintf("repayment ledger posting failed, rolled back: %v", ledgerError), http.StatusBadGateway)
+			return
+		}
+
+		preTradeRiskEngine.AdjustAvailableMarginInMinorUnits(wireRequest.ClientAccountIdentifier, -wireRequest.AmountInMinorUnits)
+
+		respondWithJson(responseWriter, http.StatusOK, map[string]any{
+			"outstandingPrincipalInMinorUnits": newOutstanding,
+		})
+	}
+}
+
+// buildLoanAgainstSecuritiesStatusHandler is GET
+// /loan-against-securities?accountId=...
+func buildLoanAgainstSecuritiesStatusHandler(
+	loanBook *loanagainstsecurities.LoanBook,
+	pledgeBook *marginpledge.PledgeBook,
+) http.HandlerFunc {
+	return func(responseWriter http.ResponseWriter, request *http.Request) {
+		accountIdentifier := request.URL.Query().Get("accountId")
+		if accountIdentifier == "" {
+			http.Error(responseWriter, "missing accountId query parameter", http.StatusBadRequest)
+			return
+		}
+		loanRecord := loanBook.LoanRecordForAccount(accountIdentifier)
+		pledgedMarginValue := pledgeBook.TotalPledgedMarginValueForAccount(accountIdentifier)
+		loanToValueCap := loanagainstsecurities.CalculateLoanToValueCap(pledgedMarginValue)
+		remainingCapacity := loanToValueCap - loanRecord.OutstandingPrincipalInMinorUnits
+		if remainingCapacity < 0 {
+			remainingCapacity = 0
+		}
+		respondWithJson(responseWriter, http.StatusOK, map[string]any{
+			"clientAccountIdentifier":             accountIdentifier,
+			"outstandingPrincipalInMinorUnits":    loanRecord.OutstandingPrincipalInMinorUnits,
+			"tenureInMonths":                      loanRecord.TenureInMonths,
+			"totalPledgedMarginValueInMinorUnits": pledgedMarginValue,
+			"loanToValueCapInMinorUnits":          loanToValueCap,
+			"remainingLoanCapacityInMinorUnits":   remainingCapacity,
+		})
+	}
+}
+
 // buildOptionsChainHandler is FEATURES.md §3's "Real-time Options Chain"
 // + "Greeks computed live per contract": GET /options/chain?
 // underlyingSpotPrice=&expiryDate=&symbol=. See internal/optionschain's
@@ -1500,5 +2000,1284 @@ func buildAlgoLimitsStatusHandler(algoLimitsRegistry *algolimits.Registry) http.
 			"strategyIdentifier":            strategyIdentifier,
 			"notionalUsedTodayInMinorUnits": algoLimitsRegistry.NotionalUsedTodayInMinorUnits(strategyIdentifier, time.Now()),
 		})
+	}
+}
+
+// ---------------------------------------------------------------------
+// Execution algos (TWAP/VWAP/POV) — FEATURES.md §15. See
+// internal/executionalgos' package doc for the real slicing/scheduling
+// engine; this section is the HTTP-layer glue: a created parent order
+// gets an algoOrderId, and separate requests drive its scheduler forward
+// (poll for TWAP/VWAP due slices; feed real-time volume for POV) — the
+// same "accept `now` explicitly, no server-side sleeping" discipline the
+// underlying package uses, just moved to the wire boundary. Known gap,
+// stated loudly: nothing here automatically submits the returned
+// ChildOrderSlice values as real orders.OrderSubmissionRequest calls —
+// see internal/executionalgos' package doc for why that's out of scope
+// for this build.
+// ---------------------------------------------------------------------
+
+// executionAlgoOrderRegistry is the mutex-guarded, in-memory map from a
+// generated algoOrderId to its live scheduler (exactly one of the two
+// maps below has an entry for any given id — TWAP/VWAP orders use a
+// executionalgos.Scheduler, POV orders use a executionalgos.PovScheduler,
+// since the two need different real-time inputs to advance).
+type executionAlgoOrderRegistry struct {
+	mutexGuardingState sync.Mutex
+
+	nextAlgoOrderSequence  uint64
+	twapOrVwapSchedulers   map[string]*executionalgos.Scheduler
+	povSchedulers          map[string]*executionalgos.PovScheduler
+	parentOrderByAlgoOrder map[string]executionalgos.ParentOrder
+}
+
+func newExecutionAlgoOrderRegistry() *executionAlgoOrderRegistry {
+	return &executionAlgoOrderRegistry{
+		twapOrVwapSchedulers:   make(map[string]*executionalgos.Scheduler),
+		povSchedulers:          make(map[string]*executionalgos.PovScheduler),
+		parentOrderByAlgoOrder: make(map[string]executionalgos.ParentOrder),
+	}
+}
+
+func (registry *executionAlgoOrderRegistry) newAlgoOrderId(prefix string) string {
+	registry.mutexGuardingState.Lock()
+	defer registry.mutexGuardingState.Unlock()
+	registry.nextAlgoOrderSequence++
+	return fmt.Sprintf("%s-%d", prefix, registry.nextAlgoOrderSequence)
+}
+
+func (registry *executionAlgoOrderRegistry) storeTwapOrVwap(algoOrderId string, parent executionalgos.ParentOrder, scheduler *executionalgos.Scheduler) {
+	registry.mutexGuardingState.Lock()
+	defer registry.mutexGuardingState.Unlock()
+	registry.twapOrVwapSchedulers[algoOrderId] = scheduler
+	registry.parentOrderByAlgoOrder[algoOrderId] = parent
+}
+
+func (registry *executionAlgoOrderRegistry) storePov(algoOrderId string, parent executionalgos.ParentOrder, scheduler *executionalgos.PovScheduler) {
+	registry.mutexGuardingState.Lock()
+	defer registry.mutexGuardingState.Unlock()
+	registry.povSchedulers[algoOrderId] = scheduler
+	registry.parentOrderByAlgoOrder[algoOrderId] = parent
+}
+
+func (registry *executionAlgoOrderRegistry) lookupTwapOrVwap(algoOrderId string) (*executionalgos.Scheduler, bool) {
+	registry.mutexGuardingState.Lock()
+	defer registry.mutexGuardingState.Unlock()
+	scheduler, exists := registry.twapOrVwapSchedulers[algoOrderId]
+	return scheduler, exists
+}
+
+func (registry *executionAlgoOrderRegistry) lookupPov(algoOrderId string) (*executionalgos.PovScheduler, bool) {
+	registry.mutexGuardingState.Lock()
+	defer registry.mutexGuardingState.Unlock()
+	scheduler, exists := registry.povSchedulers[algoOrderId]
+	return scheduler, exists
+}
+
+type createTwapExecutionAlgoWireRequest struct {
+	InstrumentSymbol      string    `json:"instrumentSymbol"`
+	OrderSideIsBuyNotSell bool      `json:"orderSideIsBuyNotSell"`
+	TotalQuantity         uint64    `json:"totalQuantity"`
+	StartTime             time.Time `json:"startTime"`
+	EndTime               time.Time `json:"endTime"`
+	NumberOfSlices        int       `json:"numberOfSlices"`
+}
+
+// buildCreateTwapExecutionAlgoHandler is POST /execution-algos/twap/create
+// — builds a full TWAP slice schedule up front and returns it along with
+// the algoOrderId a caller then drives via POST /execution-algos/poll.
+func buildCreateTwapExecutionAlgoHandler(registry *executionAlgoOrderRegistry) http.HandlerFunc {
+	return func(responseWriter http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodPost {
+			http.Error(responseWriter, "only POST is supported", http.StatusMethodNotAllowed)
+			return
+		}
+		var wireRequest createTwapExecutionAlgoWireRequest
+		if decodeError := json.NewDecoder(request.Body).Decode(&wireRequest); decodeError != nil {
+			http.Error(responseWriter, "malformed twap create request", http.StatusBadRequest)
+			return
+		}
+
+		parent := executionalgos.ParentOrder{
+			InstrumentSymbol:      wireRequest.InstrumentSymbol,
+			OrderSideIsBuyNotSell: wireRequest.OrderSideIsBuyNotSell,
+			TotalQuantity:         wireRequest.TotalQuantity,
+			StartTime:             wireRequest.StartTime,
+			EndTime:               wireRequest.EndTime,
+		}
+		slices, buildError := executionalgos.BuildTwapSchedule(parent, wireRequest.NumberOfSlices)
+		if buildError != nil {
+			http.Error(responseWriter, buildError.Error(), http.StatusBadRequest)
+			return
+		}
+
+		algoOrderId := registry.newAlgoOrderId("TWAP")
+		scheduler := executionalgos.NewScheduler(parent, slices)
+		registry.storeTwapOrVwap(algoOrderId, parent, scheduler)
+
+		respondWithJson(responseWriter, http.StatusOK, map[string]any{
+			"algoOrderId": algoOrderId,
+			"schedule":    slices,
+		})
+	}
+}
+
+type createVwapExecutionAlgoWireRequest struct {
+	InstrumentSymbol      string                            `json:"instrumentSymbol"`
+	OrderSideIsBuyNotSell bool                              `json:"orderSideIsBuyNotSell"`
+	TotalQuantity         uint64                            `json:"totalQuantity"`
+	VolumeCurve           []executionalgos.VolumeCurvePoint `json:"volumeCurve"`
+}
+
+// buildCreateVwapExecutionAlgoHandler is POST /execution-algos/vwap/create.
+func buildCreateVwapExecutionAlgoHandler(registry *executionAlgoOrderRegistry) http.HandlerFunc {
+	return func(responseWriter http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodPost {
+			http.Error(responseWriter, "only POST is supported", http.StatusMethodNotAllowed)
+			return
+		}
+		var wireRequest createVwapExecutionAlgoWireRequest
+		if decodeError := json.NewDecoder(request.Body).Decode(&wireRequest); decodeError != nil {
+			http.Error(responseWriter, "malformed vwap create request", http.StatusBadRequest)
+			return
+		}
+
+		parent := executionalgos.ParentOrder{
+			InstrumentSymbol:      wireRequest.InstrumentSymbol,
+			OrderSideIsBuyNotSell: wireRequest.OrderSideIsBuyNotSell,
+			TotalQuantity:         wireRequest.TotalQuantity,
+		}
+		slices, buildError := executionalgos.BuildVwapSchedule(parent, wireRequest.VolumeCurve)
+		if buildError != nil {
+			http.Error(responseWriter, buildError.Error(), http.StatusBadRequest)
+			return
+		}
+
+		algoOrderId := registry.newAlgoOrderId("VWAP")
+		scheduler := executionalgos.NewScheduler(parent, slices)
+		registry.storeTwapOrVwap(algoOrderId, parent, scheduler)
+
+		respondWithJson(responseWriter, http.StatusOK, map[string]any{
+			"algoOrderId": algoOrderId,
+			"schedule":    slices,
+		})
+	}
+}
+
+type createPovExecutionAlgoWireRequest struct {
+	InstrumentSymbol      string  `json:"instrumentSymbol"`
+	OrderSideIsBuyNotSell bool    `json:"orderSideIsBuyNotSell"`
+	TotalQuantity         uint64  `json:"totalQuantity"`
+	ParticipationRate     float64 `json:"participationRate"`
+	MaxClipSizeQuantity   uint64  `json:"maxClipSizeQuantity"`
+}
+
+// buildCreatePovExecutionAlgoHandler is POST /execution-algos/pov/create.
+func buildCreatePovExecutionAlgoHandler(registry *executionAlgoOrderRegistry) http.HandlerFunc {
+	return func(responseWriter http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodPost {
+			http.Error(responseWriter, "only POST is supported", http.StatusMethodNotAllowed)
+			return
+		}
+		var wireRequest createPovExecutionAlgoWireRequest
+		if decodeError := json.NewDecoder(request.Body).Decode(&wireRequest); decodeError != nil {
+			http.Error(responseWriter, "malformed pov create request", http.StatusBadRequest)
+			return
+		}
+
+		parent := executionalgos.ParentOrder{
+			InstrumentSymbol:      wireRequest.InstrumentSymbol,
+			OrderSideIsBuyNotSell: wireRequest.OrderSideIsBuyNotSell,
+			TotalQuantity:         wireRequest.TotalQuantity,
+		}
+		scheduler, buildError := executionalgos.NewPovScheduler(parent, executionalgos.PovConfig{
+			ParticipationRate:   wireRequest.ParticipationRate,
+			MaxClipSizeQuantity: wireRequest.MaxClipSizeQuantity,
+		})
+		if buildError != nil {
+			http.Error(responseWriter, buildError.Error(), http.StatusBadRequest)
+			return
+		}
+
+		algoOrderId := registry.newAlgoOrderId("POV")
+		registry.storePov(algoOrderId, parent, scheduler)
+
+		respondWithJson(responseWriter, http.StatusOK, map[string]any{
+			"algoOrderId": algoOrderId,
+		})
+	}
+}
+
+type pollExecutionAlgoWireRequest struct {
+	AlgoOrderId string    `json:"algoOrderId"`
+	Now         time.Time `json:"now"`
+}
+
+// buildPollExecutionAlgoHandler is POST /execution-algos/poll — for a
+// TWAP or VWAP algoOrderId, returns every slice newly due as of the
+// caller-supplied `now`. Calling this repeatedly (e.g. from a poller
+// every few seconds, passing time.Now() each time in a real deployment)
+// never returns the same slice twice — see
+// executionalgos.Scheduler.PollDueSlices's doc comment.
+func buildPollExecutionAlgoHandler(registry *executionAlgoOrderRegistry) http.HandlerFunc {
+	return func(responseWriter http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodPost {
+			http.Error(responseWriter, "only POST is supported", http.StatusMethodNotAllowed)
+			return
+		}
+		var wireRequest pollExecutionAlgoWireRequest
+		if decodeError := json.NewDecoder(request.Body).Decode(&wireRequest); decodeError != nil {
+			http.Error(responseWriter, "malformed poll request", http.StatusBadRequest)
+			return
+		}
+
+		scheduler, exists := registry.lookupTwapOrVwap(wireRequest.AlgoOrderId)
+		if !exists {
+			http.Error(responseWriter, "unknown algoOrderId (or it is a POV order — use /execution-algos/pov/observe-volume instead)", http.StatusNotFound)
+			return
+		}
+
+		now := wireRequest.Now
+		if now.IsZero() {
+			now = time.Now()
+		}
+		dueSlices := scheduler.PollDueSlices(now)
+
+		respondWithJson(responseWriter, http.StatusOK, map[string]any{
+			"algoOrderId":       wireRequest.AlgoOrderId,
+			"dueSlices":         dueSlices,
+			"remainingQuantity": scheduler.RemainingQuantity(),
+			"isComplete":        scheduler.IsComplete(),
+		})
+	}
+}
+
+type observePovVolumeWireRequest struct {
+	AlgoOrderId            string    `json:"algoOrderId"`
+	Now                    time.Time `json:"now"`
+	CumulativeMarketVolume uint64    `json:"cumulativeMarketVolume"`
+}
+
+// buildObservePovVolumeHandler is
+// POST /execution-algos/pov/observe-volume — feeds one real-time
+// cumulative-volume reading into a POV order's scheduler; see
+// executionalgos.PovScheduler.OnVolumeObservation's doc comment for
+// exactly how the returned slice (if any) is sized.
+func buildObservePovVolumeHandler(registry *executionAlgoOrderRegistry) http.HandlerFunc {
+	return func(responseWriter http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodPost {
+			http.Error(responseWriter, "only POST is supported", http.StatusMethodNotAllowed)
+			return
+		}
+		var wireRequest observePovVolumeWireRequest
+		if decodeError := json.NewDecoder(request.Body).Decode(&wireRequest); decodeError != nil {
+			http.Error(responseWriter, "malformed observe-volume request", http.StatusBadRequest)
+			return
+		}
+
+		scheduler, exists := registry.lookupPov(wireRequest.AlgoOrderId)
+		if !exists {
+			http.Error(responseWriter, "unknown POV algoOrderId", http.StatusNotFound)
+			return
+		}
+
+		now := wireRequest.Now
+		if now.IsZero() {
+			now = time.Now()
+		}
+		slice, observeError := scheduler.OnVolumeObservation(now, wireRequest.CumulativeMarketVolume)
+		if observeError != nil {
+			http.Error(responseWriter, observeError.Error(), http.StatusBadRequest)
+			return
+		}
+
+		respondWithJson(responseWriter, http.StatusOK, map[string]any{
+			"algoOrderId":       wireRequest.AlgoOrderId,
+			"newSlice":          slice,
+			"remainingQuantity": scheduler.RemainingQuantity(),
+			"isComplete":        scheduler.IsComplete(),
+		})
+	}
+}
+
+// buildExecutionAlgoStatusHandler is
+// GET /execution-algos/status?algoOrderId=... — a read-only status check
+// that works for either a TWAP/VWAP or a POV algoOrderId.
+func buildExecutionAlgoStatusHandler(registry *executionAlgoOrderRegistry) http.HandlerFunc {
+	return func(responseWriter http.ResponseWriter, request *http.Request) {
+		algoOrderId := request.URL.Query().Get("algoOrderId")
+		if algoOrderId == "" {
+			http.Error(responseWriter, "missing algoOrderId query parameter", http.StatusBadRequest)
+			return
+		}
+
+		if scheduler, exists := registry.lookupTwapOrVwap(algoOrderId); exists {
+			respondWithJson(responseWriter, http.StatusOK, map[string]any{
+				"algoOrderId":       algoOrderId,
+				"remainingQuantity": scheduler.RemainingQuantity(),
+				"isComplete":        scheduler.IsComplete(),
+			})
+			return
+		}
+		if scheduler, exists := registry.lookupPov(algoOrderId); exists {
+			respondWithJson(responseWriter, http.StatusOK, map[string]any{
+				"algoOrderId":       algoOrderId,
+				"remainingQuantity": scheduler.RemainingQuantity(),
+				"isComplete":        scheduler.IsComplete(),
+			})
+			return
+		}
+		http.Error(responseWriter, "unknown algoOrderId", http.StatusNotFound)
+	}
+}
+
+// ---------------------------------------------------------------------
+// Options strategy payoff diagram — FEATURES.md §15. See
+// internal/payoffdiagram's package doc for the real piecewise-linear
+// analysis behind max profit/loss and breakevens. This handler is
+// deliberately stateless — POST the full current leg set every time
+// ("computed live as legs are added" per FEATURES.md's own framing means
+// the CALLER re-POSTs with one more leg each time, not that this
+// endpoint remembers a leg set between calls).
+// ---------------------------------------------------------------------
+
+type computePayoffDiagramWireRequest struct {
+	Legs []payoffdiagram.OptionLeg `json:"legs"`
+}
+
+// buildComputePayoffDiagramHandler is POST /payoff-diagram/compute.
+func buildComputePayoffDiagramHandler() http.HandlerFunc {
+	return func(responseWriter http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodPost {
+			http.Error(responseWriter, "only POST is supported", http.StatusMethodNotAllowed)
+			return
+		}
+		var wireRequest computePayoffDiagramWireRequest
+		if decodeError := json.NewDecoder(request.Body).Decode(&wireRequest); decodeError != nil {
+			http.Error(responseWriter, "malformed payoff-diagram compute request", http.StatusBadRequest)
+			return
+		}
+
+		result, computeError := payoffdiagram.ComputePayoffDiagram(wireRequest.Legs)
+		if computeError != nil {
+			http.Error(responseWriter, computeError.Error(), http.StatusBadRequest)
+			return
+		}
+
+		respondWithJson(responseWriter, http.StatusOK, result)
+	}
+}
+
+// ---------------------------------------------------------------------
+// Multi-leg options strategy builder — FEATURES.md §15. See
+// internal/multilegoptions' package doc for the full contract: named
+// strategy shape validation plus atomic all-or-nothing execution (with
+// real, best-effort compensating rollback) through the exact same
+// processOrderSubmission pipeline every other order path reuses.
+// ---------------------------------------------------------------------
+
+type executeMultiLegOptionsWireRequest struct {
+	ClientAccountIdentifier string                        `json:"clientAccountIdentifier"`
+	Strategy                multilegoptions.StrategyShape `json:"strategy"`
+	Legs                    []multilegoptions.Leg         `json:"legs"`
+}
+
+// buildExecuteMultiLegOptionsHandler is POST /multileg-options/execute.
+func buildExecuteMultiLegOptionsHandler(dependencies orderSubmissionDependencies) http.HandlerFunc {
+	return func(responseWriter http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodPost {
+			http.Error(responseWriter, "only POST is supported", http.StatusMethodNotAllowed)
+			return
+		}
+		var wireRequest executeMultiLegOptionsWireRequest
+		if decodeError := json.NewDecoder(request.Body).Decode(&wireRequest); decodeError != nil {
+			http.Error(responseWriter, "malformed multi-leg options execution request", http.StatusBadRequest)
+			return
+		}
+		if wireRequest.ClientAccountIdentifier == "" {
+			http.Error(responseWriter, "clientAccountIdentifier is required", http.StatusBadRequest)
+			return
+		}
+
+		// submitLeg: each leg reuses the EXACT SAME processOrderSubmission
+		// pipeline (KYC/freeze/risk/matching-engine/audit-trail) every
+		// other order path in this file reuses, via a plain Go closure —
+		// nothing duplicated. See internal/multilegoptions' package doc
+		// for the "no real listed options instrument" scope boundary: a
+		// leg submits as an ordinary LIMIT order at its premium.
+		submitLeg := func(leg multilegoptions.Leg) (bool, string, error) {
+			acknowledgement := processOrderSubmission(dependencies, orders.OrderSubmissionRequest{
+				ClientAccountIdentifier: wireRequest.ClientAccountIdentifier,
+				InstrumentSymbol:        leg.InstrumentSymbol,
+				OrderSideIsBuyNotSell:   leg.IsBuyNotSell,
+				LimitPriceInMinorUnits:  leg.PremiumInMinorUnits,
+				OrderQuantity:           leg.Quantity,
+			})
+			return acknowledgement.WasOrderAccepted, acknowledgement.HumanReadableRejectionReason, nil
+		}
+
+		result, executionError := multilegoptions.ExecuteStrategyAtomically(wireRequest.Strategy, wireRequest.Legs, submitLeg)
+		if executionError != nil && errors.Is(executionError, multilegoptions.ErrLegShapeMismatch) {
+			http.Error(responseWriter, executionError.Error(), http.StatusBadRequest)
+			return
+		}
+		if executionError != nil && !errors.Is(executionError, multilegoptions.ErrLegRejectedDuringExecution) {
+			http.Error(responseWriter, executionError.Error(), http.StatusBadRequest)
+			return
+		}
+
+		dependencies.auditTrail.Append(audittrail.Entry{
+			EventType:               audittrail.EventOrderSubmitted,
+			ClientAccountIdentifier: wireRequest.ClientAccountIdentifier,
+			DetailMessage:           fmt.Sprintf("MULTI_LEG_STRATEGY_%s wasFullyExecuted=%v", wireRequest.Strategy, result.WasFullyExecuted),
+		})
+
+		respondWithJson(responseWriter, http.StatusOK, result)
+	}
+}
+
+// ---------------------------------------------------------------------
+// Basket/program order execution — FEATURES.md §15. See
+// internal/basketorders' package doc for the full contract: a net-cash-
+// constrained set of constituents, each submitted through the exact same
+// order-submission path, with real aggregate fill-status tracking
+// (deliberately NOT atomic, unlike multi-leg options above).
+// ---------------------------------------------------------------------
+
+// buildExecuteBasketOrderHandler is POST /basket-orders/execute.
+func buildExecuteBasketOrderHandler(dependencies orderSubmissionDependencies) http.HandlerFunc {
+	return func(responseWriter http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodPost {
+			http.Error(responseWriter, "only POST is supported", http.StatusMethodNotAllowed)
+			return
+		}
+		var basketRequest basketorders.BasketOrderRequest
+		if decodeError := json.NewDecoder(request.Body).Decode(&basketRequest); decodeError != nil {
+			http.Error(responseWriter, "malformed basket order execution request", http.StatusBadRequest)
+			return
+		}
+
+		submitConstituent := func(instrumentSymbol string, isBuyNotSell bool, quantity uint64) (bool, uint64, string, error) {
+			acknowledgement := processOrderSubmission(dependencies, orders.OrderSubmissionRequest{
+				ClientAccountIdentifier:    basketRequest.ClientAccountIdentifier,
+				InstrumentSymbol:           instrumentSymbol,
+				OrderSideIsBuyNotSell:      isBuyNotSell,
+				OrderIsMarketOrderNotLimit: true,
+				OrderQuantity:              quantity,
+			})
+			var filledQuantity uint64
+			for _, tradeExecutionSummary := range acknowledgement.TradeExecutionEvents {
+				filledQuantity += tradeExecutionSummary.ExecutedQuantity
+			}
+			return acknowledgement.WasOrderAccepted, filledQuantity, acknowledgement.HumanReadableRejectionReason, nil
+		}
+
+		result, executionError := basketorders.ExecuteBasket(basketRequest, submitConstituent)
+		if executionError != nil {
+			http.Error(responseWriter, executionError.Error(), http.StatusBadRequest)
+			return
+		}
+
+		dependencies.auditTrail.Append(audittrail.Entry{
+			EventType:               audittrail.EventOrderSubmitted,
+			ClientAccountIdentifier: basketRequest.ClientAccountIdentifier,
+			DetailMessage:           fmt.Sprintf("BASKET_ORDER_%s aggregateStatus=%s", basketRequest.BasketIdentifier, result.AggregateStatus),
+		})
+
+		respondWithJson(responseWriter, http.StatusOK, result)
+	}
+}
+
+// ---------------------------------------------------------------------
+// Pre-trade impact-cost / slippage estimator — FEATURES.md §15. See
+// internal/impactcostestimator's package doc for the real
+// walk-the-book algorithm AND its honest "oms-gateway has no queryable
+// live depth source yet, caller supplies the snapshot" scope boundary.
+// ---------------------------------------------------------------------
+
+type estimateImpactCostWireRequest struct {
+	Snapshot             impactcostestimator.OrderBookDepthSnapshot `json:"snapshot"`
+	IsBuyNotSell         bool                                       `json:"isBuyNotSell"`
+	HypotheticalQuantity uint64                                     `json:"hypotheticalQuantity"`
+}
+
+// buildEstimateImpactCostHandler is POST /impact-cost/estimate.
+func buildEstimateImpactCostHandler() http.HandlerFunc {
+	return func(responseWriter http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodPost {
+			http.Error(responseWriter, "only POST is supported", http.StatusMethodNotAllowed)
+			return
+		}
+		var wireRequest estimateImpactCostWireRequest
+		if decodeError := json.NewDecoder(request.Body).Decode(&wireRequest); decodeError != nil {
+			http.Error(responseWriter, "malformed impact-cost estimate request", http.StatusBadRequest)
+			return
+		}
+
+		estimate, estimateError := impactcostestimator.EstimateImpactCost(wireRequest.Snapshot, wireRequest.IsBuyNotSell, wireRequest.HypotheticalQuantity)
+		if estimateError != nil {
+			http.Error(responseWriter, estimateError.Error(), http.StatusBadRequest)
+			return
+		}
+
+		respondWithJson(responseWriter, http.StatusOK, estimate)
+	}
+}
+
+// ---------------------------------------------------------------------
+// Securities Lending & Borrowing (SLB) desk — FEATURES.md §15. See
+// internal/securitieslendingborrowing's package doc for the full
+// contract: two independent, mutex-guarded ledgers (lending, borrowing),
+// server-looked-up holdings for LendSecurity (never client-asserted),
+// and the illustrative-fee-rate warning.
+// ---------------------------------------------------------------------
+
+type lendSecurityWireRequest struct {
+	ClientAccountIdentifier    string `json:"clientAccountIdentifier"`
+	InstrumentSymbol           string `json:"instrumentSymbol"`
+	Quantity                   uint64 `json:"quantity"`
+	ReferencePriceInMinorUnits int64  `json:"referencePriceInMinorUnits"`
+}
+
+// buildLendSecurityHandler is POST /securities-lending/lend.
+func buildLendSecurityHandler(desk *securitieslendingborrowing.Desk, positionBook *positions.PositionBook) http.HandlerFunc {
+	return func(responseWriter http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodPost {
+			http.Error(responseWriter, "only POST is supported", http.StatusMethodNotAllowed)
+			return
+		}
+		var wireRequest lendSecurityWireRequest
+		if decodeError := json.NewDecoder(request.Body).Decode(&wireRequest); decodeError != nil {
+			http.Error(responseWriter, "malformed lend security request", http.StatusBadRequest)
+			return
+		}
+		currentNetHoldingQuantity := positionBook.PositionsForAccount(wireRequest.ClientAccountIdentifier)[wireRequest.InstrumentSymbol]
+		record, lendError := desk.LendSecurity(
+			wireRequest.ClientAccountIdentifier,
+			wireRequest.InstrumentSymbol,
+			wireRequest.Quantity,
+			wireRequest.ReferencePriceInMinorUnits,
+			currentNetHoldingQuantity,
+		)
+		if lendError != nil {
+			http.Error(responseWriter, lendError.Error(), http.StatusBadRequest)
+			return
+		}
+		respondWithJson(responseWriter, http.StatusOK, record)
+	}
+}
+
+type recallLendingWireRequest struct {
+	ClientAccountIdentifier string `json:"clientAccountIdentifier"`
+	InstrumentSymbol        string `json:"instrumentSymbol"`
+	Quantity                uint64 `json:"quantity"`
+}
+
+// buildRecallLendingHandler is POST /securities-lending/recall.
+func buildRecallLendingHandler(desk *securitieslendingborrowing.Desk) http.HandlerFunc {
+	return func(responseWriter http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodPost {
+			http.Error(responseWriter, "only POST is supported", http.StatusMethodNotAllowed)
+			return
+		}
+		var wireRequest recallLendingWireRequest
+		if decodeError := json.NewDecoder(request.Body).Decode(&wireRequest); decodeError != nil {
+			http.Error(responseWriter, "malformed recall lending request", http.StatusBadRequest)
+			return
+		}
+		record, recallError := desk.RecallLending(wireRequest.ClientAccountIdentifier, wireRequest.InstrumentSymbol, wireRequest.Quantity)
+		if recallError != nil {
+			http.Error(responseWriter, recallError.Error(), http.StatusBadRequest)
+			return
+		}
+		respondWithJson(responseWriter, http.StatusOK, record)
+	}
+}
+
+type borrowSecurityWireRequest struct {
+	ClientAccountIdentifier    string `json:"clientAccountIdentifier"`
+	InstrumentSymbol           string `json:"instrumentSymbol"`
+	Quantity                   uint64 `json:"quantity"`
+	ReferencePriceInMinorUnits int64  `json:"referencePriceInMinorUnits"`
+}
+
+// buildBorrowSecurityHandler is POST /securities-lending/borrow.
+func buildBorrowSecurityHandler(desk *securitieslendingborrowing.Desk) http.HandlerFunc {
+	return func(responseWriter http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodPost {
+			http.Error(responseWriter, "only POST is supported", http.StatusMethodNotAllowed)
+			return
+		}
+		var wireRequest borrowSecurityWireRequest
+		if decodeError := json.NewDecoder(request.Body).Decode(&wireRequest); decodeError != nil {
+			http.Error(responseWriter, "malformed borrow security request", http.StatusBadRequest)
+			return
+		}
+		record, borrowError := desk.BorrowSecurity(
+			wireRequest.ClientAccountIdentifier,
+			wireRequest.InstrumentSymbol,
+			wireRequest.Quantity,
+			wireRequest.ReferencePriceInMinorUnits,
+		)
+		if borrowError != nil {
+			http.Error(responseWriter, borrowError.Error(), http.StatusBadRequest)
+			return
+		}
+		respondWithJson(responseWriter, http.StatusOK, record)
+	}
+}
+
+type returnBorrowingWireRequest struct {
+	ClientAccountIdentifier string `json:"clientAccountIdentifier"`
+	InstrumentSymbol        string `json:"instrumentSymbol"`
+	Quantity                uint64 `json:"quantity"`
+}
+
+// buildReturnBorrowingHandler is POST /securities-lending/return.
+func buildReturnBorrowingHandler(desk *securitieslendingborrowing.Desk) http.HandlerFunc {
+	return func(responseWriter http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodPost {
+			http.Error(responseWriter, "only POST is supported", http.StatusMethodNotAllowed)
+			return
+		}
+		var wireRequest returnBorrowingWireRequest
+		if decodeError := json.NewDecoder(request.Body).Decode(&wireRequest); decodeError != nil {
+			http.Error(responseWriter, "malformed return borrowing request", http.StatusBadRequest)
+			return
+		}
+		record, returnError := desk.ReturnBorrowing(wireRequest.ClientAccountIdentifier, wireRequest.InstrumentSymbol, wireRequest.Quantity)
+		if returnError != nil {
+			http.Error(responseWriter, returnError.Error(), http.StatusBadRequest)
+			return
+		}
+		respondWithJson(responseWriter, http.StatusOK, record)
+	}
+}
+
+// buildSecuritiesLendingStatusHandler is GET /securities-lending?accountId=...
+func buildSecuritiesLendingStatusHandler(desk *securitieslendingborrowing.Desk) http.HandlerFunc {
+	return func(responseWriter http.ResponseWriter, request *http.Request) {
+		accountIdentifier := request.URL.Query().Get("accountId")
+		respondWithJson(responseWriter, http.StatusOK, map[string]interface{}{
+			"accountIdentifier": accountIdentifier,
+			"lendingRecords":    desk.LendingRecordsForAccount(accountIdentifier),
+			"borrowingRecords":  desk.BorrowingRecordsForAccount(accountIdentifier),
+		})
+	}
+}
+
+// ---------------------------------------------------------------------
+// Dividend Reinvestment Plan (DRIP) — FEATURES.md §17. See
+// internal/drip's package doc: a real dividend cash credit proportional
+// to held quantity, posted through the real ledger, plus a real
+// auto-reinvestment toggle that — when ON — re-invests the credited cash
+// via the EXACT SAME processOrderSubmission pipeline every other order
+// path reuses.
+// ---------------------------------------------------------------------
+
+type setDripToggleWireRequest struct {
+	ClientAccountIdentifier string `json:"clientAccountIdentifier"`
+	Enabled                 bool   `json:"enabled"`
+}
+
+// buildSetDripToggleHandler is POST /drip/toggle.
+func buildSetDripToggleHandler(dripToggleRegistry *drip.ToggleRegistry) http.HandlerFunc {
+	return func(responseWriter http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodPost {
+			http.Error(responseWriter, "only POST is supported", http.StatusMethodNotAllowed)
+			return
+		}
+		var wireRequest setDripToggleWireRequest
+		if decodeError := json.NewDecoder(request.Body).Decode(&wireRequest); decodeError != nil {
+			http.Error(responseWriter, "malformed DRIP toggle request", http.StatusBadRequest)
+			return
+		}
+		dripToggleRegistry.SetAutoReinvest(wireRequest.ClientAccountIdentifier, wireRequest.Enabled)
+		respondWithJson(responseWriter, http.StatusOK, map[string]any{
+			"clientAccountIdentifier": wireRequest.ClientAccountIdentifier,
+			"autoReinvestEnabled":     dripToggleRegistry.IsAutoReinvestEnabled(wireRequest.ClientAccountIdentifier),
+		})
+	}
+}
+
+type processDividendEventWireRequest struct {
+	ClientAccountIdentifier      string `json:"clientAccountIdentifier"`
+	InstrumentSymbol             string `json:"instrumentSymbol"`
+	DividendPerShareInMinorUnits int64  `json:"dividendPerShareInMinorUnits"`
+
+	// ReinvestmentReferencePriceInMinorUnits is required only if the
+	// account's auto-reinvest toggle is ON — see internal/drip's package
+	// doc for the honest "no live price feed" gap this mirrors.
+	ReinvestmentReferencePriceInMinorUnits int64 `json:"reinvestmentReferencePriceInMinorUnits,omitempty"`
+}
+
+type processDividendEventWireResponse struct {
+	CashCreditedInMinorUnits int64                                `json:"cashCreditedInMinorUnits"`
+	WasLedgerCreditPosted    bool                                 `json:"wasLedgerCreditPosted"`
+	LedgerError              string                               `json:"ledgerError,omitempty"`
+	WasAutoReinvested        bool                                 `json:"wasAutoReinvested"`
+	ReinvestmentPlan         *drip.ReinvestmentPlan               `json:"reinvestmentPlan,omitempty"`
+	ReinvestmentOrder        *orders.OrderAcknowledgementResponse `json:"reinvestmentOrder,omitempty"`
+}
+
+// buildProcessDividendEventHandler is POST /drip/process-dividend — the
+// real end-to-end flow: look up the account's real held quantity
+// (internal/positions, never client-asserted), compute the real dividend
+// cash credit, post it through the real ledger, update the local risk
+// cache, then — if auto-reinvest is ON for this account — re-invest that
+// cash via the EXACT SAME processOrderSubmission pipeline every other
+// order path reuses.
+func buildProcessDividendEventHandler(
+	dependencies orderSubmissionDependencies,
+	dripToggleRegistry *drip.ToggleRegistry,
+) http.HandlerFunc {
+	return func(responseWriter http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodPost {
+			http.Error(responseWriter, "only POST is supported", http.StatusMethodNotAllowed)
+			return
+		}
+		var wireRequest processDividendEventWireRequest
+		if decodeError := json.NewDecoder(request.Body).Decode(&wireRequest); decodeError != nil {
+			http.Error(responseWriter, "malformed dividend event request", http.StatusBadRequest)
+			return
+		}
+
+		quantityHeld := dependencies.positionBook.PositionsForAccount(wireRequest.ClientAccountIdentifier)[wireRequest.InstrumentSymbol]
+		if quantityHeld <= 0 {
+			http.Error(responseWriter, "account holds no quantity of this instrument — nothing to credit a dividend against", http.StatusBadRequest)
+			return
+		}
+
+		cashCredited, creditError := drip.CalculateDividendCredit(uint64(quantityHeld), wireRequest.DividendPerShareInMinorUnits)
+		if creditError != nil {
+			http.Error(responseWriter, creditError.Error(), http.StatusBadRequest)
+			return
+		}
+
+		wireResponse := processDividendEventWireResponse{CashCreditedInMinorUnits: cashCredited}
+
+		ledgerError := dependencies.ledgerClient.PostDividendCreditJournalEntry(
+			wireRequest.ClientAccountIdentifier,
+			cashCredited,
+			fmt.Sprintf("dividend credit for %s: %d shares @ %d/share", wireRequest.InstrumentSymbol, quantityHeld, wireRequest.DividendPerShareInMinorUnits),
+		)
+		if ledgerError != nil {
+			log.Printf("DRIP dividend ledger credit FAILED for %s: %v", wireRequest.ClientAccountIdentifier, ledgerError)
+			wireResponse.LedgerError = ledgerError.Error()
+			respondWithJson(responseWriter, http.StatusOK, wireResponse)
+			return
+		}
+		wireResponse.WasLedgerCreditPosted = true
+		dependencies.preTradeRiskEngine.AdjustAvailableMarginInMinorUnits(wireRequest.ClientAccountIdentifier, cashCredited)
+
+		dependencies.auditTrail.Append(audittrail.Entry{
+			EventType:               audittrail.EventOrderSubmitted,
+			ClientAccountIdentifier: wireRequest.ClientAccountIdentifier,
+			InstrumentSymbol:        wireRequest.InstrumentSymbol,
+			DetailMessage:           fmt.Sprintf("DIVIDEND_CREDITED cashCreditedInMinorUnits=%d", cashCredited),
+		})
+
+		if !dripToggleRegistry.IsAutoReinvestEnabled(wireRequest.ClientAccountIdentifier) {
+			respondWithJson(responseWriter, http.StatusOK, wireResponse)
+			return
+		}
+		if wireRequest.ReinvestmentReferencePriceInMinorUnits <= 0 {
+			// Auto-reinvest is ON but no reference price was supplied —
+			// same honest "no live price feed" gap this package's doc
+			// warns about; leave the cash credited but not reinvested
+			// rather than guessing a price.
+			respondWithJson(responseWriter, http.StatusOK, wireResponse)
+			return
+		}
+
+		reinvestmentPlan, planError := drip.CalculateReinvestmentQuantity(cashCredited, wireRequest.ReinvestmentReferencePriceInMinorUnits)
+		if planError != nil || reinvestmentPlan.ReinvestmentQuantity == 0 {
+			respondWithJson(responseWriter, http.StatusOK, wireResponse)
+			return
+		}
+		wireResponse.ReinvestmentPlan = &reinvestmentPlan
+
+		reinvestmentAcknowledgement := processOrderSubmission(dependencies, orders.OrderSubmissionRequest{
+			ClientAccountIdentifier: wireRequest.ClientAccountIdentifier,
+			InstrumentSymbol:        wireRequest.InstrumentSymbol,
+			OrderSideIsBuyNotSell:   true,
+			LimitPriceInMinorUnits:  wireRequest.ReinvestmentReferencePriceInMinorUnits,
+			OrderQuantity:           reinvestmentPlan.ReinvestmentQuantity,
+		})
+		wireResponse.WasAutoReinvested = reinvestmentAcknowledgement.WasOrderAccepted
+		wireResponse.ReinvestmentOrder = &reinvestmentAcknowledgement
+
+		respondWithJson(responseWriter, http.StatusOK, wireResponse)
+	}
+}
+
+// ---------------------------------------------------------------------
+// Social/copy-trading follow graph — FEATURES.md §11. Opt-in
+// follow/unfollow of admin-verified strategies ONLY; no order mirroring.
+// See internal/strategyfollowing's package doc for the full scope
+// boundary.
+// ---------------------------------------------------------------------
+
+// buildListVerifiedStrategiesHandler is GET /strategies — the public,
+// disclosed list of strategies an admin has verified, each with its live
+// follower count. This is the ONLY set of strategyIdentifiers
+// POST /strategies/follow will accept.
+func buildListVerifiedStrategiesHandler(strategyFollowingRegistry *strategyfollowing.Registry) http.HandlerFunc {
+	return func(responseWriter http.ResponseWriter, request *http.Request) {
+		respondWithJson(responseWriter, http.StatusOK, strategyFollowingRegistry.ListVerifiedStrategies())
+	}
+}
+
+type verifyStrategyWireRequest struct {
+	StrategyIdentifier string `json:"strategyIdentifier"`
+	DisplayName        string `json:"displayName"`
+	Description        string `json:"description"`
+}
+
+// buildVerifyStrategyHandler is POST /strategies/admin/verify — the
+// admin-approval step (reusing the spirit of backoffice's admin-approval
+// pattern) that adds a strategy to the public verified list. TODO(real
+// build): unauthenticated, like every other endpoint in this service —
+// a real build gates this behind whatever admin auth backoffice's own
+// approval actions use.
+func buildVerifyStrategyHandler(strategyFollowingRegistry *strategyfollowing.Registry) http.HandlerFunc {
+	return func(responseWriter http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodPost {
+			http.Error(responseWriter, "only POST is supported", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var wireRequest verifyStrategyWireRequest
+		if decodeError := json.NewDecoder(request.Body).Decode(&wireRequest); decodeError != nil {
+			http.Error(responseWriter, "malformed strategy-verify request", http.StatusBadRequest)
+			return
+		}
+
+		if verifyError := strategyFollowingRegistry.MarkStrategyVerified(wireRequest.StrategyIdentifier, wireRequest.DisplayName, wireRequest.Description); verifyError != nil {
+			http.Error(responseWriter, verifyError.Error(), http.StatusBadRequest)
+			return
+		}
+
+		respondWithJson(responseWriter, http.StatusOK, map[string]any{
+			"strategyIdentifier": wireRequest.StrategyIdentifier,
+			"displayName":        wireRequest.DisplayName,
+			"description":        wireRequest.Description,
+			"isVerified":         true,
+		})
+	}
+}
+
+type followStrategyWireRequest struct {
+	AccountIdentifier  string `json:"accountIdentifier"`
+	StrategyIdentifier string `json:"strategyIdentifier"`
+}
+
+// buildFollowStrategyHandler is POST /strategies/follow — the one
+// opt-in action this feature supports. Rejects (400) any
+// strategyIdentifier that isn't on the verified list; this is a
+// disclosed relationship, never a silent/implicit one, and never
+// triggers any order replication.
+func buildFollowStrategyHandler(strategyFollowingRegistry *strategyfollowing.Registry) http.HandlerFunc {
+	return func(responseWriter http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodPost {
+			http.Error(responseWriter, "only POST is supported", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var wireRequest followStrategyWireRequest
+		if decodeError := json.NewDecoder(request.Body).Decode(&wireRequest); decodeError != nil {
+			http.Error(responseWriter, "malformed follow request", http.StatusBadRequest)
+			return
+		}
+
+		if followError := strategyFollowingRegistry.Follow(wireRequest.AccountIdentifier, wireRequest.StrategyIdentifier); followError != nil {
+			http.Error(responseWriter, followError.Error(), http.StatusBadRequest)
+			return
+		}
+
+		respondWithJson(responseWriter, http.StatusOK, map[string]any{
+			"accountIdentifier":  wireRequest.AccountIdentifier,
+			"strategyIdentifier": wireRequest.StrategyIdentifier,
+			"isFollowing":        true,
+		})
+	}
+}
+
+// buildUnfollowStrategyHandler is POST /strategies/unfollow — always
+// idempotent, mirrors buildFollowStrategyHandler's wire shape.
+func buildUnfollowStrategyHandler(strategyFollowingRegistry *strategyfollowing.Registry) http.HandlerFunc {
+	return func(responseWriter http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodPost {
+			http.Error(responseWriter, "only POST is supported", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var wireRequest followStrategyWireRequest
+		if decodeError := json.NewDecoder(request.Body).Decode(&wireRequest); decodeError != nil {
+			http.Error(responseWriter, "malformed unfollow request", http.StatusBadRequest)
+			return
+		}
+
+		if unfollowError := strategyFollowingRegistry.Unfollow(wireRequest.AccountIdentifier, wireRequest.StrategyIdentifier); unfollowError != nil {
+			http.Error(responseWriter, unfollowError.Error(), http.StatusBadRequest)
+			return
+		}
+
+		respondWithJson(responseWriter, http.StatusOK, map[string]any{
+			"accountIdentifier":  wireRequest.AccountIdentifier,
+			"strategyIdentifier": wireRequest.StrategyIdentifier,
+			"isFollowing":        false,
+		})
+	}
+}
+
+// buildStrategyFollowersHandler is GET /strategies/followers?strategyId=...
+func buildStrategyFollowersHandler(strategyFollowingRegistry *strategyfollowing.Registry) http.HandlerFunc {
+	return func(responseWriter http.ResponseWriter, request *http.Request) {
+		strategyIdentifier := request.URL.Query().Get("strategyId")
+		if strategyIdentifier == "" {
+			http.Error(responseWriter, "missing strategyId query parameter", http.StatusBadRequest)
+			return
+		}
+
+		respondWithJson(responseWriter, http.StatusOK, map[string]any{
+			"strategyIdentifier":         strategyIdentifier,
+			"followerAccountIdentifiers": strategyFollowingRegistry.FollowersOfStrategy(strategyIdentifier),
+		})
+	}
+}
+
+// buildAccountFollowingHandler is GET /strategies/following?accountId=...
+func buildAccountFollowingHandler(strategyFollowingRegistry *strategyfollowing.Registry) http.HandlerFunc {
+	return func(responseWriter http.ResponseWriter, request *http.Request) {
+		accountIdentifier := request.URL.Query().Get("accountId")
+		if accountIdentifier == "" {
+			http.Error(responseWriter, "missing accountId query parameter", http.StatusBadRequest)
+			return
+		}
+
+		respondWithJson(responseWriter, http.StatusOK, map[string]any{
+			"accountIdentifier":           accountIdentifier,
+			"followedStrategyIdentifiers": strategyFollowingRegistry.FollowingOfAccount(accountIdentifier),
+		})
+	}
+}
+
+// buildSetMarkToMarketPriceHandler is POST /mark-to-market/price — the
+// real HTTP push endpoint internal/marktomarket's package doc describes:
+// the smallest genuinely real way to feed this engine a current market
+// price until a real market-data service with a subscribable feed exists
+// in this repo. Body: {"instrumentSymbol":"DEMO-EQ","priceInMinorUnits":10500}
+func buildSetMarkToMarketPriceHandler(markToMarketEngine *marktomarket.MarkToMarketEngine) http.HandlerFunc {
+	return func(responseWriter http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodPost {
+			http.Error(responseWriter, "only POST is supported", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var wireRequest struct {
+			InstrumentSymbol  string `json:"instrumentSymbol"`
+			PriceInMinorUnits int64  `json:"priceInMinorUnits"`
+		}
+		if decodeError := json.NewDecoder(request.Body).Decode(&wireRequest); decodeError != nil {
+			http.Error(responseWriter, "malformed mark-to-market price payload", http.StatusBadRequest)
+			return
+		}
+		if wireRequest.InstrumentSymbol == "" {
+			http.Error(responseWriter, "instrumentSymbol is required", http.StatusBadRequest)
+			return
+		}
+
+		if setError := markToMarketEngine.SetMarketPrice(wireRequest.InstrumentSymbol, wireRequest.PriceInMinorUnits); setError != nil {
+			http.Error(responseWriter, setError.Error(), http.StatusBadRequest)
+			return
+		}
+
+		respondWithJson(responseWriter, http.StatusOK, map[string]any{
+			"instrumentSymbol":  wireRequest.InstrumentSymbol,
+			"priceInMinorUnits": wireRequest.PriceInMinorUnits,
+		})
+	}
+}
+
+// buildMarkToMarketHandler is GET /mark-to-market?accountId=... — real
+// unrealized P&L for LEVERAGED positions only, per FEATURES.md §12. "Is
+// this account leveraged" is decided HERE, not inside
+// internal/marktomarket (see that package's doc for the decoupling
+// rationale): an account counts as leveraged if it has any outstanding
+// margin-funding principal (internal/marginfunding) OR any pledged
+// quantity at all (internal/marginpledge). An account that is neither
+// gets a clear 200 response with isLeveragedAccount:false and an empty
+// positions list, rather than a confusing 404 or a silently-wrong P&L for
+// unleveraged exposure this endpoint isn't scoped to report.
+func buildMarkToMarketHandler(
+	markToMarketEngine *marktomarket.MarkToMarketEngine,
+	fundingBook *marginfunding.FundingBook,
+	pledgeBook *marginpledge.PledgeBook,
+) http.HandlerFunc {
+	return func(responseWriter http.ResponseWriter, request *http.Request) {
+		accountIdentifier := request.URL.Query().Get("accountId")
+		if accountIdentifier == "" {
+			http.Error(responseWriter, "missing accountId query parameter", http.StatusBadRequest)
+			return
+		}
+
+		hasOutstandingMarginFunding := fundingBook.OutstandingPrincipalInMinorUnits(accountIdentifier) > 0
+		hasAnyPledgedHolding := len(pledgeBook.PledgesForAccount(accountIdentifier)) > 0
+		isLeveragedAccount := hasOutstandingMarginFunding || hasAnyPledgedHolding
+
+		if !isLeveragedAccount {
+			respondWithJson(responseWriter, http.StatusOK, map[string]any{
+				"accountIdentifier":              accountIdentifier,
+				"isLeveragedAccount":             false,
+				"positions":                      []marktomarket.PositionMTM{},
+				"totalUnrealizedPnLInMinorUnits": 0,
+			})
+			return
+		}
+
+		totalUnrealizedPnL, positionSnapshots := markToMarketEngine.AccountLevelUnrealizedPnL(accountIdentifier)
+		respondWithJson(responseWriter, http.StatusOK, map[string]any{
+			"accountIdentifier":              accountIdentifier,
+			"isLeveragedAccount":             true,
+			"hasOutstandingMarginFunding":    hasOutstandingMarginFunding,
+			"hasAnyPledgedHolding":           hasAnyPledgedHolding,
+			"positions":                      positionSnapshots,
+			"totalUnrealizedPnLInMinorUnits": totalUnrealizedPnL,
+		})
+	}
+}
+
+// buildAssembleLeverageSnapshot builds a real
+// autoliquidation.AccountLeverageSnapshot for one account from real state
+// in internal/marginfunding, internal/marginpledge, internal/positions,
+// and internal/marktomarket — the decoupling boundary
+// internal/autoliquidation's package doc describes.
+func buildAssembleLeverageSnapshot(
+	accountIdentifier string,
+	fundingBook *marginfunding.FundingBook,
+	pledgeBook *marginpledge.PledgeBook,
+	positionBook *positions.PositionBook,
+	markToMarketEngine *marktomarket.MarkToMarketEngine,
+) autoliquidation.AccountLeverageSnapshot {
+	var positionsForLiquidation []autoliquidation.PositionForLiquidation
+	for instrumentSymbol, netQuantity := range positionBook.PositionsForAccount(accountIdentifier) {
+		marketPrice, priceKnown := markToMarketEngine.MarketPrice(instrumentSymbol)
+		positionsForLiquidation = append(positionsForLiquidation, autoliquidation.PositionForLiquidation{
+			InstrumentSymbol:               instrumentSymbol,
+			NetQuantity:                    netQuantity,
+			CurrentMarketPriceInMinorUnits: marketPrice,
+			MarketPriceIsKnown:             priceKnown,
+		})
+	}
+
+	return autoliquidation.AccountLeverageSnapshot{
+		ClientAccountIdentifier:          accountIdentifier,
+		OutstandingPrincipalInMinorUnits: fundingBook.OutstandingPrincipalInMinorUnits(accountIdentifier),
+		PledgedMarginValueInMinorUnits:   pledgeBook.TotalPledgedMarginValueForAccount(accountIdentifier),
+		Positions:                        positionsForLiquidation,
+	}
+}
+
+// buildAutoLiquidationStatusHandler is GET /auto-liquidation/status?
+// accountId=... — a PURE, side-effect-free read of the account's current
+// graduated risk state. Querying this endpoint NEVER triggers a
+// liquidation, even at the LIQUIDATION state — only POST
+// /auto-liquidation/evaluate can actually act, and even that only acts
+// when genuinely breached. See internal/autoliquidation.ClassifyUtilization.
+func buildAutoLiquidationStatusHandler(
+	fundingBook *marginfunding.FundingBook,
+	pledgeBook *marginpledge.PledgeBook,
+) http.HandlerFunc {
+	return func(responseWriter http.ResponseWriter, request *http.Request) {
+		accountIdentifier := request.URL.Query().Get("accountId")
+		if accountIdentifier == "" {
+			http.Error(responseWriter, "missing accountId query parameter", http.StatusBadRequest)
+			return
+		}
+
+		outstanding := fundingBook.OutstandingPrincipalInMinorUnits(accountIdentifier)
+		pledgedValue := pledgeBook.TotalPledgedMarginValueForAccount(accountIdentifier)
+		snapshot := autoliquidation.AccountLeverageSnapshot{
+			ClientAccountIdentifier:          accountIdentifier,
+			OutstandingPrincipalInMinorUnits: outstanding,
+			PledgedMarginValueInMinorUnits:   pledgedValue,
+		}
+		utilizationPercent := snapshot.UtilizationPercent()
+		thresholds := autoliquidation.DefaultThresholds()
+
+		respondWithJson(responseWriter, http.StatusOK, map[string]any{
+			"accountIdentifier":                accountIdentifier,
+			"outstandingPrincipalInMinorUnits": outstanding,
+			"pledgedMarginValueInMinorUnits":   pledgedValue,
+			"utilizationPercent":               utilizationPercent,
+			"riskState":                        autoliquidation.ClassifyUtilization(utilizationPercent, thresholds),
+			"warningThresholdPercent":          thresholds.WarningUtilizationPercent,
+			"urgentThresholdPercent":           thresholds.UrgentUtilizationPercent,
+		})
+	}
+}
+
+// buildAutoLiquidationEvaluateHandler is POST /auto-liquidation/evaluate
+// — an admin/scheduler-triggerable action endpoint (see
+// internal/autoliquidation's package doc gap (2): no automatic poller
+// ships in this build, this is the real hook a real scheduler would
+// call). Assembles a real AccountLeverageSnapshot from
+// marginfunding+marginpledge+positions+marktomarket and hands it to the
+// LiquidationEngine, which ONLY submits real reducing orders if the
+// account is genuinely at the LIQUIDATION state.
+func buildAutoLiquidationEvaluateHandler(
+	liquidationEngine *autoliquidation.LiquidationEngine,
+	fundingBook *marginfunding.FundingBook,
+	pledgeBook *marginpledge.PledgeBook,
+	positionBook *positions.PositionBook,
+	markToMarketEngine *marktomarket.MarkToMarketEngine,
+) http.HandlerFunc {
+	return func(responseWriter http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodPost {
+			http.Error(responseWriter, "only POST is supported", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var wireRequest struct {
+			AccountIdentifier string `json:"accountIdentifier"`
+		}
+		if decodeError := json.NewDecoder(request.Body).Decode(&wireRequest); decodeError != nil {
+			http.Error(responseWriter, "malformed auto-liquidation evaluate payload", http.StatusBadRequest)
+			return
+		}
+		if wireRequest.AccountIdentifier == "" {
+			http.Error(responseWriter, "accountIdentifier is required", http.StatusBadRequest)
+			return
+		}
+
+		snapshot := buildAssembleLeverageSnapshot(wireRequest.AccountIdentifier, fundingBook, pledgeBook, positionBook, markToMarketEngine)
+		outcome := liquidationEngine.EvaluateAndLiquidateIfBreached(snapshot)
+		respondWithJson(responseWriter, http.StatusOK, outcome)
+	}
+}
+
+// buildConfigureExposureLimitsHandler is POST /exposure-limits/configure
+// — the risk team's real configuration entry point for
+// internal/exposurelimits. Body:
+// {"accountIdentifier":"acct-001","segment":"EQUITY","accountLimitInMinorUnits":1000000,"segmentLimitInMinorUnits":500000}
+// Either limit field may be omitted (zero value, meaning "don't set that
+// one this call") — segment is only required if segmentLimitInMinorUnits
+// is being set.
+func buildConfigureExposureLimitsHandler(exposureLimitsRegistry *exposurelimits.LimitsRegistry) http.HandlerFunc {
+	return func(responseWriter http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodPost {
+			http.Error(responseWriter, "only POST is supported", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var wireRequest struct {
+			AccountIdentifier        string `json:"accountIdentifier"`
+			Segment                  string `json:"segment,omitempty"`
+			AccountLimitInMinorUnits *int64 `json:"accountLimitInMinorUnits,omitempty"`
+			SegmentLimitInMinorUnits *int64 `json:"segmentLimitInMinorUnits,omitempty"`
+		}
+		if decodeError := json.NewDecoder(request.Body).Decode(&wireRequest); decodeError != nil {
+			http.Error(responseWriter, "malformed exposure-limits configure payload", http.StatusBadRequest)
+			return
+		}
+		if wireRequest.AccountIdentifier == "" {
+			http.Error(responseWriter, "accountIdentifier is required", http.StatusBadRequest)
+			return
+		}
+		if wireRequest.SegmentLimitInMinorUnits != nil && wireRequest.Segment == "" {
+			http.Error(responseWriter, "segment is required when setting segmentLimitInMinorUnits", http.StatusBadRequest)
+			return
+		}
+
+		if wireRequest.AccountLimitInMinorUnits != nil {
+			exposureLimitsRegistry.SetAccountLimit(wireRequest.AccountIdentifier, *wireRequest.AccountLimitInMinorUnits)
+		}
+		if wireRequest.SegmentLimitInMinorUnits != nil {
+			exposureLimitsRegistry.SetSegmentLimit(wireRequest.AccountIdentifier, wireRequest.Segment, *wireRequest.SegmentLimitInMinorUnits)
+		}
+
+		respondWithJson(responseWriter, http.StatusOK, map[string]any{
+			"accountIdentifier": wireRequest.AccountIdentifier,
+			"configured":        true,
+		})
+	}
+}
+
+// buildExposureLimitsStatusHandler is GET /exposure-limits?accountId=...
+// [&segment=...] — real current configured limits and current cumulative
+// usage. If segment is omitted, only account-level figures are returned.
+func buildExposureLimitsStatusHandler(exposureLimitsRegistry *exposurelimits.LimitsRegistry) http.HandlerFunc {
+	return func(responseWriter http.ResponseWriter, request *http.Request) {
+		accountIdentifier := request.URL.Query().Get("accountId")
+		if accountIdentifier == "" {
+			http.Error(responseWriter, "missing accountId query parameter", http.StatusBadRequest)
+			return
+		}
+
+		accountLimit, accountLimitConfigured := exposureLimitsRegistry.AccountLimit(accountIdentifier)
+		responseBody := map[string]any{
+			"accountIdentifier":                  accountIdentifier,
+			"accountLimitInMinorUnits":           accountLimit,
+			"accountLimitConfigured":             accountLimitConfigured,
+			"currentAccountExposureInMinorUnits": exposureLimitsRegistry.CurrentAccountExposure(accountIdentifier),
+		}
+
+		if segment := request.URL.Query().Get("segment"); segment != "" {
+			segmentLimit, segmentLimitConfigured := exposureLimitsRegistry.SegmentLimit(accountIdentifier, segment)
+			responseBody["segment"] = segment
+			responseBody["segmentLimitInMinorUnits"] = segmentLimit
+			responseBody["segmentLimitConfigured"] = segmentLimitConfigured
+			responseBody["currentSegmentExposureInMinorUnits"] = exposureLimitsRegistry.CurrentSegmentExposure(accountIdentifier, segment)
+		}
+
+		respondWithJson(responseWriter, http.StatusOK, responseBody)
+	}
+}
+
+// buildEngageKillSwitchHandler is POST /connectivity-kill-switch/engage —
+// the real admin manual trigger. Body: {"reason":"..."}
+func buildEngageKillSwitchHandler(killSwitch *connectivitykillswitch.KillSwitch) http.HandlerFunc {
+	return func(responseWriter http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodPost {
+			http.Error(responseWriter, "only POST is supported", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var wireRequest struct {
+			Reason string `json:"reason"`
+		}
+		_ = json.NewDecoder(request.Body).Decode(&wireRequest) // reason is optional
+		if wireRequest.Reason == "" {
+			wireRequest.Reason = "manually engaged via POST /connectivity-kill-switch/engage (no reason given)"
+		}
+
+		killSwitch.EngageManually(wireRequest.Reason)
+		log.Printf("connectivity kill switch MANUALLY ENGAGED: %s", wireRequest.Reason)
+		respondWithJson(responseWriter, http.StatusOK, killSwitch.CurrentStatus())
+	}
+}
+
+// buildDisengageKillSwitchHandler is POST
+// /connectivity-kill-switch/disengage — clears ONLY the manual
+// engagement flag. See internal/connectivitykillswitch's package doc:
+// trading may still be halted afterward if the AUTO flag is set.
+func buildDisengageKillSwitchHandler(killSwitch *connectivitykillswitch.KillSwitch) http.HandlerFunc {
+	return func(responseWriter http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodPost {
+			http.Error(responseWriter, "only POST is supported", http.StatusMethodNotAllowed)
+			return
+		}
+
+		killSwitch.DisengageManually()
+		log.Printf("connectivity kill switch manually disengaged (auto-engagement, if any, is unaffected)")
+		respondWithJson(responseWriter, http.StatusOK, killSwitch.CurrentStatus())
+	}
+}
+
+// buildKillSwitchStatusHandler is GET /connectivity-kill-switch/status.
+func buildKillSwitchStatusHandler(killSwitch *connectivitykillswitch.KillSwitch) http.HandlerFunc {
+	return func(responseWriter http.ResponseWriter, request *http.Request) {
+		respondWithJson(responseWriter, http.StatusOK, killSwitch.CurrentStatus())
 	}
 }

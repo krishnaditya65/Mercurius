@@ -351,3 +351,57 @@ def testMarketMakingInventoryReturns404ForUnknownSymbol(runningServerBaseUrl):
     statusCode, responseBody = postJson(runningServerBaseUrl, "/market-making/inventory", {"symbol": "NOPE"})
     assert statusCode == 404
     assert "errorMessage" in responseBody
+
+
+def testEsgScreenEndpointRanksByCompositeScoreWithNoCriteria(runningServerBaseUrl):
+    statusCode, responseBody = postJson(
+        runningServerBaseUrl,
+        "/esg/screen",
+        {"candidateSymbols": ["DEMO-EQ", "SIM-AAPL", "SIM-MSFT", "SIM-JPM"]},
+    )
+    assert statusCode == 200
+    rankedSymbolsInOrder = [result["symbol"] for result in responseBody["rankedResults"]]
+    # composites: SIM-MSFT=82.2, SIM-AAPL=81.7, DEMO-EQ=70.0, SIM-JPM=61.5
+    assert rankedSymbolsInOrder == ["SIM-MSFT", "SIM-AAPL", "DEMO-EQ", "SIM-JPM"]
+    demoEqResult = next(r for r in responseBody["rankedResults"] if r["symbol"] == "DEMO-EQ")
+    assert demoEqResult["compositeEsgScore"] == pytest.approx(70.0, abs=1e-9)
+    assert responseBody["excludedSymbols"] == []
+    assert responseBody["unknownSymbols"] == []
+
+
+def testEsgScreenEndpointAppliesMinimumCompositeScoreAndSectorExclusionCriteria(runningServerBaseUrl):
+    statusCode, responseBody = postJson(
+        runningServerBaseUrl,
+        "/esg/screen",
+        {
+            "candidateSymbols": [
+                "DEMO-EQ",
+                "SIM-AAPL",
+                "SIM-MSFT",
+                "SIM-JPM",
+                "SIM-THERMAL-COAL-CO",
+                "SIM-TOBACCO-CO",
+            ],
+            "minimumCompositeEsgScore": 60.0,
+            "excludedControversialSectorFlags": ["TOBACCO", "THERMAL_COAL"],
+        },
+    )
+    assert statusCode == 200
+    rankedSymbols = {result["symbol"] for result in responseBody["rankedResults"]}
+    assert rankedSymbols == {"SIM-MSFT", "SIM-AAPL", "DEMO-EQ", "SIM-JPM"}
+    assert set(responseBody["excludedSymbols"]) == {"SIM-THERMAL-COAL-CO", "SIM-TOBACCO-CO"}
+
+
+def testEsgScreenEndpointReportsUnknownSymbolsSeparately(runningServerBaseUrl):
+    statusCode, responseBody = postJson(
+        runningServerBaseUrl, "/esg/screen", {"candidateSymbols": ["DEMO-EQ", "NOT-A-REAL-SYMBOL"]}
+    )
+    assert statusCode == 200
+    assert [r["symbol"] for r in responseBody["rankedResults"]] == ["DEMO-EQ"]
+    assert responseBody["unknownSymbols"] == ["NOT-A-REAL-SYMBOL"]
+
+
+def testEsgScreenEndpointRejectsMissingCandidateSymbolsWith400(runningServerBaseUrl):
+    statusCode, responseBody = postJson(runningServerBaseUrl, "/esg/screen", {})
+    assert statusCode == 400
+    assert "errorMessage" in responseBody

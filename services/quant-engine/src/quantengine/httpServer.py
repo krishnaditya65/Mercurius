@@ -36,6 +36,10 @@ from quantengine.correlationMatrixEngine import (
     buildPairwiseCorrelationMatrix,
     findPairsTradingCandidatePairsAboveCorrelationThreshold,
 )
+from quantengine.esgScoringEngine import (
+    EsgScreeningCriteria,
+    screenCandidateSymbolsAgainstEsgCriteria,
+)
 from quantengine.garchVolatilityForecaster import (
     calculateExpectedIntradayRangeFromForecastVariance,
     fitGarchOneOneParametersByGridSearchQuasiMaximumLikelihood,
@@ -118,6 +122,8 @@ class QuantEngineRequestHandler(BaseHTTPRequestHandler):
             self._handleMarketMakingSimulateFillRequest(requestBody)
         elif self.path == "/market-making/inventory":
             self._handleMarketMakingInventoryRequest(requestBody)
+        elif self.path == "/esg/screen":
+            self._handleEsgScreenRequest(requestBody)
         else:
             self._writeJsonResponse(404, {"errorMessage": f"no POST route for {self.path}"})
 
@@ -495,6 +501,74 @@ class QuantEngineRequestHandler(BaseHTTPRequestHandler):
 
         self._writeJsonResponse(200, responseBody)
 
+    def _handleEsgScreenRequest(self, requestBody: dict) -> None:
+        """`POST /esg/screen` — body carries `candidateSymbols` (a list of
+        symbols) and an optional criteria object: `minimumCompositeEsgScore`,
+        `minimumEnvironmentalScore`, `minimumSocialScore`,
+        `minimumGovernanceScore`, `excludedControversialSectorFlags` (a
+        list of sector flag strings, e.g. ["TOBACCO", "THERMAL_COAL"]).
+        Returns candidates ranked descending by composite ESG score
+        (`rankedResults`), symbols that failed at least one criterion
+        (`excludedSymbols`), and candidate symbols with no illustrative
+        ESG profile at all (`unknownSymbols`) — see
+        `quantengine/esgScoringEngine.py` (FEATURES.md §17).
+
+        **The underlying per-symbol ESG dataset is illustrative/fabricated
+        fixture data — see that module's docstring — the scoring math and
+        screening logic below are real.**
+        """
+        try:
+            candidateSymbols = [str(symbol) for symbol in requestBody["candidateSymbols"]]
+            criteria = EsgScreeningCriteria(
+                minimumCompositeEsgScore=(
+                    float(requestBody["minimumCompositeEsgScore"])
+                    if requestBody.get("minimumCompositeEsgScore") is not None
+                    else None
+                ),
+                minimumEnvironmentalScore=(
+                    float(requestBody["minimumEnvironmentalScore"])
+                    if requestBody.get("minimumEnvironmentalScore") is not None
+                    else None
+                ),
+                minimumSocialScore=(
+                    float(requestBody["minimumSocialScore"])
+                    if requestBody.get("minimumSocialScore") is not None
+                    else None
+                ),
+                minimumGovernanceScore=(
+                    float(requestBody["minimumGovernanceScore"])
+                    if requestBody.get("minimumGovernanceScore") is not None
+                    else None
+                ),
+                excludedControversialSectorFlags=frozenset(
+                    str(flag) for flag in requestBody.get("excludedControversialSectorFlags", [])
+                ),
+            )
+        except (KeyError, TypeError, ValueError) as validationError:
+            self._writeJsonResponse(400, {"errorMessage": f"invalid request body: {validationError}"})
+            return
+
+        result = screenCandidateSymbolsAgainstEsgCriteria(candidateSymbols, criteria)
+
+        self._writeJsonResponse(
+            200,
+            {
+                "rankedResults": [
+                    {
+                        "symbol": profile.symbol,
+                        "environmentalScore": profile.environmentalScore,
+                        "socialScore": profile.socialScore,
+                        "governanceScore": profile.governanceScore,
+                        "compositeEsgScore": profile.compositeEsgScore,
+                        "controversialSectorFlags": sorted(profile.controversialSectorFlags),
+                    }
+                    for profile in result.rankedProfiles
+                ],
+                "excludedSymbols": result.excludedSymbols,
+                "unknownSymbols": result.unknownSymbols,
+            },
+        )
+
     def _writeJsonResponse(self, statusCode: int, responseBody: dict) -> None:
         responseBytes = json.dumps(responseBody).encode("utf-8")
         self.send_response(statusCode)
@@ -516,7 +590,8 @@ def runQuantEngineHttpServer() -> None:
         f"quant-engine listening on {host}:{port} (GET /health, POST /options/price, "
         "POST /options/implied-volatility, POST /risk/statistics, POST /arbitrage/scan, "
         "POST /volatility/garch-forecast, POST /correlation/matrix, POST /risk/value-at-risk, "
-        "POST /market-making/quote, POST /market-making/simulate-fill, POST /market-making/inventory)"
+        "POST /market-making/quote, POST /market-making/simulate-fill, POST /market-making/inventory, "
+        "POST /esg/screen)"
     )
     httpServer.serve_forever()
 

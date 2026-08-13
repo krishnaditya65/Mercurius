@@ -3,16 +3,157 @@
 Skeleton — see `FEATURES.md` §11 in the repo root for the full retail app
 scope (watchlists, MF/SIP flows, options chain, alerts, etc.).
 
-## Status: one real page
+## Status: dashboard page + three FEATURES.md §11 pages
 
 `app/page.tsx` is a working order ticket that POSTs directly to
 `oms-gateway`'s `/orders/submit` and renders its
 `humanReadableRejectionReason` on failure — this proves the FEATURES.md
 §21 plain-language-rejection differentiator end-to-end from a real
-browser client, not just from `curl`.
+browser client, not just from `curl`. It now also embeds the
+Notifications section (item 2 below) and links to the two new pages.
 
-Everything else (auth, dashboard, portfolio, MF investing, SIPs,
-watchlists) does not exist yet.
+Everything else (auth dashboard reconciliation, portfolio, MF investing,
+SIPs, watchlists UI) does not exist yet.
+
+### 1. Options chain — `app/optionsChain/page.tsx`
+
+Real UI for oms-gateway's real `GET /options/chain?underlyingSpotPrice=
+&expiryDate=&symbol=` (`internal/optionschain`), which itself calls
+quant-engine's real Black-Scholes HTTP pricer for every contract — the
+Greeks and theoretical prices rendered here are genuinely computed by
+quant-engine, not fabricated by this component. Renders a 10-strike
+ladder (strike / call price+Greeks+OI+Vol / put price+Greeks+OI+Vol) plus
+a Put-Call Ratio summary. The spot-price field can be prefilled from
+market-data's real last-trade tick or edited by hand; the expiry date is
+a plain date picker.
+
+**Honest inherited gap** (from oms-gateway's own README/package doc,
+repeated in this page's file header): Open Interest and Volume per
+contract are SYNTHETIC/illustrative, not observed market data; "implied
+volatility" shown is really the ASSUMED flat volatility fed into the
+pricer, not a real solved IV; there's no real bid/ask spread anywhere in
+this repo, so the theoretical price stands in as a single bid/ask
+equivalent. Only the strike ladder, the Greeks/theoretical prices, and
+the PCR arithmetic are real.
+
+**Verified live** against a real running oms-gateway + quant-engine (see
+"Live verification transcript" below): a real chain for DEMO-EQ, spot
+1000, expiry 2026-09-30 came back with 10 strikes, real per-strike
+Greeks, `totalCallOpenInterest: 277567`, `totalPutOpenInterest: 319199`,
+`putCallRatio: 1.1499890116620493`; killing quant-engine and retrying
+produced a real `502 Bad Gateway` from oms-gateway, which this page
+surfaces as an error message (loading/error states both exercised).
+
+### 2. Push notifications — `app/notificationCenter/notificationCenterSection.tsx`
+
+Real Web Notifications API integration (`Notification.requestPermission()`
++ `new Notification(...)`), embedded as a section on the dashboard page.
+Browsers can't receive real server push without a backend push service
+(no Firebase/APNs/web-push infra anywhere in this repo) — so this is
+real client-side polling against backends that genuinely produce the
+underlying events, not fabricated data:
+
+- **Order fills**: polls oms-gateway's real `GET /audit-trail?
+  accountId=...` and fires a notification for every new `ORDER_FILLED` /
+  `PAPER_ORDER_FILLED` entry. **Honest gap**: `audittrail.Append` for a
+  fill is only called inside the request handler of the order that
+  CROSSED (the aggressor) — see oms-gateway's
+  `cmd/server/main.go`'s `processOrderSubmission`. A resting LIMIT order
+  filled later by someone *else's* incoming crossing order isn't
+  guaranteed to get an `ORDER_FILLED` entry attributed to the resting
+  order's own owner. This reliably notifies for orders that filled
+  immediately (the common demo case) but isn't a complete "notify me the
+  instant ANY of my resting orders fills" guarantee.
+- **Price alerts**: uses market-data's real, pre-existing
+  `src/pricealerts.rs` feature end to end — this component can create a
+  real alert via `POST /alerts/create`, then polls `GET /alerts?
+  accountIdentifier=...` and fires a notification the moment a
+  previously-untriggered alert flips `isTriggered: true`, which only
+  happens off a real trade tick crossing the threshold.
+- **Margin calls**: **no real event-driven trigger exists for this
+  today.** oms-gateway's margin/risk state
+  (`internal/riskengine`/`internal/marginpledge`) is not event-driven and
+  exposes no "available margin dropped below maintenance" endpoint —
+  margin only ever surfaces as a side effect of a pledge/unpledge/funding
+  call, or implicitly via an order getting rejected with
+  `INSUFFICIENT_MARGIN`. Rather than fabricate a margin-call event that
+  doesn't exist, this ships a clearly-labeled **best-effort** heuristic:
+  it polls the same real audit-trail feed and fires a notification,
+  explicitly titled "Best-effort margin alert (NOT a real margin call)",
+  for any new `ORDER_REJECTED` entry whose real `detailMessage` mentions
+  margin. This is a genuine signal (a real order was genuinely rejected
+  for real insufficient margin) but it is **not** a real margin call — a
+  real margin call fires on an *existing open position's* mark-to-market
+  breaching a maintenance threshold, independent of whether you submit
+  any new order at all, and nothing in this repo computes or watches
+  that continuously yet.
+
+**Verified live**: created a price alert (fire at DEMO-EQ ≥ 100),
+submitted a real crossing trade at 100 through oms-gateway →
+matching-engine → market-data, and the alert flipped to
+`"isTriggered": true, "triggeredAtEpochSeconds": 1786661100` — the exact
+signal this component's poll loop watches for. Submitted a real order
+for 999,999,999 shares and confirmed a real
+`{"eventType":"ORDER_REJECTED","detailMessage":"INSUFFICIENT_MARGIN"}`
+audit-trail entry — the exact signal the best-effort margin heuristic
+watches for. Submitted a real crossing pair of orders and confirmed real
+`ORDER_FILLED` audit-trail entries (`"filled 4 @ 100 (buyer=acct-001
+seller=acct-002)"`) — the exact signal the order-fill watch fires on.
+Browser-side `Notification.requestPermission()`/`new Notification(...)`
+itself could not be exercised in this environment (no interactive
+browser available to this agent) — the polling→event plumbing feeding it
+is proven real end-to-end above; wiring the last step
+(`showBrowserNotification`) to an actual granted-permission browser is a
+one-click manual step for a human running this app.
+
+### 3. Social/copy-trading (follow verified strategies) — `app/strategies/page.tsx`
+
+Opt-in follow/unfollow of admin-verified strategies, backed by a new
+real, minimal, in-memory backend piece added to oms-gateway:
+`services/oms-gateway/internal/strategyfollowing` (18 tests), wired up as
+`GET /strategies`, `POST /strategies/admin/verify`, `POST
+/strategies/follow`, `POST /strategies/unfollow`, `GET
+/strategies/followers?strategyId=`, `GET /strategies/following?
+accountId=`.
+
+**============ SCOPE BOUNDARY ============**
+This is opt-in FOLLOW/UNFOLLOW **ONLY**. There is **no order mirroring**,
+**no automatic replication** of a followed strategy's trades into your
+account, and **no auto-following** of anything — following a strategy
+here has zero effect on your own orders. A real copy-trading engine
+(mirroring trades, position sizing, risk controls for the copier) is
+explicitly out of scope, both here and in the backend package's own doc
+comment.
+**==========================================**
+
+`Follow` only succeeds against a `strategyIdentifier` that's on the
+public, admin-curated verified list (`POST /strategies/admin/verify` —
+reusing the spirit of backoffice's admin-approval pattern, a human
+decision gates something becoming publicly followable) — an unverified
+`strategyIdentifier` is rejected with a real `400`. The page includes a
+demo-only "Admin: verify a strategy" panel so this is exercisable
+end-to-end without a separate admin tool (unauthenticated, like most
+endpoints in this repo today — documented in the page's file header).
+
+**Verified live**: verified `algo-1`/`algo-2` via the admin endpoint,
+followed `algo-1` from two different accounts, confirmed `GET
+/strategies` showed `"followerCount":2` for `algo-1` and `0` for
+`algo-2`, confirmed `GET /strategies/followers?strategyId=algo-1`
+returned `["acct-001","acct-002"]` and `GET /strategies/following?
+accountId=acct-001` returned `["algo-1"]`, confirmed following an
+unverified `strategyIdentifier` was rejected with a real `400`, and
+confirmed `unfollow` then correctly emptied `acct-001`'s following list.
+
+## Tests
+
+`apps/web` has no test runner configured (`package.json` defines only
+`dev`/`build`/`start`/`lint` — no Jest/Vitest/Playwright anywhere in this
+package or its `node_modules`). No frontend automated tests were added
+here; rigor for the three frontend features above instead comes from the
+live-verification transcripts documented per-feature. The one new piece
+of backend STATE this round (`internal/strategyfollowing`) is Go and
+fully unit-tested the same as every other `oms-gateway` package (18
+tests, `go test ./internal/strategyfollowing/...`).
 
 ## Run it
 
@@ -20,9 +161,16 @@ watchlists) does not exist yet.
 npm install
 npm run dev       # http://localhost:3000
 
-# in another terminal, so the order ticket has something to talk to:
-cd ../../services/oms-gateway && go run ./cmd/server
+# in other terminals, so every page has something real to talk to:
+cd ../../services/ledger && go run ./cmd/server            # :8082
+cd ../../services/kyc-onboarding && go run ./cmd/server    # :8083
+cd ../../services/backoffice && go run ./cmd/server        # :8084
+cd ../../services/matching-engine && cargo run              # :9101 (+ market-data ingestion)
+cd ../../services/market-data && cargo run                  # :9102/:9103/:9104 — needed for the price chart, price alerts, and the options chain's spot-price prefill
+cd ../../services/quant-engine && python3 -m venv .venv && .venv/bin/pip install -e . && .venv/bin/quant-engine-server   # :8085 — needed for the options chain
+cd ../../services/oms-gateway && go run ./cmd/server        # :8081 — needed for almost everything, including the new /options/chain and /strategies/* endpoints
 ```
 
-Set `NEXT_PUBLIC_OMS_GATEWAY_BASE_URL` if oms-gateway isn't at the
-default `http://localhost:8081`.
+Override base URLs via `NEXT_PUBLIC_OMS_GATEWAY_BASE_URL` (default
+`http://localhost:8081`) and `NEXT_PUBLIC_MARKET_DATA_BASE_URL` (default
+`http://localhost:9103`) if any service isn't at its default port.
