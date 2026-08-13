@@ -1,0 +1,6 @@
+# This crate's naming convention (long, descriptive camelCase
+# identifiers, overriding normal Rust snake_case idiom — see the repo's
+# naming-convention doc) needs more horizontal room than rustfmt's
+# default 100-column width to avoid wrapping nearly every function
+# signature. 120 keeps most of this crate's existing lines intact.
+max_width = 120

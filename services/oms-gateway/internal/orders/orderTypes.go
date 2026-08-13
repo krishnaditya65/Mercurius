@@ -10,6 +10,90 @@
 // the rule stopped applying.
 package orders
 
+import "errors"
+
+// Order execution type constants — FEATURES.md §3's "Iceberg, FOK, IOC
+// for institutional flow". OrderExecutionType is an ADDITIONAL, more
+// explicit way to state what kind of order this is, layered on top of
+// the pre-existing OrderIsMarketOrderNotLimit/OrderIsStopLossVariant
+// booleans rather than replacing them (backward compatible: a client
+// that omits OrderExecutionType entirely gets exactly the pre-existing
+// behavior, unaffected by anything below).
+//
+// IMPORTANT SCOPE BOUNDARY, stated loudly because it's easy to miss:
+// oms-gateway only ACCEPTS and VALIDATES these execution types at this
+// layer. True ICEBERG/FOK/IOC fill semantics — showing only a visible
+// slice of an iceberg order and refreshing it as it fills, killing a FOK
+// order atomically if it can't fully fill immediately, cancelling an
+// IOC order's unfilled remainder immediately instead of letting it rest
+// — all require support in the matching engine's order book itself,
+// which does not exist yet (see internal/matchingengineclient: its wire
+// protocol has no field for any of this). As of this build, an ICEBERG/
+// FOK/IOC order that passes validation here is handed off to
+// matching-engine exactly like an ordinary Limit/Market order — it will
+// rest and fill/partial-fill/not-fill using ordinary continuous-matching
+// rules, NOT the semantics its execution type implies. This is a real,
+// load-bearing gap, not an oversight: closing it needs matching-engine
+// work this build doesn't include.
+const (
+	OrderExecutionTypeMarket            = "MARKET"
+	OrderExecutionTypeLimit             = "LIMIT"
+	OrderExecutionTypeStopLoss          = "SL"
+	OrderExecutionTypeStopLossMarket    = "SL-M"
+	OrderExecutionTypeIceberg           = "ICEBERG"
+	OrderExecutionTypeFillOrKill        = "FOK"
+	OrderExecutionTypeImmediateOrCancel = "IOC"
+)
+
+var (
+	// ErrUnknownOrderExecutionType is returned when OrderExecutionType is
+	// set to something other than one of the constants above.
+	ErrUnknownOrderExecutionType = errors.New("unknown orderExecutionType — must be one of MARKET, LIMIT, SL, SL-M, ICEBERG, FOK, IOC")
+
+	// ErrIcebergRequiresVisibleQuantity is returned when an ICEBERG order
+	// omits IcebergVisibleQuantity entirely.
+	ErrIcebergRequiresVisibleQuantity = errors.New("an ICEBERG order requires icebergVisibleQuantity")
+
+	// ErrIcebergVisibleQuantityMustBePositive is returned when
+	// IcebergVisibleQuantity is present but zero.
+	ErrIcebergVisibleQuantityMustBePositive = errors.New("icebergVisibleQuantity must be greater than zero")
+
+	// ErrIcebergVisibleQuantityExceedsTotalQuantity is returned when
+	// IcebergVisibleQuantity is greater than OrderQuantity — an iceberg's
+	// visible slice can never exceed the whole order it's a slice of.
+	ErrIcebergVisibleQuantityExceedsTotalQuantity = errors.New("icebergVisibleQuantity must not exceed orderQuantity")
+)
+
+// ValidateOrderExecutionType enforces what's enforceable at the
+// oms-gateway layer for OrderExecutionType — see the constants' doc
+// comment above for the honest boundary on what ISN'T enforced (true
+// ICEBERG/FOK/IOC fill semantics, which need matching-engine support).
+// An empty OrderExecutionType is valid (backward-compatible no-op) —
+// only a non-empty, unrecognized value or an invalid Iceberg sub-field
+// combination is rejected.
+func ValidateOrderExecutionType(request OrderSubmissionRequest) error {
+	switch request.OrderExecutionType {
+	case "":
+		return nil
+	case OrderExecutionTypeMarket, OrderExecutionTypeLimit, OrderExecutionTypeStopLoss, OrderExecutionTypeStopLossMarket,
+		OrderExecutionTypeFillOrKill, OrderExecutionTypeImmediateOrCancel:
+		return nil
+	case OrderExecutionTypeIceberg:
+		if request.IcebergVisibleQuantity == nil {
+			return ErrIcebergRequiresVisibleQuantity
+		}
+		if *request.IcebergVisibleQuantity == 0 {
+			return ErrIcebergVisibleQuantityMustBePositive
+		}
+		if *request.IcebergVisibleQuantity > request.OrderQuantity {
+			return ErrIcebergVisibleQuantityExceedsTotalQuantity
+		}
+		return nil
+	default:
+		return ErrUnknownOrderExecutionType
+	}
+}
+
 // OrderSubmissionRequest is what a client (web/mobile/terminal/algo) sends
 // to place an order. Field names are deliberately long and descriptive
 // per project convention — see the mercurius-naming-convention note.
@@ -64,6 +148,49 @@ type OrderSubmissionRequest struct {
 	// any other order, same as a real broker treating an AMO placed
 	// during market hours as a regular order.
 	OrderIsAfterMarketOrder bool `json:"orderIsAfterMarketOrder,omitempty"`
+
+	// OrderExecutionType: FEATURES.md §3's Iceberg/FOK/IOC support.
+	// Optional — see the constants and ValidateOrderExecutionType above
+	// for the full contract and the honest boundary on what's actually
+	// enforced. A client that omits this field entirely is unaffected;
+	// the pre-existing OrderIsMarketOrderNotLimit/OrderIsStopLossVariant
+	// booleans still select the order shape sent to matching-engine.
+	OrderExecutionType string `json:"orderExecutionType,omitempty"`
+
+	// IcebergVisibleQuantity is required, and must be > 0 and
+	// <= OrderQuantity, when OrderExecutionType is "ICEBERG"; ignored
+	// otherwise. Pointer so "not set" is distinguishable from "visible
+	// quantity 0" (invalid, caught by ValidateOrderExecutionType).
+	IcebergVisibleQuantity *uint64 `json:"icebergVisibleQuantity,omitempty"`
+
+	// IsPaperTradingOrder: FEATURES.md §7's paper trading mode. When
+	// true, this order runs through the EXACT SAME KYC/freeze/pledge/
+	// risk-check gates and audit trail as a live order — see
+	// cmd/server/main.go's processOrderSubmission and
+	// internal/papertrading's package doc for the honest "only the final
+	// hand-off differs" contract. A paper order never reaches the real
+	// matching-engine and never posts a real settlement to ledger; its
+	// simulated fill updates a completely separate paper positions book
+	// instead of the real one.
+	IsPaperTradingOrder bool `json:"isPaperTradingOrder,omitempty"`
+
+	// PaperMarketReferencePriceInMinorUnits is required when
+	// IsPaperTradingOrder AND OrderIsMarketOrderNotLimit are both true —
+	// see internal/papertrading.SimulateFill's doc comment for why a
+	// paper MARKET order needs a caller-supplied reference price
+	// (oms-gateway has no live last-traded-price feed). Ignored
+	// otherwise.
+	PaperMarketReferencePriceInMinorUnits *int64 `json:"paperMarketReferencePriceInMinorUnits,omitempty"`
+
+	// StrategyIdentifier: FEATURES.md §7's "strategy resource limits &
+	// circuit breakers". Optional — an order that omits it is never
+	// subject to internal/algolimits at all (unlimited, exactly the
+	// pre-existing behavior). When set, cmd/server/main.go's
+	// processOrderSubmission checks it against internal/algolimits
+	// BEFORE the KYC gate — an order that trips a strategy's rate or
+	// daily-notional limit is rejected before touching KYC/freeze/risk/
+	// matching-engine at all.
+	StrategyIdentifier string `json:"strategyIdentifier,omitempty"`
 }
 
 // TradeExecutionSummary mirrors matchingengineclient.TradeExecutionWireEvent
@@ -114,6 +241,20 @@ type OrderAcknowledgementResponse struct {
 	// build needs either a webhook/WS push or an "AMO ticket id" a client
 	// can poll before submission even happens.
 	IsQueuedAsAfterMarketOrder bool `json:"isQueuedAsAfterMarketOrder,omitempty"`
+
+	// IsPaperTradingOrder mirrors the request field on the response, so a
+	// client can tell at a glance that TradeExecutionEvents below (if
+	// any) came from internal/papertrading's simulated fill engine, NOT
+	// a real matching-engine trade — see that package's doc comment.
+	IsPaperTradingOrder bool `json:"isPaperTradingOrder,omitempty"`
+
+	// PaperOrderSimulationError is set only when IsPaperTradingOrder is
+	// true and internal/papertrading.SimulateFill itself rejected the
+	// order (e.g. a MARKET paper order with no reference price) — a
+	// paper-specific failure mode distinct from MatchingEngineHandoffError,
+	// which never applies to a paper order (paper orders never reach
+	// matching-engine at all).
+	PaperOrderSimulationError string `json:"paperOrderSimulationError,omitempty"`
 }
 
 // CancelOrderRequest is the client-facing payload for POST /orders/cancel.

@@ -27,6 +27,19 @@ const (
 	EventAfterMarketOrderQueued     EventType = "AFTER_MARKET_ORDER_QUEUED"
 	EventMarketSessionOpened        EventType = "MARKET_SESSION_OPENED"
 	EventMarketSessionClosed        EventType = "MARKET_SESSION_CLOSED"
+
+	// EventPaperOrderFilled and EventPaperOrderSimulationFailed are
+	// FEATURES.md §7's paper trading events — distinct from
+	// EventOrderFilled/EventOrderMatchingEngineFailure so the audit trail
+	// itself makes it obvious a fill was simulated, not real, without
+	// having to cross-reference the order request payload.
+	EventPaperOrderFilled           EventType = "PAPER_ORDER_FILLED"
+	EventPaperOrderSimulationFailed EventType = "PAPER_ORDER_SIMULATION_FAILED"
+
+	// EventStrategyLimitRejected is FEATURES.md §7's strategy resource
+	// limits — recorded when internal/algolimits rejects an order before
+	// it ever reaches the KYC/freeze/risk gates.
+	EventStrategyLimitRejected EventType = "STRATEGY_LIMIT_REJECTED"
 )
 
 // Entry is one immutable audit record. Every field is set at append time

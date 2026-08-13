@@ -2,6 +2,15 @@ use std::collections::HashMap;
 
 use crate::marketDataEventTypes::{PriceLevelDeltaUpdate, SequencedMarketDataMessage};
 
+/// One registered downstream sink's callback shape — named so
+/// `DeltaPublisher`'s field doesn't need to spell out the raw
+/// `Vec<Box<dyn FnMut(...)>>` type inline (clippy::type_complexity).
+/// `Send` because `DeltaPublisher` itself now lives behind an
+/// `Arc<Mutex<_>>` shared between the real TCP ingestion thread and the
+/// simulated feed thread (`main.rs`), so the whole struct — including
+/// every boxed sink closure — must be `Send`.
+type DownstreamSink = Box<dyn FnMut(&SequencedMarketDataMessage) + Send>;
+
 /// Assigns per-instrument monotonic sequence numbers to outgoing delta
 /// messages and hands them to every registered downstream sink.
 ///
@@ -14,7 +23,7 @@ use crate::marketDataEventTypes::{PriceLevelDeltaUpdate, SequencedMarketDataMess
 /// Kafka producer + WS fan-out fleet.
 pub struct DeltaPublisher {
     lastSequenceNumberByInstrument: HashMap<String, u64>,
-    registeredDownstreamSinks: Vec<Box<dyn FnMut(&SequencedMarketDataMessage)>>,
+    registeredDownstreamSinks: Vec<DownstreamSink>,
 }
 
 impl DeltaPublisher {
@@ -30,7 +39,7 @@ impl DeltaPublisher {
     /// message is delivered to every registered sink.
     pub fn registerDownstreamSink<SinkFn>(&mut self, downstreamSink: SinkFn)
     where
-        SinkFn: FnMut(&SequencedMarketDataMessage) + 'static,
+        SinkFn: FnMut(&SequencedMarketDataMessage) + Send + 'static,
     {
         self.registeredDownstreamSinks.push(Box::new(downstreamSink));
     }
@@ -64,24 +73,26 @@ impl DeltaPublisher {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cell::RefCell;
-    use std::rc::Rc;
+    use std::sync::{Arc, Mutex};
 
     #[test]
     fn sequenceNumberIncrementsIndependentlyPerInstrument() {
-        let receivedMessages = Rc::new(RefCell::new(Vec::new()));
-        let receivedMessagesForSink = Rc::clone(&receivedMessages);
+        // Arc<Mutex<_>> rather than Rc<RefCell<_>> — the sink closure must
+        // now be `Send` (`DeltaPublisher` lives behind an `Arc<Mutex<_>>`
+        // shared across threads in `main.rs`), and `Rc`/`RefCell` aren't.
+        let receivedMessages = Arc::new(Mutex::new(Vec::new()));
+        let receivedMessagesForSink = Arc::clone(&receivedMessages);
 
         let mut deltaPublisherUnderTest = DeltaPublisher::newPublisherWithNoSinks();
         deltaPublisherUnderTest.registerDownstreamSink(move |message| {
-            receivedMessagesForSink.borrow_mut().push(message.clone_for_test());
+            receivedMessagesForSink.lock().unwrap().push(message.clone_for_test());
         });
 
         deltaPublisherUnderTest.publishDeltaBatchForInstrument("AAPL", vec![]);
         deltaPublisherUnderTest.publishDeltaBatchForInstrument("MSFT", vec![]);
         deltaPublisherUnderTest.publishDeltaBatchForInstrument("AAPL", vec![]);
 
-        let recorded = receivedMessages.borrow();
+        let recorded = receivedMessages.lock().unwrap();
         assert_eq!(recorded[0].perInstrumentSequenceNumber, 1); // AAPL #1
         assert_eq!(recorded[1].perInstrumentSequenceNumber, 1); // MSFT #1, independent counter
         assert_eq!(recorded[2].perInstrumentSequenceNumber, 2); // AAPL #2

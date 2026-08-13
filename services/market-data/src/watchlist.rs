@@ -19,7 +19,9 @@ pub struct WatchlistStore {
 
 impl WatchlistStore {
     pub fn newEmptyStore() -> Self {
-        WatchlistStore { symbolsByAccount: Mutex::new(HashMap::new()) }
+        WatchlistStore {
+            symbolsByAccount: Mutex::new(HashMap::new()),
+        }
     }
 
     /// Returns true if the symbol was newly added, false if it was
@@ -29,7 +31,7 @@ impl WatchlistStore {
         let mut symbolsByAccount = self.symbolsByAccount.lock().expect("watchlist mutex poisoned");
         symbolsByAccount
             .entry(accountIdentifier.to_string())
-            .or_insert_with(HashSet::new)
+            .or_default()
             .insert(instrumentSymbol.to_string())
     }
 

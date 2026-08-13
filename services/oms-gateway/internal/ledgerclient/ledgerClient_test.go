@@ -81,3 +81,73 @@ func TestPostTradeSettlementJournalEntrySurfacesLedgerRejection(t *testing.T) {
 		t.Fatal("expected an error when the ledger rejects the entry")
 	}
 }
+
+// Per doubleEntryLedgerCore's convention ("debit increases the named
+// account, credit decreases it"), a disbursement that INCREASES the
+// client's balance must DEBIT the client account, not credit it.
+
+func TestPostMarginFundingDisbursementDebitsClientAccountFromClearingAccount(t *testing.T) {
+	var capturedRequest PostJournalEntryWireRequest
+
+	fakeLedgerServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&capturedRequest)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(PostJournalEntryWireResponse{WasJournalEntryPosted: true})
+	}))
+	defer fakeLedgerServer.Close()
+
+	client := NewLedgerClient(fakeLedgerServer.URL)
+	postError := client.PostMarginFundingDisbursementJournalEntry("acct-001", 50_000, "margin funding disbursement")
+
+	if postError != nil {
+		t.Fatalf("expected successful post, got: %v", postError)
+	}
+	if len(capturedRequest.DebitLines) != 1 || capturedRequest.DebitLines[0].LedgerAccountIdentifier != "acct-001" || capturedRequest.DebitLines[0].AmountInMinorUnits != 50_000 {
+		t.Fatalf("expected client account debited (increased) 50000, got %+v", capturedRequest.DebitLines)
+	}
+	if len(capturedRequest.CreditLines) != 1 || capturedRequest.CreditLines[0].LedgerAccountIdentifier != marginFundingClearingAccountIdentifier {
+		t.Fatalf("expected clearing account credited (decreased), got %+v", capturedRequest.CreditLines)
+	}
+}
+
+func TestPostMarginFundingRepaymentCreditsClientAccountToClearingAccount(t *testing.T) {
+	var capturedRequest PostJournalEntryWireRequest
+
+	fakeLedgerServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&capturedRequest)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(PostJournalEntryWireResponse{WasJournalEntryPosted: true})
+	}))
+	defer fakeLedgerServer.Close()
+
+	client := NewLedgerClient(fakeLedgerServer.URL)
+	postError := client.PostMarginFundingRepaymentJournalEntry("acct-001", 20_000, "margin funding repayment")
+
+	if postError != nil {
+		t.Fatalf("expected successful post, got: %v", postError)
+	}
+	if len(capturedRequest.CreditLines) != 1 || capturedRequest.CreditLines[0].LedgerAccountIdentifier != "acct-001" || capturedRequest.CreditLines[0].AmountInMinorUnits != 20_000 {
+		t.Fatalf("expected client account credited (decreased) 20000, got %+v", capturedRequest.CreditLines)
+	}
+	if len(capturedRequest.DebitLines) != 1 || capturedRequest.DebitLines[0].LedgerAccountIdentifier != marginFundingClearingAccountIdentifier {
+		t.Fatalf("expected clearing account debited (increased), got %+v", capturedRequest.DebitLines)
+	}
+}
+
+func TestPostMarginFundingDisbursementSurfacesLedgerRejection(t *testing.T) {
+	fakeLedgerServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(PostJournalEntryWireResponse{
+			WasJournalEntryPosted: false,
+			ErrorMessage:          "referenced ledger account does not exist: acct-001",
+		})
+	}))
+	defer fakeLedgerServer.Close()
+
+	client := NewLedgerClient(fakeLedgerServer.URL)
+	postError := client.PostMarginFundingDisbursementJournalEntry("acct-001", 1_000, "test")
+
+	if postError == nil {
+		t.Fatal("expected an error when the ledger rejects the entry")
+	}
+}

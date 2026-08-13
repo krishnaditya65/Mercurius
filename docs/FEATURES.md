@@ -83,10 +83,10 @@ onto an internal one later is expensive.
 - [ ] `[P1]` Nominee management, joint holding support
 - [ ] `[P1]` Regulatory reporting: contract notes, ledger statements, tax P&L
       (STCG/LTCG), Annual Information Statement reconciliation
-- [ ] `[P2]` AML transaction monitoring (unusual pattern flags, PEP screening)
+- [ ] 🚧 `[P2]` AML transaction monitoring (unusual pattern flags, PEP screening)
 - [ ] 🚧 `[P2]` Audit trail: immutable log of every order, modification, cancellation
       with actor, timestamp, IP — required for regulator inquiries
-- [ ] `[P2]` Segregation of client funds vs. firm funds (regulatory requirement
+- [ ] 🚧 `[P2]` Segregation of client funds vs. firm funds (regulatory requirement
       in most jurisdictions — client money must be ring-fenced)
 - [ ] `[P3]` Surveillance system: spoofing/layering/wash-trade detection for
       compliance officers, replay tooling tied to Tick-to-Trade Analytics
@@ -94,33 +94,33 @@ onto an internal one later is expensive.
 ## 2. Payments & Banking Rails
 
 - [ ] 🚧 `[P0]` Wallet/ledger core: double-entry accounting, idempotent transactions
-- [ ] `[P1]` UPI / NEFT / IMPS / net-banking deposit integration
+- [ ] 🚧 `[P1]` UPI / NEFT / IMPS / net-banking deposit integration
 - [ ] 🚧 `[P1]` Withdrawal workflow with T+N settlement holds
-- [ ] `[P1]` Auto-payment mandates for SIPs (eNACH/standing instructions)
-- [ ] `[P2]` Margin funding / instant margin against pledged collateral payout
-- [ ] `[P2]` Multi-currency wallet (for platforms offering global/US stocks)
+- [ ] 🚧 `[P1]` Auto-payment mandates for SIPs (eNACH/standing instructions)
+- [ ] 🚧 `[P2]` Margin funding / instant margin against pledged collateral payout
+- [ ] 🚧 `[P2]` Multi-currency wallet (for platforms offering global/US stocks)
 
 ## 3. Equities & Derivatives (Wealth + Active Trading)
 
 - [ ] 🚧 `[P1]` Order entry: Market, Limit, SL, SL-M
 - [ ] 🚧 `[P1]` Cover Orders (CO), Bracket Orders (BO), GTT, AMO
 - [ ] 🚧 `[P1]` Order book / trade book / positions / holdings views
-- [ ] `[P2]` Real-time Options Chain: OI, Volume, IV, strike ladder, PCR
-- [ ] `[P2]` Greeks computed live per contract (Delta/Gamma/Theta/Vega/Rho)
-- [ ] `[P2]` Margin Pledge system (stocks/MF as collateral)
-- [ ] `[P2]` SPAN + Exposure margin calculator for F&O
-- [ ] `[P3]` Iceberg, FOK, IOC order types for institutional flow
-- [ ] `[P4]` Direct Market Access (DMA) / FIX gateway for institutional clients
+- [ ] 🚧 `[P2]` Real-time Options Chain: OI, Volume, IV, strike ladder, PCR
+- [ ] 🚧 `[P2]` Greeks computed live per contract (Delta/Gamma/Theta/Vega/Rho)
+- [ ] 🚧 `[P2]` Margin Pledge system (stocks/MF as collateral)
+- [ ] 🚧 `[P2]` SPAN + Exposure margin calculator for F&O
+- [ ] 🚧 `[P3]` Iceberg, FOK, IOC order types for institutional flow
+- [ ] 🚧 `[P4]` Direct Market Access (DMA) / FIX gateway for institutional clients
 
 ## 4. Mutual Funds, ETFs & Baskets
 
-- [ ] `[P1]` Direct AMC routing (commission-free MF investing)
-- [ ] `[P1]` Lumpsum + SIP setup, SIP pause/cancel, SIP calendar
-- [ ] `[P1]` Step-Up SIPs (auto-increase % annually)
-- [ ] `[P2]` Index/thematic rebalancing baskets with one-click rebalance
-- [ ] `[P2]` Robo-Advisory: risk-profile → Efficient Frontier allocation
+- [ ] 🚧 `[P1]` Direct AMC routing (commission-free MF investing)
+- [ ] 🚧 `[P1]` Lumpsum + SIP setup, SIP pause/cancel, SIP calendar
+- [ ] 🚧 `[P1]` Step-Up SIPs (auto-increase % annually)
+- [ ] 🚧 `[P2]` Index/thematic rebalancing baskets with one-click rebalance
+- [ ] 🚧 `[P2]` Robo-Advisory: risk-profile → Efficient Frontier allocation
       (uses Sharpe Ratio module, see §6)
-- [ ] `[P3]` Goal-based investing (retirement, education) with progress tracking
+- [ ] 🚧 `[P3]` Goal-based investing (retirement, education) with progress tracking
 
 ## 5. Fixed Income
 
@@ -132,40 +132,40 @@ onto an internal one later is expensive.
 
 - [ ] 🚧 `[P2]` Black-Scholes pricer + Greeks, exposed via internal gRPC + public API
 - [ ] 🚧 `[P2]` Implied Volatility solver (Newton-Raphson/Brent on market price)
-- [ ] `[P2]` Arbitrage scanner: theoretical vs. live price deviation alerts
-- [ ] `[P2]` Sharpe Ratio / Sortino Ratio / max drawdown per portfolio & per strategy
-- [ ] `[P3]` GARCH(1,1) overnight batch job → "Expected Intraday Range" widget
-- [ ] `[P3]` Correlation matrix engine for pairs-trading candidate discovery
-- [ ] `[P3]` Value-at-Risk (VaR) and stress-testing for margin/risk engine
-- [ ] `[P4]` Volatility surface construction (per-expiry smile/skew) for options desks
+- [ ] 🚧 `[P2]` Arbitrage scanner: theoretical vs. live price deviation alerts
+- [ ] 🚧 `[P2]` Sharpe Ratio / Sortino Ratio / max drawdown per portfolio & per strategy
+- [ ] 🚧 `[P3]` GARCH(1,1) overnight batch job → "Expected Intraday Range" widget
+- [ ] 🚧 `[P3]` Correlation matrix engine for pairs-trading candidate discovery
+- [ ] 🚧 `[P3]` Value-at-Risk (VaR) and stress-testing for margin/risk engine
+- [ ] 🚧 `[P4]` Volatility surface construction (per-expiry smile/skew) for options desks
 
 ## 7. Algorithmic Trading & Backtesting
 
-- [ ] `[P3]` Historical tick data store + backtest runner (Python strategy SDK)
-- [ ] `[P3]` Paper trading mode sharing the exact same OMS code path as live
-- [ ] `[P3]` Strategy deployment pipeline: backtest → paper → live promotion gates
-- [ ] `[P3]` Pairs trading template (z-score mean reversion) as reference strategy
-- [ ] `[P4]` Market-making sandbox: quote/inventory risk API for approved institutional clients
-- [ ] `[P4]` Event-driven NLP trading: filings/earnings ingestion → sentiment → order hook
+- [ ] 🚧 `[P3]` Historical tick data store + backtest runner (Python strategy SDK)
+- [ ] 🚧 `[P3]` Paper trading mode sharing the exact same OMS code path as live
+- [ ] 🚧 `[P3]` Strategy deployment pipeline: backtest → paper → live promotion gates
+- [ ] 🚧 `[P3]` Pairs trading template (z-score mean reversion) as reference strategy
+- [ ] 🚧 `[P4]` Market-making sandbox: quote/inventory risk API for approved institutional clients
+- [ ] 🚧 `[P4]` Event-driven NLP trading: filings/earnings ingestion → sentiment → order hook
       (build with strict kill-switches; this category is the easiest to blow up an account)
-- [ ] `[P4]` Strategy resource limits & circuit breakers (max orders/sec, max notional/day per algo)
+- [ ] 🚧 `[P4]` Strategy resource limits & circuit breakers (max orders/sec, max notional/day per algo)
 
 ## 8. Market Data Pipeline
 
-- [ ] `[P1]` Exchange feed ingestion (simulated/sandbox feed for Phase 0–1)
+- [ ] 🚧 `[P1]` Exchange feed ingestion (simulated/sandbox feed for Phase 0–1)
 - [ ] 🚧 `[P1]` OHLCV candle aggregation (1m/5m/15m/1D) + historical bar storage
-- [ ] `[P1]` WebSocket broadcast for L1 quotes to web/mobile clients
+- [ ] 🚧 `[P1]` WebSocket broadcast for L1 quotes to web/mobile clients
 - [ ] 🚧 `[P2]` L2 market depth (DOM) broadcast with delta compression
-- [ ] `[P2]` Client-side reconnect/resync protocol (sequence numbers, snapshot+delta)
-- [ ] `[P3]` Tick-level storage in a columnar time-series store for replay/backtest
-- [ ] `[P4]` UDP multicast fan-out for co-located institutional consumers
+- [ ] 🚧 `[P2]` Client-side reconnect/resync protocol (sequence numbers, snapshot+delta)
+- [ ] 🚧 `[P3]` Tick-level storage in a columnar time-series store for replay/backtest
+- [ ] 🚧 `[P4]` UDP multicast fan-out for co-located institutional consumers
 
 ## 9. Matching Engine (only once Phase 2+ demands owning the book, e.g. running your own exchange/dark pool — most retail brokers route to an exchange instead of building this)
 
 - [ ] 🚧 `[P4]` Price-time priority Limit Order Book, single-threaded core
-- [ ] `[P4]` Event sourcing + WAL replay for crash recovery
-- [ ] `[P4]` Lock-free ring buffer ingress/egress
-- [ ] `[P4]` Deterministic replay test harness (same input sequence → same book state, always)
+- [ ] 🚧 `[P4]` Event sourcing + WAL replay for crash recovery
+- [ ] 🚧 `[P4]` Lock-free ring buffer ingress/egress
+- [ ] 🚧 `[P4]` Deterministic replay test harness (same input sequence → same book state, always)
 
 ## 10. The Terminal (Pro Desktop)
 
@@ -422,6 +422,7 @@ Mercurius/
 │   ├── quant-engine/        # Python/Rust — Black-Scholes, GARCH, Sharpe, VaR
 │   ├── ledger/              # Go/Postgres — double-entry accounting, settlement
 │   ├── kyc-onboarding/      # Go — identity verification workflows
+│   ├── mutual-funds/        # Go — AMC routing, SIP/lumpsum, step-up SIPs
 │   └── backoffice/          # admin panel API
 ├── apps/
 │   ├── web/                 # Next.js retail app

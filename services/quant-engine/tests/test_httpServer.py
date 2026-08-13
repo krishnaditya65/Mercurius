@@ -154,3 +154,200 @@ def testMalformedJsonBodyReturns400(runningServerBaseUrl):
 def testCorsHeaderIsPresentOnResponses(runningServerBaseUrl):
     with urllib.request.urlopen(f"{runningServerBaseUrl}/health") as response:
         assert response.headers.get("Access-Control-Allow-Origin") == "*"
+
+
+def testRiskStatisticsEndpointMatchesHandWorkedValues(runningServerBaseUrl):
+    # Same hand-worked series as tests/test_riskStatistics.py:
+    # [0.04, -0.02, 0.04, -0.02, 0.04, -0.02], periodicRiskFreeRate=0,
+    # periodsPerYear=252 -> Sharpe ~5.291502622129181,
+    # Sortino ~11.224972160321824, and (from the same series compounded
+    # into an equity curve starting at 1.0) a max drawdown fraction.
+    statusCode, responseBody = postJson(
+        runningServerBaseUrl,
+        "/risk/statistics",
+        {
+            "periodicReturns": [0.04, -0.02, 0.04, -0.02, 0.04, -0.02],
+            "periodicRiskFreeRate": 0.0,
+            "periodsPerYear": 252,
+        },
+    )
+    assert statusCode == 200
+    assert responseBody["annualizedSharpeRatio"] == pytest.approx(5.291502622129181, rel=1e-9)
+    assert responseBody["annualizedSortinoRatio"] == pytest.approx(11.224972160321824, rel=1e-9)
+    assert responseBody["maximumDrawdownFraction"] >= 0.0
+
+
+def testRiskStatisticsEndpointReturns422ForZeroVarianceSeries(runningServerBaseUrl):
+    statusCode, responseBody = postJson(
+        runningServerBaseUrl,
+        "/risk/statistics",
+        {"periodicReturns": [0.01, 0.01, 0.01], "periodicRiskFreeRate": 0.0, "periodsPerYear": 252},
+    )
+    assert statusCode == 422
+    assert "errorMessage" in responseBody
+
+
+def testRiskStatisticsEndpointReturns400ForMissingField(runningServerBaseUrl):
+    statusCode, responseBody = postJson(
+        runningServerBaseUrl, "/risk/statistics", {"periodicReturns": [0.01, 0.02]}
+    )
+    assert statusCode == 400
+    assert "errorMessage" in responseBody
+
+
+def testArbitrageScanEndpointMatchesHandWorkedValues(runningServerBaseUrl):
+    # theoretical=100, live=102, threshold=1% -> absoluteDeviation=2,
+    # percentageDeviation=2%, triggered=True, overpriced=True.
+    statusCode, responseBody = postJson(
+        runningServerBaseUrl,
+        "/arbitrage/scan",
+        {"theoreticalFairPrice": 100.0, "liveMarketPrice": 102.0, "deviationThresholdPercentage": 1.0},
+    )
+    assert statusCode == 200
+    assert responseBody["absoluteDeviation"] == pytest.approx(2.0)
+    assert responseBody["percentageDeviation"] == pytest.approx(2.0)
+    assert responseBody["isAlertTriggered"] is True
+    assert responseBody["isLiveOverpricedRelativeToTheoretical"] is True
+
+
+def testArbitrageScanEndpointReturns422ForNonPositiveTheoreticalPrice(runningServerBaseUrl):
+    statusCode, responseBody = postJson(
+        runningServerBaseUrl,
+        "/arbitrage/scan",
+        {"theoreticalFairPrice": 0.0, "liveMarketPrice": 10.0, "deviationThresholdPercentage": 1.0},
+    )
+    assert statusCode == 422
+    assert "errorMessage" in responseBody
+
+
+def testGarchForecastEndpointReturnsStationaryParametersAndExpectedRange(runningServerBaseUrl):
+    statusCode, responseBody = postJson(
+        runningServerBaseUrl,
+        "/volatility/garch-forecast",
+        {
+            "periodicReturns": [
+                0.01, -0.015, 0.02, -0.01, 0.005, -0.02, 0.015, -0.005, 0.01, -0.01,
+                0.025, -0.02, 0.01, -0.015, 0.02, -0.01, 0.005, -0.025, 0.015, -0.01,
+            ],
+            "currentPrice": 100.0,
+        },
+    )
+    assert statusCode == 200
+    assert responseBody["omega"] > 0
+    assert 0 <= responseBody["alphaArchCoefficient"] < 1
+    assert 0 <= responseBody["betaGarchCoefficient"] < 1
+    assert responseBody["forecastNextPeriodVolatility"] > 0
+    assert responseBody["expectedRangeLowerBound"] < 100.0 < responseBody["expectedRangeUpperBound"]
+
+
+def testGarchForecastEndpointReturns422ForTooFewReturns(runningServerBaseUrl):
+    statusCode, responseBody = postJson(
+        runningServerBaseUrl, "/volatility/garch-forecast", {"periodicReturns": [0.01, 0.02], "currentPrice": 100.0}
+    )
+    assert statusCode == 422
+    assert "errorMessage" in responseBody
+
+
+def testCorrelationMatrixEndpointMatchesHandWorkedValue(runningServerBaseUrl):
+    # Same x/y hand-worked case as test_correlationMatrixEngine.py:
+    # x=[1,2,3,4], y=[1,3,2,5] -> r = 0.8315218406202999
+    statusCode, responseBody = postJson(
+        runningServerBaseUrl,
+        "/correlation/matrix",
+        {
+            "returnSeriesBySymbol": {"X": [1, 2, 3, 4], "Y": [1, 3, 2, 5]},
+            "minimumAbsoluteCorrelationThreshold": 0.5,
+        },
+    )
+    assert statusCode == 200
+    assert len(responseBody["correlationBySymbolPair"]) == 1
+    pairEntry = responseBody["correlationBySymbolPair"][0]
+    assert pairEntry["correlationCoefficient"] == pytest.approx(0.8315218406202999, rel=1e-9)
+    assert len(responseBody["candidatePairs"]) == 1
+
+
+def testCorrelationMatrixEndpointReturns422ForSingleSymbol(runningServerBaseUrl):
+    statusCode, responseBody = postJson(
+        runningServerBaseUrl, "/correlation/matrix", {"returnSeriesBySymbol": {"X": [1, 2, 3]}}
+    )
+    assert statusCode == 422
+    assert "errorMessage" in responseBody
+
+
+def testValueAtRiskEndpointMatchesHandWorkedValues(runningServerBaseUrl):
+    # Same hand-worked series as test_valueAtRiskCalculator.py's
+    # historical-VaR case: 90% confidence -> 0.03.
+    statusCode, responseBody = postJson(
+        runningServerBaseUrl,
+        "/risk/value-at-risk",
+        {
+            "periodicReturns": [-0.05, -0.03, -0.02, -0.01, 0.0, 0.01, 0.02, 0.03, 0.04, 0.05],
+            "confidenceLevel": 0.90,
+        },
+    )
+    assert statusCode == 200
+    assert responseBody["historicalValueAtRisk"] == pytest.approx(0.03, rel=1e-9)
+    assert responseBody["parametricValueAtRisk"] > 0
+
+
+def testValueAtRiskEndpointReturns422OnZeroVarianceSeries(runningServerBaseUrl):
+    statusCode, responseBody = postJson(
+        runningServerBaseUrl, "/risk/value-at-risk", {"periodicReturns": [0.01, 0.01, 0.01], "confidenceLevel": 0.95}
+    )
+    assert statusCode == 422
+    assert "errorMessage" in responseBody
+
+
+def testMarketMakingQuoteThenSimulateFillThenInventoryRoundTrips(runningServerBaseUrl):
+    quoteStatus, quoteResponse = postJson(
+        runningServerBaseUrl,
+        "/market-making/quote",
+        {
+            "symbol": "AAPL",
+            "maximumAbsoluteInventory": 100.0,
+            "bidPrice": 99.0,
+            "bidQuantity": 50.0,
+            "askPrice": 101.0,
+            "askQuantity": 50.0,
+        },
+    )
+    assert quoteStatus == 200
+    assert quoteResponse["inventoryPosition"] == 0.0
+
+    fillStatus, fillResponse = postJson(
+        runningServerBaseUrl,
+        "/market-making/simulate-fill",
+        {"symbol": "AAPL", "takerSide": "BID", "quantity": 20.0},
+    )
+    assert fillStatus == 200
+    assert fillResponse["filledQuantity"] == 20.0
+    assert fillResponse["inventoryPosition"] == 20.0
+
+    inventoryStatus, inventoryResponse = postJson(
+        runningServerBaseUrl, "/market-making/inventory", {"symbol": "AAPL"}
+    )
+    assert inventoryStatus == 200
+    assert inventoryResponse["inventoryPosition"] == 20.0
+
+
+def testMarketMakingQuoteRejectsWhenFillWouldExceedInventoryLimit(runningServerBaseUrl):
+    statusCode, responseBody = postJson(
+        runningServerBaseUrl,
+        "/market-making/quote",
+        {
+            "symbol": "TSLA",
+            "maximumAbsoluteInventory": 50.0,
+            "bidPrice": 99.0,
+            "bidQuantity": 100.0,
+            "askPrice": 101.0,
+            "askQuantity": 10.0,
+        },
+    )
+    assert statusCode == 422
+    assert "errorMessage" in responseBody
+
+
+def testMarketMakingInventoryReturns404ForUnknownSymbol(runningServerBaseUrl):
+    statusCode, responseBody = postJson(runningServerBaseUrl, "/market-making/inventory", {"symbol": "NOPE"})
+    assert statusCode == 404
+    assert "errorMessage" in responseBody

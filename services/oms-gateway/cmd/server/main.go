@@ -11,26 +11,36 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"log/slog"
 	"net/http"
 	"os"
 	"strconv"
+	"time"
 
+	"mercurius/omsgateway/internal/algolimits"
 	"mercurius/omsgateway/internal/amoqueue"
 	"mercurius/omsgateway/internal/audittrail"
 	"mercurius/omsgateway/internal/backofficeclient"
 	"mercurius/omsgateway/internal/chargescalculator"
+	"mercurius/omsgateway/internal/dmagateway"
 	"mercurius/omsgateway/internal/httplogging"
 	"mercurius/omsgateway/internal/idempotency"
 	"mercurius/omsgateway/internal/kycclient"
 	"mercurius/omsgateway/internal/ledgerclient"
+	"mercurius/omsgateway/internal/marginengine"
+	"mercurius/omsgateway/internal/marginfunding"
+	"mercurius/omsgateway/internal/marginpledge"
 	"mercurius/omsgateway/internal/marketsession"
 	"mercurius/omsgateway/internal/matchingengineclient"
 	"mercurius/omsgateway/internal/metrics"
+	"mercurius/omsgateway/internal/optionschain"
 	"mercurius/omsgateway/internal/orders"
+	"mercurius/omsgateway/internal/papertrading"
 	"mercurius/omsgateway/internal/positions"
+	"mercurius/omsgateway/internal/quantengineclient"
 	"mercurius/omsgateway/internal/riskengine"
 	"mercurius/omsgateway/internal/sequencing"
 )
@@ -62,7 +72,30 @@ func main() {
 	}
 	backofficeClient := backofficeclient.NewBackofficeClient(backofficeBaseUrl)
 
+	quantEngineBaseUrl := os.Getenv("QUANT_ENGINE_BASE_URL")
+	if quantEngineBaseUrl == "" {
+		quantEngineBaseUrl = "http://127.0.0.1:8085"
+	}
+	quantEngineClient := quantengineclient.NewQuantEngineClient(quantEngineBaseUrl)
+
 	positionBook := positions.NewPositionBook()
+	// paperPositionBook is FEATURES.md §7's paper trading mode: a
+	// COMPLETELY SEPARATE positions.PositionBook instance (same type,
+	// distinct state) so simulated paper fills can never contaminate real
+	// holdings — see internal/papertrading's package doc and
+	// processOrderSubmission's paper-trading branch below.
+	paperPositionBook := positions.NewPositionBook()
+	pledgeBook := marginpledge.NewPledgeBook()
+	fundingBook := marginfunding.NewFundingBook()
+	// algoLimitsRegistry: FEATURES.md §7 strategy resource limits &
+	// circuit breakers. The default config (used by any strategyId that
+	// never gets an explicit override via POST /algo-limits/configure)
+	// is deliberately unlimited (0/0) — algolimits only constrains an
+	// order that actually opts into a strategyId AND that strategy has
+	// been configured with real limits, so this is fully backward
+	// compatible with every pre-existing client that never sets
+	// strategyIdentifier at all.
+	algoLimitsRegistry := algolimits.NewRegistry(algolimits.StrategyLimitConfig{})
 	idempotencyStore := idempotency.NewIdempotencyStore()
 	marketSession := marketsession.NewMarketSessionState()
 	afterMarketOrderQueue := amoqueue.NewAfterMarketOrderQueue()
@@ -89,12 +122,16 @@ func main() {
 		backofficeClient:              backofficeClient,
 		positionBook:                  positionBook,
 		auditTrail:                    auditTrail,
+		pledgeBook:                    pledgeBook,
+		paperPositionBook:             paperPositionBook,
+		algoLimitsRegistry:            algoLimitsRegistry,
 	}
 
 	httpRequestMultiplexer := http.NewServeMux()
 	httpRequestMultiplexer.HandleFunc("/health", healthCheckHandler)
 	httpRequestMultiplexer.HandleFunc("/orders/submit", buildSubmitOrderHandler(orderSubmissionDeps, idempotencyStore, marketSession, afterMarketOrderQueue))
 	httpRequestMultiplexer.HandleFunc("/positions", buildPositionsHandler(positionBook))
+	httpRequestMultiplexer.HandleFunc("/paper-positions", buildPositionsHandler(paperPositionBook))
 	httpRequestMultiplexer.HandleFunc("/orders/cancel", buildCancelOrderHandler(matchingEngineClient, auditTrail))
 	httpRequestMultiplexer.HandleFunc("/orders/cover-submit", buildCoverOrderHandler(orderSubmissionDeps))
 	httpRequestMultiplexer.HandleFunc("/orders/status", buildOrderStatusHandler(matchingEngineClient))
@@ -104,15 +141,46 @@ func main() {
 	httpRequestMultiplexer.HandleFunc("/audit-trail", buildAuditTrailHandler(auditTrail))
 	httpRequestMultiplexer.HandleFunc("/orders/estimate-charges", buildEstimateChargesHandler())
 	httpRequestMultiplexer.HandleFunc("/metrics", metrics.BuildMetricsHandler(metricsRegistry))
+	httpRequestMultiplexer.HandleFunc("/margin-pledge/pledge", buildPledgeHoldingHandler(pledgeBook, positionBook, preTradeRiskEngine))
+	httpRequestMultiplexer.HandleFunc("/margin-pledge/unpledge", buildUnpledgeHoldingHandler(pledgeBook, preTradeRiskEngine))
+	httpRequestMultiplexer.HandleFunc("/margin-pledge/set-utilized-margin", buildSetUtilizedMarginHandler(pledgeBook))
+	httpRequestMultiplexer.HandleFunc("/margin-pledge/holdings", buildPledgesForAccountHandler(pledgeBook))
+	httpRequestMultiplexer.HandleFunc("/margin/calculate-span-exposure", buildCalculateSpanExposureMarginHandler())
+	httpRequestMultiplexer.HandleFunc("/margin-funding/request", buildMarginFundingRequestHandler(fundingBook, pledgeBook, ledgerClient, preTradeRiskEngine))
+	httpRequestMultiplexer.HandleFunc("/margin-funding", buildMarginFundingStatusHandler(fundingBook, pledgeBook))
+	httpRequestMultiplexer.HandleFunc("/options/chain", buildOptionsChainHandler(quantEngineClient))
+	httpRequestMultiplexer.HandleFunc("/algo-limits/configure", buildConfigureAlgoLimitsHandler(algoLimitsRegistry))
+	httpRequestMultiplexer.HandleFunc("/algo-limits", buildAlgoLimitsStatusHandler(algoLimitsRegistry))
+
+	// FEATURES.md §3 DMA/FIX gateway (internal/dmagateway) — LOUD WARNING:
+	// NOT FIX-protocol-certified, see that package's doc comment for the
+	// full disclaimer. Reuses processOrderSubmission via this closure so
+	// an order accepted over the TCP session runs through the exact same
+	// risk-check/audit-trail/matching-engine pipeline as HTTP
+	// /orders/submit.
+	dmaOrderSubmitFunc := func(request orders.OrderSubmissionRequest) orders.OrderAcknowledgementResponse {
+		return processOrderSubmission(orderSubmissionDeps, request)
+	}
+	dmaListenAddress := os.Getenv("DMA_GATEWAY_LISTEN_ADDRESS")
+	if dmaListenAddress == "" {
+		dmaListenAddress = ":8088"
+	}
+	dmaServer := dmagateway.NewServer(dmaListenAddress, dmaOrderSubmitFunc)
+	go func() {
+		if dmaServerError := dmaServer.ListenAndServe(); dmaServerError != nil {
+			log.Printf("DMA/FIX-inspired gateway failed to start on %s: %v", dmaListenAddress, dmaServerError)
+		}
+	}()
 
 	listenAddress := ":8081"
 	log.Printf(
-		"oms-gateway listening on %s (CORS wide open — see withPermissiveCorsForDevelopment) — matching-engine at %s, ledger at %s, kyc-onboarding at %s, backoffice at %s\n",
+		"oms-gateway listening on %s (CORS wide open — see withPermissiveCorsForDevelopment) — matching-engine at %s, ledger at %s, kyc-onboarding at %s, backoffice at %s, quant-engine at %s\n",
 		listenAddress,
 		matchingEngineTcpAddress,
 		ledgerBaseUrl,
 		kycOnboardingBaseUrl,
 		backofficeBaseUrl,
+		quantEngineBaseUrl,
 	)
 	instrumentedHandler := metrics.WithRequestTiming(metricsRegistry, httplogging.WithRequestLogging(httpRequestMultiplexer))
 	if serverStartupError := http.ListenAndServe(listenAddress, withPermissiveCorsForDevelopment(instrumentedHandler)); serverStartupError != nil {
@@ -183,6 +251,13 @@ type orderSubmissionDependencies struct {
 	backofficeClient              *backofficeclient.BackofficeClient
 	positionBook                  *positions.PositionBook
 	auditTrail                    *audittrail.AuditTrail
+	pledgeBook                    *marginpledge.PledgeBook
+	// paperPositionBook: FEATURES.md §7 paper trading — see main()'s
+	// construction comment.
+	paperPositionBook *positions.PositionBook
+	// algoLimitsRegistry: FEATURES.md §7 strategy resource limits — see
+	// main()'s construction comment.
+	algoLimitsRegistry *algolimits.Registry
 }
 
 func buildSubmitOrderHandler(
@@ -201,6 +276,26 @@ func buildSubmitOrderHandler(
 		if decodeError := json.NewDecoder(request.Body).Decode(&incomingOrderSubmissionRequest); decodeError != nil {
 			http.Error(responseWriter, "malformed order submission payload", http.StatusBadRequest)
 			return
+		}
+
+		// FEATURES.md §3 Iceberg/FOK/IOC: validated and accepted here — see
+		// orders.ValidateOrderExecutionType's doc comment for the honest
+		// boundary on what's NOT enforced (true fill semantics need
+		// matching-engine support this build doesn't have).
+		if executionTypeError := orders.ValidateOrderExecutionType(incomingOrderSubmissionRequest); executionTypeError != nil {
+			http.Error(responseWriter, executionTypeError.Error(), http.StatusBadRequest)
+			return
+		}
+		if incomingOrderSubmissionRequest.OrderExecutionType == orders.OrderExecutionTypeIceberg ||
+			incomingOrderSubmissionRequest.OrderExecutionType == orders.OrderExecutionTypeFillOrKill ||
+			incomingOrderSubmissionRequest.OrderExecutionType == orders.OrderExecutionTypeImmediateOrCancel {
+			log.Printf(
+				"order accepted with orderExecutionType=%s for %s on %s -- NOTE: matching-engine does not yet implement true %s fill semantics, this order will match using ordinary continuous-matching rules like any Limit/Market order (see orders.ValidateOrderExecutionType doc comment)",
+				incomingOrderSubmissionRequest.OrderExecutionType,
+				incomingOrderSubmissionRequest.ClientAccountIdentifier,
+				incomingOrderSubmissionRequest.InstrumentSymbol,
+				incomingOrderSubmissionRequest.OrderExecutionType,
+			)
 		}
 
 		// FEATURES.md §3 AMO: an after-market order arriving while the
@@ -268,6 +363,42 @@ func processOrderSubmission(
 	dependencies orderSubmissionDependencies,
 	incomingOrderSubmissionRequest orders.OrderSubmissionRequest,
 ) orders.OrderAcknowledgementResponse {
+	// FEATURES.md §7 strategy resource limits & circuit breakers —
+	// checked FIRST, before even KYC: an order tagged with a
+	// strategyIdentifier that trips its configured max-orders/sec or
+	// max-notional/day limit is rejected before touching KYC/freeze/
+	// pledge/risk/matching-engine at all. An order with no
+	// strategyIdentifier at all skips this entirely (see
+	// internal/algolimits' package doc — unconfigured/untagged orders
+	// are never limited). Uses real wall-clock time.Now() here (the only
+	// place in this codebase that's appropriate — internal/algolimits
+	// itself takes `now` as an explicit parameter everywhere so its OWN
+	// tests never depend on the wall clock).
+	if incomingOrderSubmissionRequest.StrategyIdentifier != "" {
+		orderNotionalForLimitCheck := incomingOrderSubmissionRequest.LimitPriceInMinorUnits * int64(incomingOrderSubmissionRequest.OrderQuantity)
+		if limitError := dependencies.algoLimitsRegistry.CheckAndReserve(
+			incomingOrderSubmissionRequest.StrategyIdentifier,
+			orderNotionalForLimitCheck,
+			time.Now(),
+		); limitError != nil {
+			machineReadableReason := "STRATEGY_RATE_LIMIT_EXCEEDED"
+			if errors.Is(limitError, algolimits.ErrDailyNotionalLimitExceeded) {
+				machineReadableReason = "STRATEGY_DAILY_NOTIONAL_LIMIT_EXCEEDED"
+			}
+			dependencies.auditTrail.Append(audittrail.Entry{
+				EventType:               audittrail.EventStrategyLimitRejected,
+				ClientAccountIdentifier: incomingOrderSubmissionRequest.ClientAccountIdentifier,
+				InstrumentSymbol:        incomingOrderSubmissionRequest.InstrumentSymbol,
+				DetailMessage:           fmt.Sprintf("strategyId=%s: %v", incomingOrderSubmissionRequest.StrategyIdentifier, limitError),
+			})
+			return orders.OrderAcknowledgementResponse{
+				WasOrderAccepted:               false,
+				HumanReadableRejectionReason:   fmt.Sprintf("This order was blocked by strategy %q's own resource limits: %v", incomingOrderSubmissionRequest.StrategyIdentifier, limitError),
+				MachineReadableRejectionReason: machineReadableReason,
+			}
+		}
+	}
+
 	// KYC gate comes before the risk check — an unonboarded account
 	// shouldn't even have its margin evaluated, per FEATURES.md §1.
 	//
@@ -319,6 +450,39 @@ func processOrderSubmission(
 		}
 	}
 
+	// Pledged-holding gate — FEATURES.md §3 margin pledge system: a
+	// SELL order can never draw down more of an instrument than the
+	// account's UNPLEDGED holding covers. Only checked on the sell
+	// side (buying never touches pledged collateral) and only for
+	// instruments with a non-zero pledged quantity, so this is a no-op
+	// for every order that isn't selling something currently pledged.
+	if !incomingOrderSubmissionRequest.OrderSideIsBuyNotSell {
+		pledgedQuantity := dependencies.pledgeBook.PledgedQuantity(
+			incomingOrderSubmissionRequest.ClientAccountIdentifier,
+			incomingOrderSubmissionRequest.InstrumentSymbol,
+		)
+		if pledgedQuantity > 0 {
+			netHoldingQuantity := dependencies.positionBook.PositionsForAccount(incomingOrderSubmissionRequest.ClientAccountIdentifier)[incomingOrderSubmissionRequest.InstrumentSymbol]
+			unpledgedQuantity := netHoldingQuantity - int64(pledgedQuantity)
+			if unpledgedQuantity < 0 || incomingOrderSubmissionRequest.OrderQuantity > uint64(unpledgedQuantity) {
+				dependencies.auditTrail.Append(audittrail.Entry{
+					EventType:               audittrail.EventOrderRejected,
+					ClientAccountIdentifier: incomingOrderSubmissionRequest.ClientAccountIdentifier,
+					InstrumentSymbol:        incomingOrderSubmissionRequest.InstrumentSymbol,
+					DetailMessage:           "PLEDGED_QUANTITY_UNAVAILABLE",
+				})
+				return orders.OrderAcknowledgementResponse{
+					WasOrderAccepted: false,
+					HumanReadableRejectionReason: fmt.Sprintf(
+						"This sell order needs %d shares, but %d of your %d %s shares are currently pledged as collateral and unavailable to sell. Unpledge them first via POST /margin-pledge/unpledge.",
+						incomingOrderSubmissionRequest.OrderQuantity, pledgedQuantity, netHoldingQuantity, incomingOrderSubmissionRequest.InstrumentSymbol,
+					),
+					MachineReadableRejectionReason: "PLEDGED_QUANTITY_UNAVAILABLE",
+				}
+			}
+		}
+	}
+
 	// KNOWN GAP, not yet fixed: for a market order OR a
 	// StopLossMarket order, LimitPriceInMinorUnits is 0 (ignored by
 	// the matching engine), so this notional is always 0 and the
@@ -363,6 +527,58 @@ func processOrderSubmission(
 	acknowledgement := orders.OrderAcknowledgementResponse{
 		WasOrderAccepted:             true,
 		AssignedGlobalSequenceNumber: assignedGlobalSequenceNumber,
+		IsPaperTradingOrder:          incomingOrderSubmissionRequest.IsPaperTradingOrder,
+	}
+
+	// FEATURES.md §7 paper trading mode: everything ABOVE this point —
+	// KYC, freeze, pledged-holding, and pre-trade risk gates, plus
+	// sequence assignment and the ORDER_SUBMITTED audit entry — is
+	// IDENTICAL for a paper order and a live one. Only the final
+	// hand-off differs: a paper order never reaches the real
+	// matching-engine and never posts a real settlement to ledger. Its
+	// simulated fill (internal/papertrading) updates paperPositionBook
+	// — a completely separate positions.PositionBook instance — instead
+	// of the real one, so paper P&L can never contaminate real holdings.
+	if incomingOrderSubmissionRequest.IsPaperTradingOrder {
+		simulatedFill, simulationError := papertrading.SimulateFill(incomingOrderSubmissionRequest)
+		if simulationError != nil {
+			acknowledgement.PaperOrderSimulationError = simulationError.Error()
+			dependencies.auditTrail.Append(audittrail.Entry{
+				EventType:               audittrail.EventPaperOrderSimulationFailed,
+				ClientAccountIdentifier: incomingOrderSubmissionRequest.ClientAccountIdentifier,
+				InstrumentSymbol:        incomingOrderSubmissionRequest.InstrumentSymbol,
+				DetailMessage:           simulationError.Error(),
+			})
+			return acknowledgement
+		}
+
+		buyingAccountId, sellingAccountId := incomingOrderSubmissionRequest.ClientAccountIdentifier, papertrading.SyntheticCounterpartyAccountIdentifier
+		if !incomingOrderSubmissionRequest.OrderSideIsBuyNotSell {
+			buyingAccountId, sellingAccountId = sellingAccountId, buyingAccountId
+		}
+
+		dependencies.paperPositionBook.ApplyFill(
+			buyingAccountId,
+			sellingAccountId,
+			incomingOrderSubmissionRequest.InstrumentSymbol,
+			simulatedFill.ExecutedQuantity,
+		)
+		acknowledgement.TradeExecutionEvents = append(acknowledgement.TradeExecutionEvents, orders.TradeExecutionSummary{
+			BuyingClientAccountId:     buyingAccountId,
+			SellingClientAccountId:    sellingAccountId,
+			ExecutedPriceInMinorUnits: simulatedFill.ExecutedPriceInMinorUnits,
+			ExecutedQuantity:          simulatedFill.ExecutedQuantity,
+		})
+		dependencies.auditTrail.Append(audittrail.Entry{
+			EventType:               audittrail.EventPaperOrderFilled,
+			ClientAccountIdentifier: incomingOrderSubmissionRequest.ClientAccountIdentifier,
+			InstrumentSymbol:        incomingOrderSubmissionRequest.InstrumentSymbol,
+			DetailMessage: fmt.Sprintf(
+				"SIMULATED fill %d @ %d (NOT a real matching-engine trade, NOT settled to ledger)",
+				simulatedFill.ExecutedQuantity, simulatedFill.ExecutedPriceInMinorUnits,
+			),
+		})
+		return acknowledgement
 	}
 
 	matchingEngineResponse, handoffError := dependencies.matchingEngineClient.SubmitOrderAndAwaitMatchResult(
@@ -846,5 +1062,443 @@ func buildEstimateChargesHandler() http.HandlerFunc {
 			wireRequest.IsIntradayNotDelivery,
 		)
 		respondWithJson(responseWriter, http.StatusOK, breakdown)
+	}
+}
+
+// pledgeHoldingWireRequest is the client-facing payload for
+// POST /margin-pledge/pledge. currentNetHoldingQuantity is deliberately
+// NOT taken from the client — it's looked up server-side from
+// positionBook, so a client can't lie about how much it actually holds.
+type pledgeHoldingWireRequest struct {
+	ClientAccountIdentifier    string `json:"clientAccountIdentifier"`
+	InstrumentSymbol           string `json:"instrumentSymbol"`
+	Quantity                   uint64 `json:"quantity"`
+	ReferencePriceInMinorUnits int64  `json:"referencePriceInMinorUnits"`
+}
+
+type pledgeHoldingWireResponse struct {
+	WasPledgeAccepted                      bool                       `json:"wasPledgeAccepted"`
+	ErrorMessage                           string                     `json:"errorMessage,omitempty"`
+	PledgeRecord                           *marginpledge.PledgeRecord `json:"pledgeRecord,omitempty"`
+	MarginValueContributedInMinorUnits     int64                      `json:"marginValueContributedInMinorUnits,omitempty"`
+	AvailableMarginAfterPledgeInMinorUnits int64                      `json:"availableMarginAfterPledgeInMinorUnits,omitempty"`
+}
+
+// buildPledgeHoldingHandler is FEATURES.md §3's Margin Pledge system:
+// pledging `quantity` of an existing holding as collateral increases the
+// account's available margin (internal/riskengine) by a haircut-adjusted
+// value and marks that quantity unavailable to sell (enforced in
+// processOrderSubmission's pledged-holding gate) until it's unpledged.
+//
+// KNOWN GAP, loudly documented in internal/marginpledge's package doc:
+// referencePriceInMinorUnits is caller-supplied, not looked up from any
+// live price feed — oms-gateway has none yet. Every resulting margin
+// figure is illustrative, not authoritative — same caveat as
+// internal/chargescalculator and internal/marginengine.
+func buildPledgeHoldingHandler(
+	pledgeBook *marginpledge.PledgeBook,
+	positionBook *positions.PositionBook,
+	preTradeRiskEngine *riskengine.PreTradeRiskEngine,
+) http.HandlerFunc {
+	return func(responseWriter http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodPost {
+			http.Error(responseWriter, "only POST is supported", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var wireRequest pledgeHoldingWireRequest
+		if decodeError := json.NewDecoder(request.Body).Decode(&wireRequest); decodeError != nil {
+			http.Error(responseWriter, "malformed pledge request", http.StatusBadRequest)
+			return
+		}
+
+		currentNetHoldingQuantity := positionBook.PositionsForAccount(wireRequest.ClientAccountIdentifier)[wireRequest.InstrumentSymbol]
+
+		record, marginValueContributed, pledgeError := pledgeBook.PledgeHolding(
+			wireRequest.ClientAccountIdentifier,
+			wireRequest.InstrumentSymbol,
+			wireRequest.Quantity,
+			wireRequest.ReferencePriceInMinorUnits,
+			currentNetHoldingQuantity,
+		)
+		if pledgeError != nil {
+			respondWithJson(responseWriter, http.StatusOK, pledgeHoldingWireResponse{
+				WasPledgeAccepted: false,
+				ErrorMessage:      pledgeError.Error(),
+			})
+			return
+		}
+
+		preTradeRiskEngine.AdjustAvailableMarginInMinorUnits(wireRequest.ClientAccountIdentifier, marginValueContributed)
+		availableMarginAfterPledge, _ := preTradeRiskEngine.AvailableMarginInMinorUnits(wireRequest.ClientAccountIdentifier)
+
+		respondWithJson(responseWriter, http.StatusOK, pledgeHoldingWireResponse{
+			WasPledgeAccepted:                      true,
+			PledgeRecord:                           &record,
+			MarginValueContributedInMinorUnits:     marginValueContributed,
+			AvailableMarginAfterPledgeInMinorUnits: availableMarginAfterPledge,
+		})
+	}
+}
+
+// unpledgeHoldingWireRequest is the client-facing payload for
+// POST /margin-pledge/unpledge.
+type unpledgeHoldingWireRequest struct {
+	ClientAccountIdentifier string `json:"clientAccountIdentifier"`
+	InstrumentSymbol        string `json:"instrumentSymbol"`
+	Quantity                uint64 `json:"quantity"`
+}
+
+type unpledgeHoldingWireResponse struct {
+	WasUnpledgeAccepted                      bool   `json:"wasUnpledgeAccepted"`
+	ErrorMessage                             string `json:"errorMessage,omitempty"`
+	MarginValueReleasedInMinorUnits          int64  `json:"marginValueReleasedInMinorUnits,omitempty"`
+	AvailableMarginAfterUnpledgeInMinorUnits int64  `json:"availableMarginAfterUnpledgeInMinorUnits,omitempty"`
+}
+
+// buildUnpledgeHoldingHandler releases pledged collateral, refused (real
+// state-machine check, see marginpledge.ErrPledgeStillBackingOpenMarginPosition)
+// if doing so would drop the account's pledged collateral below its
+// currently utilized margin — see POST /margin-pledge/set-utilized-margin
+// to set that figure (a real, documented simplification: oms-gateway has
+// no structured open-F&O-position book yet to derive it from
+// automatically, see marginpledge.PledgeBook's doc comment).
+func buildUnpledgeHoldingHandler(
+	pledgeBook *marginpledge.PledgeBook,
+	preTradeRiskEngine *riskengine.PreTradeRiskEngine,
+) http.HandlerFunc {
+	return func(responseWriter http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodPost {
+			http.Error(responseWriter, "only POST is supported", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var wireRequest unpledgeHoldingWireRequest
+		if decodeError := json.NewDecoder(request.Body).Decode(&wireRequest); decodeError != nil {
+			http.Error(responseWriter, "malformed unpledge request", http.StatusBadRequest)
+			return
+		}
+
+		marginValueReleased, unpledgeError := pledgeBook.UnpledgeHolding(
+			wireRequest.ClientAccountIdentifier,
+			wireRequest.InstrumentSymbol,
+			wireRequest.Quantity,
+		)
+		if unpledgeError != nil {
+			respondWithJson(responseWriter, http.StatusOK, unpledgeHoldingWireResponse{
+				WasUnpledgeAccepted: false,
+				ErrorMessage:        unpledgeError.Error(),
+			})
+			return
+		}
+
+		preTradeRiskEngine.AdjustAvailableMarginInMinorUnits(wireRequest.ClientAccountIdentifier, -marginValueReleased)
+		availableMarginAfterUnpledge, _ := preTradeRiskEngine.AvailableMarginInMinorUnits(wireRequest.ClientAccountIdentifier)
+
+		respondWithJson(responseWriter, http.StatusOK, unpledgeHoldingWireResponse{
+			WasUnpledgeAccepted:                      true,
+			MarginValueReleasedInMinorUnits:          marginValueReleased,
+			AvailableMarginAfterUnpledgeInMinorUnits: availableMarginAfterUnpledge,
+		})
+	}
+}
+
+// setUtilizedMarginWireRequest is the payload for
+// POST /margin-pledge/set-utilized-margin — see buildUnpledgeHoldingHandler's
+// doc comment for why this is an explicit, documented stand-in rather
+// than something derived automatically.
+type setUtilizedMarginWireRequest struct {
+	ClientAccountIdentifier    string `json:"clientAccountIdentifier"`
+	UtilizedMarginInMinorUnits int64  `json:"utilizedMarginInMinorUnits"`
+}
+
+func buildSetUtilizedMarginHandler(pledgeBook *marginpledge.PledgeBook) http.HandlerFunc {
+	return func(responseWriter http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodPost {
+			http.Error(responseWriter, "only POST is supported", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var wireRequest setUtilizedMarginWireRequest
+		if decodeError := json.NewDecoder(request.Body).Decode(&wireRequest); decodeError != nil {
+			http.Error(responseWriter, "malformed set-utilized-margin request", http.StatusBadRequest)
+			return
+		}
+
+		pledgeBook.SetUtilizedMarginInMinorUnits(wireRequest.ClientAccountIdentifier, wireRequest.UtilizedMarginInMinorUnits)
+		respondWithJson(responseWriter, http.StatusOK, map[string]any{
+			"clientAccountIdentifier":    wireRequest.ClientAccountIdentifier,
+			"utilizedMarginInMinorUnits": wireRequest.UtilizedMarginInMinorUnits,
+		})
+	}
+}
+
+// buildPledgesForAccountHandler is a read-only lookup of an account's
+// currently pledged holdings — GET /margin-pledge/holdings?accountId=...
+func buildPledgesForAccountHandler(pledgeBook *marginpledge.PledgeBook) http.HandlerFunc {
+	return func(responseWriter http.ResponseWriter, request *http.Request) {
+		accountIdentifier := request.URL.Query().Get("accountId")
+		if accountIdentifier == "" {
+			http.Error(responseWriter, "missing accountId query parameter", http.StatusBadRequest)
+			return
+		}
+		respondWithJson(responseWriter, http.StatusOK, map[string]any{
+			"accountIdentifier":         accountIdentifier,
+			"pledgesByInstrumentSymbol": pledgeBook.PledgesForAccount(accountIdentifier),
+		})
+	}
+}
+
+// calculateSpanExposureMarginWireRequest is the payload for
+// POST /margin/calculate-span-exposure — FEATURES.md §3's SPAN +
+// exposure margin calculator for F&O. See internal/marginengine's
+// package doc for the loud "illustrative, not exchange-certified"
+// warning that applies to every number this endpoint returns.
+type calculateSpanExposureMarginWireRequest struct {
+	ContractNotionalValueInMinorUnits int64 `json:"contractNotionalValueInMinorUnits"`
+}
+
+func buildCalculateSpanExposureMarginHandler() http.HandlerFunc {
+	return func(responseWriter http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodPost {
+			http.Error(responseWriter, "only POST is supported", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var wireRequest calculateSpanExposureMarginWireRequest
+		if decodeError := json.NewDecoder(request.Body).Decode(&wireRequest); decodeError != nil {
+			http.Error(responseWriter, "malformed margin-calculation request", http.StatusBadRequest)
+			return
+		}
+
+		requirement, calculationError := marginengine.CalculateSpanAndExposureMargin(wireRequest.ContractNotionalValueInMinorUnits)
+		if calculationError != nil {
+			http.Error(responseWriter, calculationError.Error(), http.StatusBadRequest)
+			return
+		}
+		respondWithJson(responseWriter, http.StatusOK, requirement)
+	}
+}
+
+// marginFundingRequestWireRequest is the payload for
+// POST /margin-funding/request.
+type marginFundingRequestWireRequest struct {
+	ClientAccountIdentifier     string `json:"clientAccountIdentifier"`
+	RequestedAmountInMinorUnits int64  `json:"requestedAmountInMinorUnits"`
+}
+
+type marginFundingRequestWireResponse struct {
+	WasFundingApproved                           bool   `json:"wasFundingApproved"`
+	ErrorMessage                                 string `json:"errorMessage,omitempty"`
+	DisbursedAmountInMinorUnits                  int64  `json:"disbursedAmountInMinorUnits,omitempty"`
+	OutstandingPrincipalInMinorUnits             int64  `json:"outstandingPrincipalInMinorUnits,omitempty"`
+	AvailableMarginAfterDisbursementInMinorUnits int64  `json:"availableMarginAfterDisbursementInMinorUnits,omitempty"`
+}
+
+// buildMarginFundingRequestHandler is FEATURES.md §2's "Margin funding /
+// instant margin against pledged collateral": a real CASH ADVANCE, capped
+// at whatever of the account's pledged collateral value
+// (internal/marginpledge) isn't already drawn against
+// (internal/marginfunding). Approval is a two-phase operation: the
+// funding book reserves the principal FIRST (so a concurrent request
+// can't double-spend the same capacity), then the actual cash is
+// disbursed via a real balanced journal entry to `ledger`
+// (internal/ledgerclient) — if that disbursement fails, the reservation
+// is rolled back so the account's funding capacity isn't permanently
+// (and incorrectly) consumed by a cash advance that never happened. See
+// internal/marginfunding's package doc for the full "REAL money
+// movement, illustrative interest" contract.
+func buildMarginFundingRequestHandler(
+	fundingBook *marginfunding.FundingBook,
+	pledgeBook *marginpledge.PledgeBook,
+	ledgerClient *ledgerclient.LedgerClient,
+	preTradeRiskEngine *riskengine.PreTradeRiskEngine,
+) http.HandlerFunc {
+	return func(responseWriter http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodPost {
+			http.Error(responseWriter, "only POST is supported", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var wireRequest marginFundingRequestWireRequest
+		if decodeError := json.NewDecoder(request.Body).Decode(&wireRequest); decodeError != nil {
+			http.Error(responseWriter, "malformed margin-funding request", http.StatusBadRequest)
+			return
+		}
+
+		pledgedMarginValue := pledgeBook.TotalPledgedMarginValueForAccount(wireRequest.ClientAccountIdentifier)
+
+		newOutstanding, requestError := fundingBook.RequestFunding(
+			wireRequest.ClientAccountIdentifier,
+			wireRequest.RequestedAmountInMinorUnits,
+			pledgedMarginValue,
+		)
+		if requestError != nil {
+			respondWithJson(responseWriter, http.StatusOK, marginFundingRequestWireResponse{
+				WasFundingApproved: false,
+				ErrorMessage:       requestError.Error(),
+			})
+			return
+		}
+
+		disbursementError := ledgerClient.PostMarginFundingDisbursementJournalEntry(
+			wireRequest.ClientAccountIdentifier,
+			wireRequest.RequestedAmountInMinorUnits,
+			fmt.Sprintf("margin funding disbursement for %s", wireRequest.ClientAccountIdentifier),
+		)
+		if disbursementError != nil {
+			// The reservation must not outlive a disbursement that never
+			// actually happened — see the handler's doc comment above.
+			log.Printf("MARGIN FUNDING DISBURSEMENT FAILED for %s — rolling back reservation: %v", wireRequest.ClientAccountIdentifier, disbursementError)
+			fundingBook.RollbackReservation(wireRequest.ClientAccountIdentifier, wireRequest.RequestedAmountInMinorUnits)
+			respondWithJson(responseWriter, http.StatusOK, marginFundingRequestWireResponse{
+				WasFundingApproved: false,
+				ErrorMessage:       fmt.Sprintf("margin funding was approved but the cash disbursement to the ledger failed: %v", disbursementError),
+			})
+			return
+		}
+
+		// Real cash landed in the account — reflect it in the local risk
+		// cache immediately, the same pattern settleTradeAgainstLedgerAndLocalCache
+		// uses for a trade fill.
+		preTradeRiskEngine.AdjustAvailableMarginInMinorUnits(wireRequest.ClientAccountIdentifier, wireRequest.RequestedAmountInMinorUnits)
+		availableMarginAfter, _ := preTradeRiskEngine.AvailableMarginInMinorUnits(wireRequest.ClientAccountIdentifier)
+
+		respondWithJson(responseWriter, http.StatusOK, marginFundingRequestWireResponse{
+			WasFundingApproved:                           true,
+			DisbursedAmountInMinorUnits:                  wireRequest.RequestedAmountInMinorUnits,
+			OutstandingPrincipalInMinorUnits:             newOutstanding,
+			AvailableMarginAfterDisbursementInMinorUnits: availableMarginAfter,
+		})
+	}
+}
+
+// buildMarginFundingStatusHandler is the read-only lookup for
+// GET /margin-funding?accountId=... — shows an account's currently
+// outstanding margin-funding principal and remaining unutilized
+// capacity against its currently pledged collateral.
+func buildMarginFundingStatusHandler(
+	fundingBook *marginfunding.FundingBook,
+	pledgeBook *marginpledge.PledgeBook,
+) http.HandlerFunc {
+	return func(responseWriter http.ResponseWriter, request *http.Request) {
+		accountIdentifier := request.URL.Query().Get("accountId")
+		if accountIdentifier == "" {
+			http.Error(responseWriter, "missing accountId query parameter", http.StatusBadRequest)
+			return
+		}
+
+		fundingRecord := fundingBook.FundingRecordForAccount(accountIdentifier)
+		pledgedMarginValue := pledgeBook.TotalPledgedMarginValueForAccount(accountIdentifier)
+		remainingCapacity := pledgedMarginValue - fundingRecord.OutstandingPrincipalInMinorUnits
+		if remainingCapacity < 0 {
+			remainingCapacity = 0
+		}
+
+		respondWithJson(responseWriter, http.StatusOK, map[string]any{
+			"clientAccountIdentifier":              accountIdentifier,
+			"outstandingPrincipalInMinorUnits":     fundingRecord.OutstandingPrincipalInMinorUnits,
+			"totalPledgedMarginValueInMinorUnits":  pledgedMarginValue,
+			"remainingFundingCapacityInMinorUnits": remainingCapacity,
+		})
+	}
+}
+
+// buildOptionsChainHandler is FEATURES.md §3's "Real-time Options Chain"
+// + "Greeks computed live per contract": GET /options/chain?
+// underlyingSpotPrice=&expiryDate=&symbol=. See internal/optionschain's
+// package doc for the full, loud "what's real (Greeks, PCR math) vs.
+// synthetic (OI, Volume, assumed volatility)" contract. If quant-engine
+// is unreachable, this returns a clear 502 error rather than crashing or
+// hanging oms-gateway.
+func buildOptionsChainHandler(quantEngineClient *quantengineclient.QuantEngineClient) http.HandlerFunc {
+	return func(responseWriter http.ResponseWriter, request *http.Request) {
+		underlyingSpotPriceParam := request.URL.Query().Get("underlyingSpotPrice")
+		expiryDateParam := request.URL.Query().Get("expiryDate")
+		symbol := request.URL.Query().Get("symbol")
+		if underlyingSpotPriceParam == "" || expiryDateParam == "" || symbol == "" {
+			http.Error(responseWriter, "missing underlyingSpotPrice, expiryDate, or symbol query parameter", http.StatusBadRequest)
+			return
+		}
+
+		underlyingSpotPrice, parseSpotError := strconv.ParseFloat(underlyingSpotPriceParam, 64)
+		if parseSpotError != nil {
+			http.Error(responseWriter, "underlyingSpotPrice must be a valid number", http.StatusBadRequest)
+			return
+		}
+
+		expiryDate, parseExpiryError := time.Parse("2006-01-02", expiryDateParam)
+		if parseExpiryError != nil {
+			http.Error(responseWriter, "expiryDate must be in YYYY-MM-DD format", http.StatusBadRequest)
+			return
+		}
+
+		chain, chainError := optionschain.GenerateSyntheticOptionsChain(quantEngineClient, symbol, underlyingSpotPrice, expiryDate, time.Now())
+		if chainError != nil {
+			log.Printf("options chain generation failed for %s: %v", symbol, chainError)
+			http.Error(responseWriter, fmt.Sprintf("could not generate options chain (is quant-engine running?): %v", chainError), http.StatusBadGateway)
+			return
+		}
+
+		respondWithJson(responseWriter, http.StatusOK, chain)
+	}
+}
+
+// configureAlgoLimitsWireRequest is the payload for
+// POST /algo-limits/configure — FEATURES.md §7's per-strategy resource
+// limits. maxOrdersPerSecond<=0 disables rate limiting for this
+// strategy; maxNotionalPerDayInMinorUnits<=0 disables the daily notional
+// cap — see internal/algolimits.StrategyLimitConfig's doc comment.
+type configureAlgoLimitsWireRequest struct {
+	StrategyIdentifier            string  `json:"strategyIdentifier"`
+	MaxOrdersPerSecond            float64 `json:"maxOrdersPerSecond"`
+	MaxNotionalPerDayInMinorUnits int64   `json:"maxNotionalPerDayInMinorUnits"`
+}
+
+func buildConfigureAlgoLimitsHandler(algoLimitsRegistry *algolimits.Registry) http.HandlerFunc {
+	return func(responseWriter http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodPost {
+			http.Error(responseWriter, "only POST is supported", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var wireRequest configureAlgoLimitsWireRequest
+		if decodeError := json.NewDecoder(request.Body).Decode(&wireRequest); decodeError != nil {
+			http.Error(responseWriter, "malformed algo-limits configure request", http.StatusBadRequest)
+			return
+		}
+		if wireRequest.StrategyIdentifier == "" {
+			http.Error(responseWriter, "missing strategyIdentifier", http.StatusBadRequest)
+			return
+		}
+
+		algoLimitsRegistry.SetStrategyLimits(wireRequest.StrategyIdentifier, algolimits.StrategyLimitConfig{
+			MaxOrdersPerSecond:            wireRequest.MaxOrdersPerSecond,
+			MaxNotionalPerDayInMinorUnits: wireRequest.MaxNotionalPerDayInMinorUnits,
+		})
+
+		respondWithJson(responseWriter, http.StatusOK, map[string]any{
+			"strategyIdentifier":            wireRequest.StrategyIdentifier,
+			"maxOrdersPerSecond":            wireRequest.MaxOrdersPerSecond,
+			"maxNotionalPerDayInMinorUnits": wireRequest.MaxNotionalPerDayInMinorUnits,
+		})
+	}
+}
+
+// buildAlgoLimitsStatusHandler is a read-only lookup of how much of a
+// strategy's daily notional cap it has used so far today —
+// GET /algo-limits?strategyId=...
+func buildAlgoLimitsStatusHandler(algoLimitsRegistry *algolimits.Registry) http.HandlerFunc {
+	return func(responseWriter http.ResponseWriter, request *http.Request) {
+		strategyIdentifier := request.URL.Query().Get("strategyId")
+		if strategyIdentifier == "" {
+			http.Error(responseWriter, "missing strategyId query parameter", http.StatusBadRequest)
+			return
+		}
+
+		respondWithJson(responseWriter, http.StatusOK, map[string]any{
+			"strategyIdentifier":            strategyIdentifier,
+			"notionalUsedTodayInMinorUnits": algoLimitsRegistry.NotionalUsedTodayInMinorUnits(strategyIdentifier, time.Now()),
+		})
 	}
 }

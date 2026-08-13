@@ -50,7 +50,7 @@ impl CandleAggregator {
         let tickHistory = self
             .recentTicksByInstrument
             .entry(instrumentSymbol.to_string())
-            .or_insert_with(Vec::new);
+            .or_default();
         tickHistory.push(TradeTick {
             instrumentSymbol: instrumentSymbol.to_string(),
             executedAtEpochSeconds,
@@ -65,7 +65,7 @@ impl CandleAggregator {
         let candleHistory = self
             .candlesByInstrument
             .entry(instrumentSymbol.to_string())
-            .or_insert_with(Vec::new);
+            .or_default();
 
         match candleHistory.last_mut() {
             Some(currentCandle) if currentCandle.bucketStartEpochSeconds == bucketStartEpochSeconds => {
@@ -173,7 +173,10 @@ mod tests {
 
         assert_eq!(aggregator.recentCandlesForInstrument("AAPL", 10).len(), 1);
         assert_eq!(aggregator.recentCandlesForInstrument("MSFT", 10).len(), 1);
-        assert_eq!(aggregator.recentTradeTicksForInstrument("AAPL", 10)[0].priceInMinorUnits, 100);
+        assert_eq!(
+            aggregator.recentTradeTicksForInstrument("AAPL", 10)[0].priceInMinorUnits,
+            100
+        );
     }
 
     #[test]

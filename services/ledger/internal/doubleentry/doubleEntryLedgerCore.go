@@ -114,6 +114,32 @@ func (ledgerBook *InMemoryDoubleEntryLedgerBook) PostJournalEntry(journalEntry J
 	return nil
 }
 
+// RegisterAccountIfAbsent adds a brand-new ledger account with a zero
+// starting balance if — and only if — accountIdentifier does not already
+// exist. It is purely additive: existing accounts and every other method
+// on this type are completely unaffected, so callers that only ever used
+// NewInMemoryDoubleEntryLedgerBookWithAccounts's fixed initial account
+// list (e.g. oms-gateway posting trade settlements) see no behavior
+// change whatsoever. This exists for callers that need to open new
+// ledger accounts dynamically at runtime — e.g.
+// internal/multicurrencywallet registering a new "acct-001:USD"-style
+// sub-account the first time a client deposits into a currency it has
+// never held before, rather than requiring every possible account to be
+// hardcoded at startup.
+//
+// Returns true if the account was newly created, false if it already
+// existed (a harmless no-op in that case — this method is idempotent).
+func (ledgerBook *InMemoryDoubleEntryLedgerBook) RegisterAccountIfAbsent(accountIdentifier string) bool {
+	ledgerBook.mutexGuardingAccountBalances.Lock()
+	defer ledgerBook.mutexGuardingAccountBalances.Unlock()
+
+	if _, accountAlreadyExists := ledgerBook.accountBalanceInMinorUnitsByAccountId[accountIdentifier]; accountAlreadyExists {
+		return false
+	}
+	ledgerBook.accountBalanceInMinorUnitsByAccountId[accountIdentifier] = 0
+	return true
+}
+
 func (ledgerBook *InMemoryDoubleEntryLedgerBook) CurrentBalanceInMinorUnits(accountIdentifier string) (int64, error) {
 	ledgerBook.mutexGuardingAccountBalances.Lock()
 	defer ledgerBook.mutexGuardingAccountBalances.Unlock()

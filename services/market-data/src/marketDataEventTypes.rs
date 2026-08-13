@@ -9,6 +9,15 @@
 /// requirement in ARCHITECTURE.md §5.
 #[derive(Debug, Clone)]
 pub struct PriceLevelDeltaUpdate {
+    // Not read internally today — DeltaPublisher and L1QuotePublisher
+    // both receive this field's value as a separate `instrumentSymbol:
+    // &str` argument instead (see their `publishDeltaBatchForInstrument`
+    // / `applyDepthPublishForInstrument`), so nothing needs to read it
+    // back off the struct. Kept because a real wire-format consumer
+    // downstream of the eventual Kafka topic (see the module TODO) would
+    // need it self-describing rather than implied by which topic
+    // partition it arrived on.
+    #[allow(dead_code)]
     pub instrumentSymbol: String,
     pub isBidSide: bool,
     pub priceInMinorUnits: i64,
@@ -29,6 +38,15 @@ pub struct SequencedMarketDataMessage {
 
 /// A full point-in-time book snapshot, sent when a client (re)subscribes
 /// or reports a detected sequence gap.
+///
+/// Not constructed anywhere yet — the snapshot+delta/resync protocol
+/// implemented so far (`l1QuoteWireProtocol.rs`,
+/// `l1QuoteWebSocketServer.rs`) covers the L1 (top-of-book) feed, not a
+/// full order-book depth WS stream. This type documents the shape a
+/// depth-level snapshot would need once that's built; kept rather than
+/// deleted since it's referenced by ARCHITECTURE.md §5's contract
+/// description.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct FullBookSnapshotMessage {
     pub instrumentSymbol: String,

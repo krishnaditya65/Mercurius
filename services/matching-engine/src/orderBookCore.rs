@@ -2,17 +2,21 @@ use std::collections::BTreeMap;
 use std::collections::VecDeque;
 
 use crate::orderTypes::{
-    IncomingOrderRequest, OrderSide, OrderStatusQueryResult, OrderSubmissionOutcome, OrderType, RestingLimitOrder,
-    TradeExecutionEvent,
+    IncomingOrderRequest, OrderSide, OrderStatusQueryResult, OrderSubmissionOutcome, OrderType,
+    RestingLimitOrder, TradeExecutionEvent,
 };
 
 /// Single-instrument, single-threaded, price-time-priority limit order book.
 ///
 /// Per ARCHITECTURE.md §3.1 (single-writer principle): exactly one thread
-/// should ever own an instance of this struct. This skeleton doesn't yet
-/// enforce that at the type level (no ring-buffer ingress wired up — see
-/// the TODOs in `main.rs`), but the internal data structures are already
-/// lock-free BY DESIGN: there is no interior mutability or locking here at
+/// should ever own an instance of this struct. `main.rs` now enforces this
+/// at the type level — a `WalBackedOrderBook` (which wraps one of these)
+/// is moved into the dedicated matching-core thread's closure and never
+/// named again on the thread that spawned it, with a lock-free SPSC ring
+/// buffer (`src/lockFreeSpscRingBuffer.rs`) as the only channel in or out
+/// (see the README's "Lock-free ring buffer ingress/egress" section). The
+/// internal data structures here are, independently, already lock-free BY
+/// DESIGN: there is no interior mutability or locking in this struct at
 /// all. Correctness comes from single-threaded ownership, not from
 /// synchronization primitives.
 pub struct OrderBookCore {
@@ -42,6 +46,18 @@ pub struct OrderBookCore {
     /// index price instead of last-traded; last-traded is the simpler,
     /// more common retail convention and what this skeleton implements.
     lastTradedPriceInMinorUnits: Option<i64>,
+}
+
+/// See `OrderBookCore::fullBookStateSnapshotForTesting`. Test-only
+/// equality-comparable dump of the whole book, id-for-id and
+/// price-level-for-price-level.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FullOrderBookStateSnapshotForTesting {
+    pub restingBuyOrdersByPriceDescending: Vec<(i64, Vec<RestingLimitOrder>)>,
+    pub restingSellOrdersByPriceAscending: Vec<(i64, Vec<RestingLimitOrder>)>,
+    pub pendingStopOrders: Vec<IncomingOrderRequest>,
+    pub lastTradedPriceInMinorUnits: Option<i64>,
+    pub nextOrderSequenceNumber: u64,
 }
 
 impl OrderBookCore {
@@ -77,7 +93,10 @@ impl OrderBookCore {
     /// (no String cloning, no Vec growth per call) per ARCHITECTURE.md §1
     /// tenet 2. The skeleton prioritizes readability of the matching
     /// algorithm over the hot-path constraints it will eventually need.
-    pub fn submitIncomingOrder(&mut self, mut incomingOrderRequest: IncomingOrderRequest) -> OrderSubmissionOutcome {
+    pub fn submitIncomingOrder(
+        &mut self,
+        mut incomingOrderRequest: IncomingOrderRequest,
+    ) -> OrderSubmissionOutcome {
         let assignedOrderSequenceNumber = self.allocateNextOrderSequenceNumber();
         incomingOrderRequest.orderSequenceNumber = assignedOrderSequenceNumber;
 
@@ -86,7 +105,9 @@ impl OrderBookCore {
                 self.pendingStopOrders.push(incomingOrderRequest);
                 Vec::new()
             }
-            OrderType::Limit | OrderType::Market => self.matchAndRecordLastPrice(incomingOrderRequest),
+            OrderType::Limit | OrderType::Market => {
+                self.matchAndRecordLastPrice(incomingOrderRequest)
+            }
         };
 
         allTradeExecutionEvents.extend(self.triggerAnyEligiblePendingStopOrders());
@@ -112,17 +133,22 @@ impl OrderBookCore {
     /// scale; a real build would index resting orders by id directly
     /// (e.g. `HashMap<u64, (i64, OrderSide)>`) instead of searching.
     pub fn cancelOrder(&mut self, orderSequenceNumberToCancel: u64) -> bool {
-        if Self::removeFromRestingMap(&mut self.restingBuyOrdersByPriceDescending, orderSequenceNumberToCancel) {
+        if Self::removeFromRestingMap(
+            &mut self.restingBuyOrdersByPriceDescending,
+            orderSequenceNumberToCancel,
+        ) {
             return true;
         }
-        if Self::removeFromRestingMap(&mut self.restingSellOrdersByPriceAscending, orderSequenceNumberToCancel) {
+        if Self::removeFromRestingMap(
+            &mut self.restingSellOrdersByPriceAscending,
+            orderSequenceNumberToCancel,
+        ) {
             return true;
         }
 
-        let pendingIndex = self
-            .pendingStopOrders
-            .iter()
-            .position(|pendingOrder| pendingOrder.orderSequenceNumber == orderSequenceNumberToCancel);
+        let pendingIndex = self.pendingStopOrders.iter().position(|pendingOrder| {
+            pendingOrder.orderSequenceNumber == orderSequenceNumberToCancel
+        });
         if let Some(pendingIndex) = pendingIndex {
             self.pendingStopOrders.remove(pendingIndex);
             return true;
@@ -138,18 +164,20 @@ impl OrderBookCore {
     /// fully filled). Same linear-scan approach as `cancelOrder`, same
     /// "index by id in a real build" caveat.
     pub fn queryOrderStatus(&self, orderSequenceNumberToQuery: u64) -> OrderStatusQueryResult {
-        if let Some((priceInMinorUnits, remainingQuantity)) =
-            Self::findInRestingMap(&self.restingBuyOrdersByPriceDescending, orderSequenceNumberToQuery)
-        {
+        if let Some((priceInMinorUnits, remainingQuantity)) = Self::findInRestingMap(
+            &self.restingBuyOrdersByPriceDescending,
+            orderSequenceNumberToQuery,
+        ) {
             return OrderStatusQueryResult::RestingLimit {
                 orderSide: OrderSide::Buy,
                 limitPriceInMinorUnits: priceInMinorUnits,
                 remainingQuantity,
             };
         }
-        if let Some((priceInMinorUnits, remainingQuantity)) =
-            Self::findInRestingMap(&self.restingSellOrdersByPriceAscending, orderSequenceNumberToQuery)
-        {
+        if let Some((priceInMinorUnits, remainingQuantity)) = Self::findInRestingMap(
+            &self.restingSellOrdersByPriceAscending,
+            orderSequenceNumberToQuery,
+        ) {
             return OrderStatusQueryResult::RestingLimit {
                 orderSide: OrderSide::Sell,
                 limitPriceInMinorUnits: priceInMinorUnits,
@@ -197,7 +225,8 @@ impl OrderBookCore {
 
         for (priceInMinorUnits, restingOrdersAtPrice) in restingOrdersByPrice.iter_mut() {
             let beforeLen = restingOrdersAtPrice.len();
-            restingOrdersAtPrice.retain(|order| order.restingOrderSequenceNumber != orderSequenceNumberToCancel);
+            restingOrdersAtPrice
+                .retain(|order| order.restingOrderSequenceNumber != orderSequenceNumberToCancel);
             if restingOrdersAtPrice.len() != beforeLen {
                 wasRemoved = true;
                 if restingOrdersAtPrice.is_empty() {
@@ -239,10 +268,9 @@ impl OrderBookCore {
             let Some(lastTradedPrice) = self.lastTradedPriceInMinorUnits else {
                 break;
             };
-            let triggeredIndex = self
-                .pendingStopOrders
-                .iter()
-                .position(|pendingOrder| isStopOrderTriggeredAtPrice(pendingOrder, lastTradedPrice));
+            let triggeredIndex = self.pendingStopOrders.iter().position(|pendingOrder| {
+                isStopOrderTriggeredAtPrice(pendingOrder, lastTradedPrice)
+            });
 
             let Some(triggeredIndex) = triggeredIndex else {
                 break;
@@ -275,8 +303,11 @@ impl OrderBookCore {
         let mut tradeExecutionEventsProduced = Vec::new();
 
         loop {
-            let bestRestingSellPriceOpt =
-                self.restingSellOrdersByPriceAscending.keys().next().copied();
+            let bestRestingSellPriceOpt = self
+                .restingSellOrdersByPriceAscending
+                .keys()
+                .next()
+                .copied();
 
             let bestRestingSellPrice = match bestRestingSellPriceOpt {
                 Some(price)
@@ -319,7 +350,8 @@ impl OrderBookCore {
             }
 
             if restingOrdersAtBestPrice.is_empty() {
-                self.restingSellOrdersByPriceAscending.remove(&bestRestingSellPrice);
+                self.restingSellOrdersByPriceAscending
+                    .remove(&bestRestingSellPrice);
             }
         }
 
@@ -342,8 +374,11 @@ impl OrderBookCore {
         let mut tradeExecutionEventsProduced = Vec::new();
 
         loop {
-            let bestRestingBuyPriceOpt =
-                self.restingBuyOrdersByPriceDescending.keys().next_back().copied();
+            let bestRestingBuyPriceOpt = self
+                .restingBuyOrdersByPriceDescending
+                .keys()
+                .next_back()
+                .copied();
 
             let bestRestingBuyPrice = match bestRestingBuyPriceOpt {
                 Some(price)
@@ -386,7 +421,8 @@ impl OrderBookCore {
             }
 
             if restingOrdersAtBestPrice.is_empty() {
-                self.restingBuyOrdersByPriceDescending.remove(&bestRestingBuyPrice);
+                self.restingBuyOrdersByPriceDescending
+                    .remove(&bestRestingBuyPrice);
             }
         }
 
@@ -448,15 +484,49 @@ impl OrderBookCore {
         let mut depthSnapshot = Vec::new();
 
         for (priceInMinorUnits, restingOrdersAtPrice) in &self.restingBuyOrdersByPriceDescending {
-            let totalQuantityAtPrice: u64 = restingOrdersAtPrice.iter().map(|o| o.remainingQuantity).sum();
+            let totalQuantityAtPrice: u64 = restingOrdersAtPrice
+                .iter()
+                .map(|o| o.remainingQuantity)
+                .sum();
             depthSnapshot.push((true, *priceInMinorUnits, totalQuantityAtPrice));
         }
         for (priceInMinorUnits, restingOrdersAtPrice) in &self.restingSellOrdersByPriceAscending {
-            let totalQuantityAtPrice: u64 = restingOrdersAtPrice.iter().map(|o| o.remainingQuantity).sum();
+            let totalQuantityAtPrice: u64 = restingOrdersAtPrice
+                .iter()
+                .map(|o| o.remainingQuantity)
+                .sum();
             depthSnapshot.push((false, *priceInMinorUnits, totalQuantityAtPrice));
         }
 
         depthSnapshot
+    }
+
+    /// A full, order-for-order, price-level-for-price-level dump of every
+    /// bit of book state this struct holds — every resting order on both
+    /// sides (in FIFO order within each price level), every still-armed
+    /// pending stop order, the last traded price, and the next id the
+    /// allocator would hand out. Deliberately much richer than
+    /// `currentBookDepthSnapshot` (which only aggregates quantity per
+    /// price level for depth publishing) — this exists purely so tests
+    /// (in particular `writeAheadLog.rs`'s replay round-trip tests and
+    /// `deterministicReplayHarness.rs`) can assert two books are IDENTICAL,
+    /// not just "have the same visible depth."
+    pub fn fullBookStateSnapshotForTesting(&self) -> FullOrderBookStateSnapshotForTesting {
+        FullOrderBookStateSnapshotForTesting {
+            restingBuyOrdersByPriceDescending: self
+                .restingBuyOrdersByPriceDescending
+                .iter()
+                .map(|(price, ordersAtPrice)| (*price, ordersAtPrice.iter().cloned().collect()))
+                .collect(),
+            restingSellOrdersByPriceAscending: self
+                .restingSellOrdersByPriceAscending
+                .iter()
+                .map(|(price, ordersAtPrice)| (*price, ordersAtPrice.iter().cloned().collect()))
+                .collect(),
+            pendingStopOrders: self.pendingStopOrders.clone(),
+            lastTradedPriceInMinorUnits: self.lastTradedPriceInMinorUnits,
+            nextOrderSequenceNumber: self.nextOrderSequenceNumber,
+        }
     }
 
     pub fn printCurrentBookDepth(&self) {
@@ -465,16 +535,20 @@ impl OrderBookCore {
         for (priceInMinorUnits, restingOrdersAtPrice) in
             self.restingBuyOrdersByPriceDescending.iter().rev()
         {
-            let totalQuantityAtPrice: u64 =
-                restingOrdersAtPrice.iter().map(|o| o.remainingQuantity).sum();
+            let totalQuantityAtPrice: u64 = restingOrdersAtPrice
+                .iter()
+                .map(|o| o.remainingQuantity)
+                .sum();
             println!("  {:>8} x {}", priceInMinorUnits, totalQuantityAtPrice);
         }
         println!("ASKS (best first):");
         for (priceInMinorUnits, restingOrdersAtPrice) in
             self.restingSellOrdersByPriceAscending.iter()
         {
-            let totalQuantityAtPrice: u64 =
-                restingOrdersAtPrice.iter().map(|o| o.remainingQuantity).sum();
+            let totalQuantityAtPrice: u64 = restingOrdersAtPrice
+                .iter()
+                .map(|o| o.remainingQuantity)
+                .sum();
             println!("  {:>8} x {}", priceInMinorUnits, totalQuantityAtPrice);
         }
     }
@@ -487,7 +561,10 @@ impl OrderBookCore {
 /// the trigger. Free function rather than a method so
 /// `triggerAnyEligiblePendingStopOrders` can call it from inside an
 /// `iter().position()` closure without a `self` borrow conflict.
-fn isStopOrderTriggeredAtPrice(pendingOrder: &IncomingOrderRequest, lastTradedPriceInMinorUnits: i64) -> bool {
+fn isStopOrderTriggeredAtPrice(
+    pendingOrder: &IncomingOrderRequest,
+    lastTradedPriceInMinorUnits: i64,
+) -> bool {
     let triggerPrice = pendingOrder
         .stopTriggerPriceInMinorUnits
         .expect("a StopLossLimit/StopLossMarket order must always carry a trigger price");
@@ -530,8 +607,14 @@ mod tests {
         // Price-time priority: trade executes at the RESTING order's price,
         // not the aggressor's — this is the standard convention and the
         // one every downstream P&L/margin calc must assume.
-        assert_eq!(tradeExecutionEvents.tradeExecutionEvents[0].executedPriceInMinorUnits, 100);
-        assert_eq!(tradeExecutionEvents.tradeExecutionEvents[0].executedQuantity, 5);
+        assert_eq!(
+            tradeExecutionEvents.tradeExecutionEvents[0].executedPriceInMinorUnits,
+            100
+        );
+        assert_eq!(
+            tradeExecutionEvents.tradeExecutionEvents[0].executedQuantity,
+            5
+        );
     }
 
     #[test]
@@ -559,14 +642,20 @@ mod tests {
         });
 
         assert_eq!(tradeExecutionEvents.tradeExecutionEvents.len(), 1);
-        assert_eq!(tradeExecutionEvents.tradeExecutionEvents[0].executedQuantity, 4);
+        assert_eq!(
+            tradeExecutionEvents.tradeExecutionEvents[0].executedQuantity,
+            4
+        );
 
         let remainingRestingSellOrders = orderBookUnderTest
             .restingSellOrdersByPriceAscending
             .get(&100)
             .expect("6 units should still be resting at price 100");
         assert_eq!(
-            remainingRestingSellOrders.front().unwrap().remainingQuantity,
+            remainingRestingSellOrders
+                .front()
+                .unwrap()
+                .remainingQuantity,
             6
         );
     }
@@ -653,8 +742,14 @@ mod tests {
         });
 
         assert_eq!(tradeExecutionEvents.tradeExecutionEvents.len(), 1);
-        assert_eq!(tradeExecutionEvents.tradeExecutionEvents[0].executedPriceInMinorUnits, 10_000);
-        assert_eq!(tradeExecutionEvents.tradeExecutionEvents[0].executedQuantity, 5);
+        assert_eq!(
+            tradeExecutionEvents.tradeExecutionEvents[0].executedPriceInMinorUnits,
+            10_000
+        );
+        assert_eq!(
+            tradeExecutionEvents.tradeExecutionEvents[0].executedQuantity,
+            5
+        );
     }
 
     #[test]
@@ -751,8 +846,15 @@ mod tests {
             orderQuantity: 3,
         });
 
-        assert_eq!(tradeExecutionEvents.tradeExecutionEvents.len(), 1, "only the initiating trade at 85 — the triggered stop found no resting buys to fill into");
-        assert_eq!(tradeExecutionEvents.tradeExecutionEvents[0].executedPriceInMinorUnits, 85);
+        assert_eq!(
+            tradeExecutionEvents.tradeExecutionEvents.len(),
+            1,
+            "only the initiating trade at 85 — the triggered stop found no resting buys to fill into"
+        );
+        assert_eq!(
+            tradeExecutionEvents.tradeExecutionEvents[0].executedPriceInMinorUnits,
+            85
+        );
         assert_eq!(
             orderBookUnderTest.pendingStopOrderCount(),
             0,
@@ -819,7 +921,8 @@ mod tests {
         });
         assert!(!orderBookUnderTest.currentBookDepthSnapshot().is_empty());
 
-        let wasCancelled = orderBookUnderTest.cancelOrder(restingOrderOutcome.assignedOrderSequenceNumber);
+        let wasCancelled =
+            orderBookUnderTest.cancelOrder(restingOrderOutcome.assignedOrderSequenceNumber);
         assert!(wasCancelled);
         assert!(
             orderBookUnderTest.currentBookDepthSnapshot().is_empty(),
@@ -855,7 +958,8 @@ mod tests {
         });
         assert_eq!(orderBookUnderTest.pendingStopOrderCount(), 1);
 
-        let wasCancelled = orderBookUnderTest.cancelOrder(stopOrderOutcome.assignedOrderSequenceNumber);
+        let wasCancelled =
+            orderBookUnderTest.cancelOrder(stopOrderOutcome.assignedOrderSequenceNumber);
         assert!(wasCancelled);
         assert_eq!(orderBookUnderTest.pendingStopOrderCount(), 0);
 
@@ -895,7 +999,10 @@ mod tests {
     #[test]
     fn queryOrderStatusReturnsNotFoundForAnUnknownId() {
         let orderBookUnderTest = OrderBookCore::newEmptyOrderBook("TEST");
-        assert_eq!(orderBookUnderTest.queryOrderStatus(999), OrderStatusQueryResult::NotFound);
+        assert_eq!(
+            orderBookUnderTest.queryOrderStatus(999),
+            OrderStatusQueryResult::NotFound
+        );
     }
 
     #[test]
@@ -924,7 +1031,8 @@ mod tests {
             orderQuantity: 2,
         });
 
-        let status = orderBookUnderTest.queryOrderStatus(restingOutcome.assignedOrderSequenceNumber);
+        let status =
+            orderBookUnderTest.queryOrderStatus(restingOutcome.assignedOrderSequenceNumber);
         assert_eq!(
             status,
             OrderStatusQueryResult::RestingLimit {

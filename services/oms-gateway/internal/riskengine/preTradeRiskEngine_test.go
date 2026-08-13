@@ -76,3 +76,32 @@ func TestApplyTradeSettlementDebitsBuyerAndCreditsSeller(t *testing.T) {
 		t.Fatal("expected seller's margin to be increased by the executed notional")
 	}
 }
+
+func TestAdjustAvailableMarginAppliesSignedDeltaAndCreatesUnknownAccounts(t *testing.T) {
+	riskEngineUnderTest := NewPreTradeRiskEngineWithSeedBalances(map[string]int64{
+		"acct-001": 100_000,
+	})
+
+	riskEngineUnderTest.AdjustAvailableMarginInMinorUnits("acct-001", 25_000)
+	if available, _ := riskEngineUnderTest.AvailableMarginInMinorUnits("acct-001"); available != 125_000 {
+		t.Fatalf("expected available margin 125000 after positive delta, got %d", available)
+	}
+
+	riskEngineUnderTest.AdjustAvailableMarginInMinorUnits("acct-001", -25_000)
+	if available, _ := riskEngineUnderTest.AvailableMarginInMinorUnits("acct-001"); available != 100_000 {
+		t.Fatalf("expected available margin back to 100000 after negative delta, got %d", available)
+	}
+
+	riskEngineUnderTest.AdjustAvailableMarginInMinorUnits("acct-brand-new", 5_000)
+	if available, known := riskEngineUnderTest.AvailableMarginInMinorUnits("acct-brand-new"); !known || available != 5_000 {
+		t.Fatalf("expected a previously-unknown account to be created with the delta as its balance, got available=%d known=%v", available, known)
+	}
+}
+
+func TestAvailableMarginInMinorUnitsReportsUnknownAccounts(t *testing.T) {
+	riskEngineUnderTest := NewPreTradeRiskEngineWithSeedBalances(map[string]int64{})
+
+	if available, known := riskEngineUnderTest.AvailableMarginInMinorUnits("nobody"); known || available != 0 {
+		t.Fatalf("expected unknown account to report known=false available=0, got available=%d known=%v", available, known)
+	}
+}

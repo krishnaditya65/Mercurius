@@ -15,8 +15,8 @@
 // "re-arm" option for a recurring alert.
 #![allow(non_snake_case)]
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::Serialize;
 
@@ -38,7 +38,10 @@ pub struct PriceAlertStore {
 
 impl PriceAlertStore {
     pub fn newEmptyStore() -> Self {
-        PriceAlertStore { alerts: Mutex::new(Vec::new()), nextAlertId: AtomicU64::new(1) }
+        PriceAlertStore {
+            alerts: Mutex::new(Vec::new()),
+            nextAlertId: AtomicU64::new(1),
+        }
     }
 
     pub fn createAlert(
@@ -97,7 +100,11 @@ impl PriceAlertStore {
 
     pub fn alertsForAccount(&self, accountIdentifier: &str) -> Vec<PriceAlert> {
         let alerts = self.alerts.lock().expect("price alert store mutex poisoned");
-        alerts.iter().filter(|alert| alert.accountIdentifier == accountIdentifier).cloned().collect()
+        alerts
+            .iter()
+            .filter(|alert| alert.accountIdentifier == accountIdentifier)
+            .cloned()
+            .collect()
     }
 }
 

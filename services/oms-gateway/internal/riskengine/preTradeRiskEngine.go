@@ -78,6 +78,19 @@ func (riskEngine *PreTradeRiskEngine) EvaluateOrderAgainstAvailableMargin(
 	return RiskCheckOutcome{IsOrderApproved: true}
 }
 
+// AvailableMarginInMinorUnits returns the account's current cached
+// available margin and whether the account is known at all. Read-only —
+// exposed so callers like internal/marginpledge's HTTP handlers can show
+// a real before/after margin figure without reaching into the cache map
+// directly.
+func (riskEngine *PreTradeRiskEngine) AvailableMarginInMinorUnits(clientAccountIdentifier string) (int64, bool) {
+	riskEngine.mutexGuardingAvailableMarginCache.RLock()
+	defer riskEngine.mutexGuardingAvailableMarginCache.RUnlock()
+
+	availableMargin, accountIsKnown := riskEngine.availableMarginInMinorUnitsByAccountId[clientAccountIdentifier]
+	return availableMargin, accountIsKnown
+}
+
 // RefreshAccountBalanceFromLedger overwrites the cached balance for one
 // account with an authoritative value fetched from the ledger service.
 // Safe to call for an account not previously known — it adds the account
@@ -91,6 +104,23 @@ func (riskEngine *PreTradeRiskEngine) RefreshAccountBalanceFromLedger(
 	defer riskEngine.mutexGuardingAvailableMarginCache.Unlock()
 
 	riskEngine.availableMarginInMinorUnitsByAccountId[clientAccountIdentifier] = authoritativeBalanceInMinorUnits
+}
+
+// AdjustAvailableMarginInMinorUnits applies a signed delta to one
+// account's cached available margin — used by internal/marginpledge to
+// reflect a pledge (positive delta: pledging collateral increases
+// available margin) or an unpledge (negative delta: removing collateral
+// decreases it). Safe to call for an account not previously known — the
+// delta becomes the account's starting balance, same rationale as
+// RefreshAccountBalanceFromLedger.
+func (riskEngine *PreTradeRiskEngine) AdjustAvailableMarginInMinorUnits(
+	clientAccountIdentifier string,
+	deltaInMinorUnits int64,
+) {
+	riskEngine.mutexGuardingAvailableMarginCache.Lock()
+	defer riskEngine.mutexGuardingAvailableMarginCache.Unlock()
+
+	riskEngine.availableMarginInMinorUnitsByAccountId[clientAccountIdentifier] += deltaInMinorUnits
 }
 
 // ApplyTradeSettlementToLocalCache adjusts the cached margin for both

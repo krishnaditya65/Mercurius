@@ -119,6 +119,80 @@ allocation-free hot path.
 | `publishBookDepthToMarketData` (in `main.rs`) | Fire-and-forget: connects to market-data at `127.0.0.1:9102` with a 200ms timeout after every processed order and sends the current depth plus any trade ticks. Deliberately swallows connection failures — a Tier 0 component must never let a Tier 1 consumer's availability affect order processing. Verified end-to-end (`docs/BUILD_LOG.md` entries 15, 26): market-data received real sequence numbers and real trade ticks from real orders, not demo data. |
 | `handleOneIncomingOrderLine` (in `main.rs`) | Now returns `(OrderSubmissionWireResponse, Vec<TradeExecutionEvent>)` — cancels/status-queries always return an empty trade vec, submissions return whatever `OrderBookCore::submitIncomingOrder` produced, so the caller can forward exactly those trades to market-data as ticks. |
 
+### `src/writeAheadLog.rs`, `src/walBackedOrderBook.rs`, `src/deterministicReplayHarness.rs` — new this build
+
+FEATURES.md §9: "Event sourcing + WAL replay for crash recovery" and
+"Deterministic replay test harness". A real fsync'd, append-only NDJSON
+write-ahead log — one record per book-mutating event
+(`OrderAccepted`/`OrderCancelled`/`TradeExecuted`) — with a reader
+tolerant of a torn tail and a replay function that reconstructs a fresh
+`OrderBookCore` from a WAL file. `WalBackedOrderBook` wraps
+`OrderBookCore` with this logging and withholds acknowledgement on any
+WAL write error. `deterministicReplayHarness.rs` runs an arbitrary
+operation sequence through both a live book and a WAL-replay-
+reconstructed book and asserts exact equality via a new
+`fullBookStateSnapshotForTesting()` on `OrderBookCore` — 5 hand-written
+scenarios plus a loop over 12 seeded pseudo-random sequences. `main.rs`
+gained `MATCHING_ENGINE_WAL_FILE_PATH` and an offline `cargo run --
+--replay <path>` recovery-inspection mode. 17 new tests (46 total for
+the crate, up from 29, zero regressions).
+
+**Verified live** (`docs/BUILD_LOG.md` entry 52): ran the real server
+with a real WAL path, drove 5 real orders over the actual TCP wire
+protocol from a standalone Python client, inspected the resulting WAL
+file directly with `xxd` (7 real NDJSON lines), then separately replayed
+that exact file via `--replay` and confirmed the reconstructed book
+state matched what the live sequence should leave resting.
+
+**Known limitations:** no WAL compaction/snapshotting (unbounded
+growth); no per-record checksums; the WAL logs commands, not book
+internals — "which resting order absorbed this fill" requires a replay
+to re-derive, not a direct read.
+
+### `src/lockFreeSpscRingBuffer.rs` — new this build
+
+FEATURES.md §9: "Lock-free ring buffer ingress/egress". A hand-rolled,
+genuinely lock-free single-producer/single-consumer ring buffer on
+`std::sync::atomic` — no mutex on the enqueue/dequeue hot path. Split
+into `RingBufferProducerHandle`/`RingBufferConsumerHandle` so the type
+system itself enforces the single-producer/single-consumer invariant
+the 4 `unsafe` blocks rely on for soundness: (1) `unsafe impl Sync` —
+sound because the Acquire/Release handoff protocol guarantees producer
+and consumer never touch the same slot concurrently; (2) the write in
+`tryPush` — sound because there's structurally one producer, and the
+preceding Acquire-gated full-check proves the consumer already finished
+reading whatever was there; (3) `assume_init_read()` in `tryPop` —
+sound because there's structurally one consumer, and the preceding
+Acquire-gated empty-check proves a completed push initialized and
+published the slot; (4) `assume_init_drop()` in `Drop` — sound because
+`Drop` gives exclusive access only once the `Arc` refcount hits zero.
+
+`main.rs` now runs two real threads — a network thread (owns the
+`TcpListener`) and a matching-core thread (owns `WalBackedOrderBook`) —
+connected ONLY by an ingress and an egress ring buffer, replacing the
+previous direct synchronous call. `handleOneIncomingOrderLine`'s logic
+is reused verbatim on the core thread; every existing behavior (price-
+time priority, WAL logging) is unchanged. 6 new tests: single-threaded
+FIFO/full/empty/wraparound, plus two real multi-threaded stress tests
+(2,000,000 `usize` items; 200,000 heap-allocated `String` items on a
+capacity-8 buffer to force contention).
+
+**Verified live** (`docs/BUILD_LOG.md` entry 58): real TCP wire traffic
+through the new two-thread path produced correct trades/sequence-
+numbers/cancels; the resulting WAL was independently replayed
+successfully; two load passes (2,000 sequential requests, then 2,000
+requests from 20 concurrent client threads) against the live server
+completed with zero errors and the ingress/egress correlation assertion
+never fired, confirming FIFO correctness under real concurrent
+pressure. 52/52 tests pass — all 46 pre-existing tests (order book, WAL,
+deterministic replay) unmodified, zero regressions.
+
+**Known limitations:** at most one request is in flight through the
+ring buffers at a time (the network thread blocks on egress before
+accepting the next connection) — real and lock-free, but pipelining
+isn't exploited yet; no supervision if the matching-core thread panics;
+blocking push/pop use a plain spin loop, not spin-then-park.
+
 ---
 
 ## services/market-data (Rust) — Tier 1 skeleton
@@ -245,6 +319,67 @@ alerts) is in-memory only. The HTTP query API is a polling stopgap, not
 real WebSocket streaming. Watchlists/alerts have no auth, no technical
 triggers, no push notification (poll `GET /alerts` to discover a fired
 one), and a fired alert never re-arms.
+
+### `src/l1QuotePublisher.rs`, `src/l1QuoteWireProtocol.rs`, `src/l1QuoteWebSocketServer.rs` — new this build
+
+FEATURES.md §8: "WebSocket broadcast for L1 quotes to web/mobile
+clients" and "Client-side reconnect/resync protocol". `l1QuotePublisher`
+derives L1 state (best bid/ask/last trade) from the service's real depth
+publish stream, with monotonic per-instrument sequence numbers.
+`l1QuoteWebSocketServer` is a real `tokio`/`tokio-tungstenite` WS server
+on `127.0.0.1:9104`: every new connection gets a SNAPSHOT (current state
++ its sequence number) before switching to DELTA messages, so a client
+can detect a sequence gap and know to resync rather than silently
+corrupting its view; a `RESYNC_REQUEST` client message triggers a fresh
+SNAPSHOT. 16 new tests (47 total for the crate, up from 33), including 4
+real integration tests against an actual bound listener and a real
+`tokio-tungstenite` client, not mocks.
+
+**Verified live** (`docs/BUILD_LOG.md` entry 51): real matching-engine +
+market-data processes, real crossing orders driven over TCP, a real
+Python `websockets` client received correctly-sequenced DELTA messages
+reflecting the real fills; a later-connecting client's SNAPSHOT
+correctly caught it up; a RESYNC_REQUEST correctly returned a fresh
+SNAPSHOT at the same sequence number.
+
+**Known limitations:** fan-out is in-process only (no Kafka); no
+per-symbol WS subscription filtering (broadcasts every instrument); no
+WS auth; only L1 got real WS push this build — depth-delta and
+trade-tick feeds still don't.
+
+### `src/simulatedExchangeFeedGenerator.rs`, `src/columnarTickStore.rs`, `src/udpMulticastPublisher.rs` — new this build
+
+FEATURES.md §8: "Exchange feed ingestion (simulated/sandbox feed for
+Phase 0–1)", "Tick-level storage in a columnar time-series store", "UDP
+multicast fan-out". The simulated feed generator produces a
+deterministic (seeded) per-symbol random-walk tick stream feeding the
+EXACT SAME ingestion pipeline real matching-engine ticks use (the
+shared `ingestDepthPublishMessage` function was extracted specifically
+to guarantee this) — this service now runs fully standalone with zero
+matching-engine dependency. The columnar tick store is a real
+struct-of-arrays (not array-of-structs) store with binary-search range
+queries, exposed via `GET /ticks/range`. The UDP multicast publisher is
+a real `IP_ADD_MEMBERSHIP` group join broadcasting trade ticks and L1
+quotes in a compact binary format. 33 new tests (83 total, up from 47).
+
+**Bug found and fixed:** `DeltaPublisher`'s sink closure type lacked a
+`Send` bound — fine single-threaded, broke once shared behind
+`Arc<Mutex<_>>` with the new feed-generator thread; fixed by adding the
+bound and updating its test from `Rc<RefCell<_>>` to `Arc<Mutex<_>>`.
+
+**Verified live** (`docs/BUILD_LOG.md` entry 57) with NO matching-engine
+process running at all (confirmed via `ps aux`): real sequenced depth
+publishes purely from the simulated feed, real candle/trade/tick-range
+query results, a real WebSocket client receiving correctly-sequenced
+messages, and a real Python UDP client joining the multicast group and
+decoding 5 real datagrams from the live process.
+
+**Known limitations:** UDP multicast is a single fixed group/TTL 1, no
+reliability/gap-detection layer, no auth/encryption; simulated feed's
+symbol list/drift/volatility are hardcoded, not fully configurable;
+columnar tick store duplicates trade-tick storage alongside the
+existing candle aggregator's shorter trade tape (different retention
+purposes, real duplication nonetheless); everything in-memory only.
 
 ---
 
@@ -544,6 +679,103 @@ backpressure/throttling. The matching-engine hand-off and the ledger
 settlement post are both synchronous placeholders, not the real
 ring-buffer / async-event-consumer design ARCHITECTURE.md describes.
 
+### `internal/marginpledge`, `internal/marginengine`, `internal/orders` execution types — new this build
+
+FEATURES.md §3: "Margin Pledge system", "SPAN + Exposure margin
+calculator for F&O", "Iceberg, FOK, IOC order types". `marginpledge`
+lets an account pledge held stock quantity as collateral — increases
+`riskengine`'s `AvailableMarginInMinorUnits` by (quantity × price ×
+1-haircut), marks that quantity unavailable for sale, refuses to
+unpledge quantity currently backing open utilized margin. `marginengine`
+computes an illustrative SPAN + Exposure margin (explicitly not an
+exchange-certified SPAN file). `orders.OrderExecutionType` gained
+ICEBERG/FOK/IOC — this is ACCEPTANCE and VALIDATION only (an Iceberg
+order without a visible-quantity sub-field, or one exceeding total
+quantity, is rejected); true fill semantics need matching-engine support
+that doesn't exist, and every accepted order of these types logs a loud
+boundary warning saying so. New routes: `/margin-pledge/pledge`,
+`/unpledge`, `/set-utilized-margin`, `/margin-pledge?accountId=`,
+`/margin/calculate-span-exposure`. 38 new tests (17 pledge + 11 margin
+engine + 10 order-type validation), including a `-race`-targeted
+concurrent pledge/unpledge test and a fully hand-worked SPAN example.
+
+**Verified live** (`docs/BUILD_LOG.md` entry 48) across a real 5-service
+run: pledging increased available margin by the exact hand-computed
+amount and reduced an oversized order's shortfall by that same amount;
+selling into pledged quantity was blocked, selling the unpledged
+remainder succeeded; unpledging released a proportional amount exactly;
+utilized margin above the safe remainder genuinely blocked a further
+unpledge; the SPAN calculator matched its hand-worked test over HTTP; a
+valid Iceberg/FOK order was accepted and filled under ordinary
+continuous-matching rules (the documented boundary), invalid ones were
+rejected with clear errors.
+
+**Known limitations:** pledge haircuts and SPAN/exposure rates are
+illustrative, not real regulatory tables; pledge reference price is
+caller-supplied (no live price feed here yet); utilized margin for open
+derivative positions is set via an admin-style endpoint, not derived
+from a structured F&O position book (doesn't exist yet).
+
+### `internal/marginfunding`, `internal/optionschain`, `internal/dmagateway`, `internal/papertrading`, `internal/algolimits` — new this build
+
+Five FEATURES.md items built sequentially in one pass (§2 P2, §3 P2/P4,
+§7 P3/P4).
+
+**`marginfunding`** ("Margin funding / instant margin against pledged
+collateral payout"): real cash disbursement up to unpledged collateral
+value via a real journal entry through `internal/ledgerclient`
+(`PostMarginFundingDisbursementJournalEntry` /
+`...RepaymentJournalEntry`), tracked as a real outstanding loan balance.
+16 tests. **Bug caught via live verification**: an early draft credited
+the client account for a disbursement, which under `doubleentry`'s real
+"debit increases" convention actually decreased it — caught when the
+balance moved the wrong direction live, fixed by swapping the debit/
+credit lines.
+
+**`optionschain`** + **`quantengineclient`** ("Real-time Options Chain"
++ "Greeks computed live per contract"): a synthetic strike ladder with
+illustrative OI/Volume, but REAL Greeks/IV per contract via a real HTTP
+call to quant-engine's live Black-Scholes endpoint, and a real PCR
+computed from the synthetic OI. Degrades to a clean 502 (not a crash) if
+quant-engine is down — verified live by killing it mid-run. 21 tests.
+
+**`dmagateway`** ("Direct Market Access (DMA) / FIX gateway"): a real
+session-based TCP protocol on port 8088 — Logon/NewOrderSingle/
+ExecutionReport/Logout with real sequence-number enforcement (an
+out-of-sequence message disconnects the session) — **explicitly,
+repeatedly NOT FIX-certified**: no real FIX tag numbers, no
+SOH/BeginString/CheckSum framing, no ResendRequest/SequenceReset
+gap-fill. Reuses the same internal order-submission path as the HTTP
+API, so a DMA order is genuinely risk-checked. 23 tests. Verified live
+with a standalone Python TCP client: full session lifecycle, a
+genuinely risk-rejected order, an out-of-sequence rejection, a
+pre-Logon rejection, and confirmation the accepted order hit the real
+audit trail.
+
+**`papertrading`** ("Paper trading mode sharing the exact same OMS code
+path as live"): a paper order goes through the identical risk engine
+and audit trail as a live order, but the matching-engine hand-off is
+replaced with a simulated fill and nothing posts to ledger. 9 tests.
+Verified live: paper fills left the real ledger balance and real
+`/positions` untouched while `/paper-positions` accumulated separately;
+an oversized paper order was genuinely rejected by the real risk
+engine, not rubber-stamped.
+
+**`algolimits`** ("Strategy resource limits & circuit breakers"): real
+per-`strategyId` rate limiting (orders/sec) and daily notional caps,
+enforced before an order reaches the risk engine or matching-engine. 18
+tests. Verified live: rate-limit rejection, refill-then-succeed, the
+exact daily-cap boundary, post-cap rejection, untagged orders unaffected.
+
+**Known limitations per item:** margin funding's interest formula isn't
+auto-applied and reuses the existing clearing account; options chain
+OI/Volume are illustrative and "IV" is an assumed flat input, not solved
+from real market prices (needs a real listed-options feed to be truly
+complete); the DMA/FIX gateway needs a certified FIX engine and real
+exchange onboarding to be genuinely complete; paper trading's SELL gate
+still checks real positions (conservative simplification); algo limits
+are per-strategy only, no global circuit breaker, config in-memory.
+
 ---
 
 ## services/ledger (Go) — Tier 2, double-entry core is real
@@ -602,31 +834,317 @@ category of gap as kyc-onboarding's bank-verification penny-drop).
 `ProcessDueWithdrawals` is externally triggered (an endpoint), not run
 on a real scheduled job. In-memory only. No auth.
 
+### `internal/fundsegregation/clientFundSegregation.go` — new this build
+
+Client fund segregation (FEATURES.md §1: "Segregation of client funds
+vs. firm funds ... client money must be ring-fenced"). Classifies
+accounts as CLIENT or FIRM and enforces one real invariant on top of
+`doubleentry`: a dedicated custody-pool account's balance must always
+equal the sum of every CLIENT account's balance.
+
+| Item | Purpose |
+|---|---|
+| `AccountKind` | `CLIENT` or `FIRM`. |
+| `NewSegregationGuard(ledgerBook, custodyPoolAccountId, externalCashSuspenseAccountId, clientAccountIds, firmAccountIds)` | Builds the guard; both named accounts must already exist in `ledgerBook`. |
+| `PostClientMoneyMovement(clientAccountId, amount, description) -> error` | Ring-fenced deposit/payout. Posts one balanced THREE-leg entry: client account and custody pool move together (same direction), `externalCashSuspenseAccountId` is the real-world counterparty absorbing double the amount — the same clearing-account role `firm-clearing-acct` already plays elsewhere, dedicated to genuinely-external client cash. Positive = money arriving, negative = payout. |
+| `PostInterClientTransfer(from, to, amount, description) -> error` | Client-to-client only — rejects outright if either side isn't classified CLIENT. Doesn't touch custody at all, since no client money enters/leaves custody in aggregate. |
+| `CheckSegregationInvariant() -> (SegregationInvariantReport, error)` | The compliance-facing report: custody pool balance, aggregate client balance, computed discrepancy, `IsSegregationIntact` bool. |
+| `ValidateEntryPreservesSegregation(entry) -> error` | Dry-run: would posting this arbitrary journal entry break the invariant? Never posts anything. |
+| `AccountKindOf(accountId) -> (AccountKind, bool)` | Classification lookup. |
+
+**Tested behavior** (13 tests): deposit/payout correctly moves both
+client and custody balances together; zero-amount and negative-payout
+edge cases; unclassified-account rejection; invariant stays intact
+across several movements; inter-client transfer preserves the
+invariant and is rejected for a non-client destination or non-positive
+amount; dry-run validation accepts a properly-segregated deposit,
+client-to-client transfer, and firm-only entry, and rejects an entry
+that moves client money without touching custody; account
+classification lookups.
+
+**Verified live** (`docs/BUILD_LOG.md` entry 45): funded two client
+accounts via `POST /client-funds/deposit` (report stayed intact),
+transferred between them via `POST /client-funds/transfer` (report
+stayed intact, no custody movement needed), a transfer attempt to
+`firm-clearing-acct` was rejected, a payout (negative deposit) updated
+both balances and the report correctly, a dry-run against the OLD
+funding pattern (debit client / credit `firm-clearing-acct`) was
+flagged without posting, and — to prove the report isn't just always
+green — a real entry posted through the pre-existing `/journal-entries`
+endpoint using that old pattern produced a genuine, correctly-computed
+nonzero discrepancy in the report.
+
+**Known limitation:** segregation is enforced ONLY on the new
+`/client-funds/*` endpoints — `/journal-entries` (used by oms-gateway
+for trade settlement) is not migrated and can still produce a real
+discrepancy, exactly as demonstrated above. Custody pool and suspense
+accounts are just more in-memory ledger accounts, not backed by a real
+segregated bank account.
+
+### `internal/amlmonitoring/amlMonitor.go` — new this build
+
+AML transaction monitoring (FEATURES.md §1: "unusual pattern flags, PEP
+screening"). Rule-based, evaluated synchronously against every
+transaction explicitly reported to it — decoupled from any specific
+money-movement mechanism, same design principle as `fundsegregation`.
+
+| Item | Purpose |
+|---|---|
+| `MonitorConfig` | Explicit thresholds: `LargeTransactionThresholdInMinorUnits`, `StructuringReportThresholdInMinorUnits` + `StructuringWindow`, `VelocityMaxTransactionsInWindow` + `VelocityWindow`. All illustrative constants, not real regulatory limits. |
+| `NewMonitor(config, pepNames)` | Builds the monitor with a static PEP watch list (matched case-insensitively). |
+| `RecordTransaction(accountId, amount, occurredAt) -> []Alert` | Logs the transaction and evaluates all three rules, returning whatever new alerts fired. |
+| `ScreenName(accountId, fullName, occurredAt) -> (Alert, bool)` | Case-insensitive PEP watch-list check; a match raises and stores a `PEP_MATCH` alert (doesn't block anything — it's a signal, not a hard stop). |
+| `AlertsForAccount(accountId) -> []Alert` | Every alert for one account, oldest first. |
+| `AllAlerts() -> []Alert` | Every alert across every account, chronologically sorted — the actual compliance review-queue view. |
+
+Rules: `LARGE_TRANSACTION` fires immediately on any single transaction
+at/above the threshold; `VELOCITY` fires when an account's transaction
+count within the rolling window exceeds the limit; `STRUCTURING` fires
+when several individually-sub-threshold transactions within the window
+sum over the reporting threshold — deliberately does NOT fire for a
+single transaction alone crossing the threshold (that's
+`LARGE_TRANSACTION`'s job).
+
+**Tested behavior** (15 tests): no alert for an ordinary small
+transaction; large-transaction alert on a single big transaction
+(positive or negative amount); velocity alert on the transaction that
+crosses the limit, not before, and not for transactions outside the
+window; structuring alert once sub-threshold transactions sum over the
+limit within the window, not for a single large transaction or a single
+sub-threshold transaction alone, not across a wider time gap; PEP
+name-match case-insensitivity and non-match; per-account and
+cross-account alert aggregation, both empty-not-nil when nothing's been
+raised.
+
+**Verified live**: a large deposit triggered `LARGE_TRANSACTION`
+immediately; three sub-threshold deposits summing over the reporting
+threshold triggered `STRUCTURING` on exactly the third one; a
+PEP-listed name matched, an ordinary name didn't; six withdrawal
+requests within an hour (limit 5) triggered real `VELOCITY` alerts on
+the 6th and 7th; the aggregate `/aml/alerts` view correctly showed every
+alert across every account.
+
+**Known limitation:** only `/client-funds/deposit` and
+`/withdrawals/request` report to the monitor — `/journal-entries` (trade
+settlement) and `/withdrawals/process-due` (the actual money-leaving
+moment) do not, so trade flow isn't monitored yet. No case-management
+lifecycle for a raised alert (no assign/investigate/close/escalate).
+Static PEP list, not a real sanctions database.
+
 ### `cmd/server/main.go`
 
 | Route | Behavior |
 |---|---|
 | `GET /health` | Liveness check. |
 | `GET /accounts/balance?accountId=...` | Returns the current balance for an account, 404 if unknown. Now ALSO returns `availableBalanceInMinorUnits` alongside the raw `currentBalanceInMinorUnits` — genuinely different numbers once any withdrawal hold exists. |
-| `POST /journal-entries` | Decodes `PostJournalEntryWireRequest` (own wire type, deliberately decoupled from `doubleentry.JournalEntry` which has no JSON tags), converts to the internal domain type, calls `PostJournalEntry`. Returns `422 Unprocessable Entity` with `errorMessage` set on rejection (unbalanced entry or unknown account), `200` with `wasJournalEntryPosted:true` on success. This is what `oms-gateway` posts trade settlements to — see its `internal/ledgerclient`. |
-| `POST /withdrawals/request` | `{accountIdentifier, amountInMinorUnits}` → the new `WithdrawalRequest` (`PENDING_HOLD`) or a 400 with the validation error. |
+| `POST /journal-entries` | Decodes `PostJournalEntryWireRequest` (own wire type, deliberately decoupled from `doubleentry.JournalEntry` which has no JSON tags), converts to the internal domain type, calls `PostJournalEntry`. Returns `422 Unprocessable Entity` with `errorMessage` set on rejection (unbalanced entry or unknown account), `200` with `wasJournalEntryPosted:true` on success. This is what `oms-gateway` posts trade settlements to — see its `internal/ledgerclient`. NOT routed through the segregation guard or AML monitor — see their known-limitation notes above. |
+| `POST /withdrawals/request` | `{accountIdentifier, amountInMinorUnits}` → the new `WithdrawalRequest` (`PENDING_HOLD`) or a 400 with the validation error. Also reports the transaction to the AML monitor on success. |
 | `POST /withdrawals/cancel` | `{withdrawalId}` → the now-`CANCELLED` request or a 400. |
 | `GET /withdrawals?accountId=...` | Full history for an account, any status. |
 | `POST /withdrawals/process-due` | Sweeps and actually pays out every elapsed hold — `{completedWithdrawalIds, failedWithdrawalIds}`. |
+| `POST /client-funds/deposit` | `{accountIdentifier, amountInMinorUnits}` → ring-fenced deposit/payout via `PostClientMoneyMovement`. `{wasApplied, errorMessage?}`. Also reports the transaction to the AML monitor on success. |
+| `POST /client-funds/transfer` | `{fromAccountIdentifier, toAccountIdentifier, amountInMinorUnits}` → client-to-client transfer via `PostInterClientTransfer`. |
+| `GET /client-funds/segregation-report` | Live `SegregationInvariantReport` — custody pool balance, aggregate client balance, discrepancy, `isSegregationIntact`. |
+| `POST /client-funds/validate-entry` | Same wire shape as `/journal-entries` — dry-run only, never posts. `{wasApplied:false, errorMessage}` if it would break segregation. |
+| `GET /aml/alerts` (optional `?accountId=...`) | The compliance review queue — every alert, or every alert for one account. |
+| `POST /aml/screen-name` | `{accountIdentifier, fullName}` → `{isMatch, alert?}` PEP check via `ScreenName`. |
 
-Seed accounts are `acct-001`, `acct-002`, `firm-clearing-acct` —
-deliberately matching `oms-gateway`'s demo accounts so the two services
-exercise together without extra setup. `WITHDRAWAL_SETTLEMENT_HOLD_DAYS`
+Seed accounts are `acct-001`, `acct-002`, `firm-clearing-acct`,
+`client-money-custody-pool`, `external-cash-suspense` — the first three
+deliberately match `oms-gateway`'s demo accounts so the two services
+exercise together without extra setup; the last two back the
+segregation guard (`acct-001`/`acct-002` classified CLIENT,
+`firm-clearing-acct` classified FIRM). `WITHDRAWAL_SETTLEMENT_HOLD_DAYS`
 env var (default 2) overrides the settlement hold duration — set to 0 for
 live testing without waiting real days. **Verified end-to-end**
-(`docs/BUILD_LOG.md` entries 15, 42): funded via `POST /journal-entries`,
-balances moved correctly after a real trade routed through all three of
-ledger/matching-engine/oms-gateway; separately, a full withdrawal
-lifecycle verified live with a real running process — request (available
-balance dropped, raw balance didn't) → a second over-limit request
-correctly rejected → `process-due` (raw balance ACTUALLY dropped this
-time) → a separate request-then-cancel round trip fully restored the
-balance.
+(`docs/BUILD_LOG.md` entries 15, 42, 45, 46): funded via `POST
+/journal-entries`, balances moved correctly after a real trade routed
+through all three of ledger/matching-engine/oms-gateway; a full
+withdrawal lifecycle verified live — request (available balance
+dropped, raw balance didn't) → a second over-limit request correctly
+rejected → `process-due` (raw balance ACTUALLY dropped this time) → a
+separate request-then-cancel round trip fully restored the balance;
+client fund segregation verified live across deposit/transfer/report/
+validate-entry, including a genuine caught discrepancy from the
+unmigrated `/journal-entries` path.
+
+### `internal/depositrail/simulatedDepositRail.go`, `internal/paymentmandate/paymentMandate.go` — new this build
+
+FEATURES.md §2: "UPI / NEFT / IMPS / net-banking deposit integration"
+and "Auto-payment mandates for SIPs (eNACH/standing instructions)". Both
+are loudly documented as NOT real bank integrations — no actual
+UPI/NEFT/IMPS/eNACH network call happens anywhere in this codebase.
+
+`depositrail`: a two-phase state machine — `POST /deposits/initiate`
+starts a deposit PENDING (no money moves yet); `POST /deposits/confirm`
+stands in for the bank's webhook and is the ONLY place real money moves,
+posting through `fundsegregation.SegregationGuard.PostClientMoneyMovement`
+(same ring-fenced path `/client-funds/deposit` uses) and reporting to
+`amlmonitoring.Monitor`. Confirming an already-confirmed or unknown
+deposit is rejected — no double-post (a genuine TOCTOU race in an early
+draft was caught and fixed before this shipped — see
+`docs/BUILD_LOG.md` entry 47). `GET /deposits?accountId=` for history.
+13 tests.
+
+`paymentmandate`: register a standing instruction (account, amount,
+frequency, next debit date), pause/resume/cancel, and `POST
+/payment-mandates/sweep-due` (same "process-due" sweep pattern as
+`withdrawalworkflow`) that debits the account via the segregation guard
+on every mandate whose date has arrived and advances its next due date.
+17 tests.
+
+**Verified live** (`docs/BUILD_LOG.md` entry 47): a deposit's balance
+stayed unchanged right after initiate, jumped only after confirm,
+segregation stayed intact throughout, a second confirm was rejected; a
+mandate swept and debited the account correctly, a paused mandate's
+sweep did nothing, a cancelled mandate's resume attempt correctly
+failed.
+
+**Known limitations:** sweep endpoints are manually/externally
+triggered, not on a real schedule; `/journal-entries`,
+`/withdrawals/process-due`, and `/payment-mandates/sweep-due` aren't
+reported to AML monitoring (only `/client-funds/deposit`,
+`/withdrawals/request`, and `/deposits/confirm` are); swept SIP money
+has no real investment destination; no auth on any new endpoint.
+
+### `internal/multicurrencywallet/multiCurrencyWallet.go` — new this build
+
+FEATURES.md §2: "Multi-currency wallet (for platforms offering global/US
+stocks)". Each (accountIdentifier, currencyCode) pair is tracked as its
+own real `doubleentry` ledger account — the native currency (INR) is an
+explicit alias for the account's existing raw ledger account, so nothing
+about the pre-existing balance/segregation path changed. Real deposit/
+withdraw per currency wallet; real conversion between two currency
+wallets of the same account through a static illustrative FX rate table
+(e.g. USD/INR=83.0), posted as a real balanced journal entry through a
+new `fx-conversion-clearing-acct`. `GET /wallets?accountId=` lists every
+currency balance. One new additive method on `doubleentry`,
+`RegisterAccountIfAbsent` — no existing signature touched. 18 tests.
+
+**Design bug caught and fixed before implementation, not live:** an
+early draft would have decoupled the native-currency wallet's balance
+from the raw account it's supposed to alias — fixed by making the
+aliasing consistent everywhere before any code ran.
+
+**Verified live** (`docs/BUILD_LOG.md` entry 53): depositing into a USD
+wallet left the INR balance and segregation report untouched; converting
+100.00 USD → INR at the static rate moved exactly 830000 minor units, no
+rounding; withdrawing from an empty currency wallet was rejected even
+with a large balance in a different currency (per-currency isolation);
+an unconfigured currency pair was rejected with a clear error.
+
+**Known limitations:** FX rate table is static/hardcoded, no live feed,
+no bid/ask spread; no real foreign-currency custody/settlement rail; no
+LRS limit tracking; non-native currency wallets are deliberately NOT
+included in `fundsegregation`'s CLIENT/FIRM classification — mixing
+foreign-currency minor units into the INR custody-pool sum would be
+numerically meaningless, so the segregation invariant only covers INR
+today.
+
+---
+
+## services/mutual-funds (Go) — new this build: AMC routing, SIP/lumpsum, step-up SIPs
+
+FEATURES.md §4. A brand-new Go service (module `mercurius/mutualFunds`,
+port :8087), following the same house style as every other Go service
+in this repo (long descriptive camelCase names, sentinel errors,
+mutex-guarded in-memory state, real HTTP handlers).
+
+### `internal/fundcatalog`
+
+A small static catalog of 5 illustrative mutual fund schemes
+(schemeId, name, category — EQUITY/DEBT/HYBRID — and a NAV that can be
+moved for testing). 6 tests.
+
+### `internal/amcrouting`
+
+Models routing a purchase/redemption order to an AMC/RTA as a real
+PENDING→CONFIRMED state machine — units are allocated as
+`amountInvested / navAtConfirmation` only once a (simulated) T+N
+confirmation sweep runs, not instantly at order time. **This is NOT a
+real AMC/RTA integration** — no BSE StAR MF / NSE NMF II / CAMS /
+KFintech API call happens anywhere; it's a state machine standing in for
+one, same honesty pattern as `kyc-onboarding`'s bank-verification
+placeholder. 11 tests.
+
+### `internal/sipscheduler`
+
+Register a SIP (account, scheme, amount, MONTHLY frequency, start
+date), pause/resume/cancel, and a `POST /sips/sweep-due` sweep (same
+"process-due" pattern as `ledger`'s `withdrawalworkflow`) that executes
+every installment whose due date has arrived by routing a purchase
+through `amcrouting`, then advances the next due date. Step-up SIPs: an
+optional annual step-up percentage increases the installment amount at
+each anniversary of the SIP's start date. Every scheduling function
+takes an explicit `now`/`asOf time.Time` parameter (not real-clock
+`time.Now()`), so time-dependent behavior — including the step-up
+boundary — is testable deterministically without sleeping. 19 tests.
+
+**Tested behavior:** happy-path purchase/redemption, pause/cancel
+semantics, sweep idempotency (sweeping twice before the next due date
+does nothing the second time), and a hand-worked step-up boundary case:
+a ₹5,000/month SIP with 10% step-up stayed at ₹5,000 for installments
+#1–#12 and became exactly ₹5,500 at installment #13 (the first
+anniversary).
+
+**Verified live** (`docs/BUILD_LOG.md` entry 49, real running process on
+:8087): a lumpsum purchase allocated exactly `amount / navAtConfirmation`
+units after a simulated confirmation sweep; a SIP's first due sweep
+executed and advanced its next due date, a repeat sweep at the same
+instant did nothing; pausing froze the schedule, resuming let exactly
+one installment execute (no backfilled catch-up); invalid inputs (zero
+amount, unknown scheme) were rejected with clear errors; the step-up
+boundary was demonstrated by driving `?asOf=` forward through 13
+installments without sleeping real time.
+
+### `cmd/server/main.go`
+
+`GET /health`, plus routes for registering/pausing/resuming/cancelling a
+SIP, listing SIPs for an account, sweeping due SIPs and due AMC orders,
+lumpsum purchase, redemption, and viewing per-account holdings/units.
+
+**Known limitations:** no real AMC/RTA integration anywhere; sweep
+endpoints are manually triggered, not scheduled; only MONTHLY frequency
+implemented; no KYC gating; **no ledger integration** — purchases don't
+debit any account and redemptions don't credit one, this service and
+`ledger` aren't wired together yet; no persistence, no auth; the
+`?asOf=` time-override is a testing convenience with no access control.
+
+### `internal/basketrebalancing`, `internal/roboadvisory`, `internal/goalinvesting` — new this build
+
+FEATURES.md §4: "Index/thematic rebalancing baskets", "Robo-Advisory:
+risk-profile → Efficient Frontier allocation", "Goal-based investing".
+
+**`basketrebalancing`**: named target-weight baskets across
+`fundcatalog` schemes (weights validated to sum to exactly 100%),
+lumpsum subscription routes proportional purchases through `amcrouting`,
+and a real one-click rebalance comparing current holding value per
+scheme against target weights to compute exact buy/sell orders. 18
+tests, hand-worked NAV-move example verified live: a BLUECHIP NAV move
+produced an exact SELL of 2500 (12.5 units) funding a BUY of 1500
+MIDCAP + 1000 LIQUID.
+
+**`roboadvisory`**: risk category (matching kyc-onboarding's categories)
+→ illustrative model allocation across EQUITY/DEBT/HYBRID, with a REAL
+call to quant-engine's live `/risk/statistics` endpoint surfacing real
+Sharpe/Sortino/max-drawdown alongside the recommendation — degrades
+cleanly when quant-engine is down. 15 tests. Verified live: killed
+quant-engine mid-request (clean degradation), restarted it and got real
+numbers back (Sharpe 0.7283, Sortino 1.3522).
+
+**`goalinvesting`**: named goals (RETIREMENT/EDUCATION) linked to SIPs/
+baskets, real progress tracking, and an on-track projection under an
+illustrative assumed growth rate. 19 tests. Hand-worked and live-
+verified exactly: 10000 current value, 12 months remaining, 1000/month
+contribution → projected value 23346, matched to the integer.
+
+**Known limitations:** Robo-Advisory's allocation table is explicitly
+illustrative, NOT a real mean-variance/Efficient Frontier optimization —
+this repo has no historical return/covariance data for the fictitious
+catalog schemes to optimize over; goal projection's assumed growth rate
+is illustrative, not a forecast, and doesn't vary by the goal's actual
+linked-scheme risk mix; no cross-referencing between goals/baskets and
+actual SIP records — a caller supplies linked scheme IDs by hand.
 
 ---
 
@@ -1028,6 +1546,88 @@ T=1y → 10.4506), the IV solver recovering σ≈0.2 from that same price, the
 400/422 error paths, and the CORS header — all via real `curl` requests,
 not just `pytest`.
 
+### `riskStatistics.py`, `arbitrageScanner.py`, `backtesting/` — new this build
+
+FEATURES.md §6: "Sharpe Ratio / Sortino Ratio / max drawdown" and
+"Arbitrage scanner"; §7: "Historical tick data store + backtest runner"
+and "Pairs trading template (z-score mean reversion)".
+`riskStatistics.py` computes annualized Sharpe ratio, annualized Sortino
+ratio (downside-deviation denominator), and max drawdown from an equity
+curve. `arbitrageScanner.py` compares a theoretical fair price against a
+live price and flags a deviation-threshold breach. `backtesting/`
+(new subpackage) has `tickStore.py` (in-memory per-symbol tick series),
+`backtestRunner.py` (a real event-driven backtest loop, deterministic —
+same input twice produces byte-identical output, tested), and
+`pairsTradingStrategy.py` (real z-score mean-reversion over a price
+spread, wired as a `backtestRunner` strategy callback). 45 new tests (65
+total for the service, up from 20).
+
+`POST /risk/statistics` and `POST /arbitrage/scan` are wired into the
+existing HTTP server; the backtest runner and pairs strategy are
+pytest-verified only, not yet HTTP-exposed (a documented time-budget
+tradeoff, not an oversight).
+
+**Verified live** (`docs/BUILD_LOG.md` entry 50): both new HTTP
+endpoints returned hand-worked values exactly (Sortino differed by 2e-15
+float noise); zero-variance and non-positive-price inputs correctly
+422'd; pre-existing `/options/price` re-verified unaffected.
+
+**Known limitations:** pairs strategy trades the spread as one synthetic
+instrument rather than sizing two real hedge-ratio legs; formulas are
+real math, not tuned against live market data. (Paper trading was
+subsequently built in `oms-gateway` — see its section above — and
+strategy deployment gates were subsequently built here, below.)
+
+### `garchVolatilityForecaster.py`, `correlationMatrixEngine.py`, `valueAtRiskCalculator.py`, `volatilitySurfaceBuilder.py`, `strategyLifecycle.py`, `marketMakingSandbox.py`, `illustrativeSentimentTradingHook.py` — new this build
+
+Seven FEATURES.md items (§6 remaining P3/P4, §7 remaining P3/P4).
+
+- **GARCH(1,1)**: a real recursion (`σ²_t = ω + α·ε²_{t-1} + β·σ²_{t-1}`),
+  fit via a documented simplified variance-targeting + grid-search
+  quasi-MLE (not a production optimizer), producing a next-period
+  volatility forecast and an Expected Intraday Range. 22 tests,
+  hand-worked recursion matched exactly.
+- **Correlation matrix**: real pairwise Pearson correlation +
+  configurable-threshold candidate-pairs filter for pairs-trading
+  discovery. 14 tests, hand-worked r=0.8315218406202999.
+- **VaR**: real historical (percentile) and real parametric
+  (mean/stddev + z-score, reusing the existing normal-CDF solver) VaR,
+  plus an illustrative-scenario stress test. 19 tests. **Bug found and
+  fixed**: the historical VaR percentile index landed one index low due
+  to float representation error — fixed with an epsilon.
+- **Volatility surface**: solves real IV per (strike, expiry) quote by
+  reusing the existing Black-Scholes IV solver, assembles a surface,
+  linear-interpolates across strikes. 11 tests, hand-worked
+  interpolation matched (strikes 90/100/110 → IVs 0.25/0.20/0.22, strike
+  95 → 0.225).
+- **Strategy lifecycle**: a real BACKTESTING→PAPER_TRADING→LIVE (or
+  REJECTED) promotion state machine, gated on real backtest-runner and
+  paper-trading-track-record results against configurable illustrative
+  bars. 17 tests.
+- **Market-making sandbox**: real two-sided quote tracking, simulated
+  taker fills, and a real inventory risk limit rejecting a quote update
+  that would breach the configured long/short limit. 15 tests, wired to
+  HTTP and verified live including the exact rejection message.
+- **Illustrative sentiment hook**: an explicitly-toy lexicon-based
+  sentiment scorer over fixture text, producing a structured BUY/SELL/
+  HOLD suggestion ONLY when a kill-switch flag is explicitly enabled
+  (default OFF) — never places a real order, never wired to any
+  order-submission path. 14 tests.
+
+GARCH, correlation, VaR, and market-making are wired into the real HTTP
+server and verified live via curl matching hand-worked values exactly;
+volatility surface, strategy lifecycle, and the sentiment hook are
+pytest-verified only (documented time-budget choice, not an oversight).
+Full suite: 186 tests total (up from 65), green throughout, re-verified
+after every one of the seven items.
+
+**Known limitations:** GARCH fit is a simplified quasi-MLE, not
+production-grade; VaR stress scenarios and strategy-lifecycle promotion
+gates are illustrative, not regulatory-calibrated; volatility surface
+interpolates only across strikes, not expiries; market-making sandbox is
+single-price-level; the sentiment hook never ingests real filings/
+earnings data and structurally cannot place a real order.
+
 ---
 
 ## apps/web (Next.js) — one page, now covering most of oms-gateway's surface plus a live price chart
@@ -1329,6 +1929,78 @@ real. What's consistently *not* real yet, across all of them:
   untriggered, a trade crossing it fired the alert for real. 15 new
   tests. No technical (moving-average/RSI) triggers, no push
   notification, no `apps/web` UI yet.
+- **Client fund segregation** (`ledger`'s `internal/fundsegregation`,
+  `docs/BUILD_LOG.md` entry 45): CLIENT/FIRM account classification plus
+  one real, checkable invariant — a custody-pool account's balance must
+  always equal the sum of every CLIENT account's balance. A dedicated
+  ring-fenced deposit/payout path and client-to-client transfer path
+  keep the invariant true by construction; a live compliance-facing
+  report and a dry-run entry validator make it checkable and
+  pre-checkable respectively. 13 tests, verified live including a real,
+  correctly-computed discrepancy surfaced when money was deliberately
+  moved through the pre-existing, unmigrated `/journal-entries` path —
+  proving the check catches genuine violations, not just always passing.
+  Only the new `/client-funds/*` endpoints are ring-fenced; trade
+  settlement and withdrawals still bypass the guard.
+- **AML transaction monitoring** (`ledger`'s `internal/amlmonitoring`,
+  `docs/BUILD_LOG.md` entry 46): real rule-based detection —
+  large-transaction, velocity, and structuring rules — plus a static
+  PEP name screen. `/client-funds/deposit` and `/withdrawals/request`
+  report every real transaction to it; `/aml/alerts` is the compliance
+  review queue. 15 tests, verified live including structuring firing on
+  exactly the transaction that crosses the threshold, not before, and
+  velocity firing on real repeated withdrawal requests against a running
+  service. Trade settlement (`/journal-entries`) isn't monitored yet;
+  thresholds are illustrative, not real regulatory limits; no
+  case-management lifecycle for a raised alert.
+- **§2/§3/§4/§6/§7/§8/§9 parallel build** (`docs/BUILD_LOG.md` entries
+  47–52): a simulated UPI/NEFT/IMPS deposit rail and eNACH-style SIP
+  payment mandates in `ledger`; a margin pledge system, SPAN/exposure
+  margin calculator, and Iceberg/FOK/IOC order-type acceptance in
+  `oms-gateway`; a brand-new `mutual-funds` service (AMC routing,
+  SIP/lumpsum, step-up SIPs); Sharpe/Sortino/max-drawdown, an arbitrage
+  scanner, a deterministic backtest runner, and a pairs-trading strategy
+  in `quant-engine`; a real WebSocket L1 quote feed with a
+  sequence-numbered snapshot/resync protocol in `market-data`; and a
+  real fsync'd write-ahead log with deterministic crash-replay in
+  `matching-engine`. All six built in parallel by independent agents
+  scoped to non-overlapping service directories, each with real tests
+  (182 new tests total across the six) and real live verification
+  against actually-running processes — see each service's own section
+  above and `docs/BUILD_LOG.md` for the full verification transcripts.
+  Every lane documents its own honest gaps (illustrative
+  rates/thresholds, no real bank/AMC/exchange network calls, several
+  cross-service wiring gaps like mutual-funds not yet debiting `ledger`)
+  rather than papering over them.
+- **§2/§3/§4/§6/§7/§8/§9 completion round** (`docs/BUILD_LOG.md` entries
+  53–58): every item remaining unchecked in these seven sections after
+  the round above was built, finishing them completely per explicit user
+  instruction. A multi-currency wallet in `ledger`; margin funding, a
+  synthetic-but-real-Greeks options chain, an illustrative (explicitly
+  NOT FIX-certified) DMA/FIX-style institutional gateway, paper trading
+  sharing the live OMS code path, and per-strategy circuit breakers in
+  `oms-gateway`; rebalancing baskets, robo-advisory (genuinely calling
+  quant-engine's live Sharpe/Sortino endpoint), and goal-based investing
+  in `mutual-funds`; GARCH, a correlation matrix engine, VaR +
+  stress-testing, a volatility surface builder, a strategy promotion
+  pipeline, a market-making sandbox, and an explicitly-toy sentiment
+  hook that structurally cannot place a real order, all in `quant-engine`;
+  a standalone deterministic simulated exchange feed, a columnar tick
+  store, and real UDP multicast in `market-data`; and a genuinely
+  lock-free SPSC ring buffer replacing the matching-engine's ingress/
+  egress synchronization, with every one of its `unsafe` blocks carrying
+  a written soundness argument. Six more independent agents, six more
+  non-overlapping service directories, 400+ further tests, real live
+  verification throughout (including two real concurrent-load passes
+  against the matching-engine and a real UDP multicast receive). Two
+  more real bugs caught and fixed along the way (a ledger debit/credit
+  sign error found via live verification, a float-epsilon VaR percentile
+  bug). Every item that fundamentally cannot be "complete" without
+  infrastructure this environment doesn't have — a certified FIX/
+  exchange connection, real co-located multicast consumers, real
+  historical-return covariance data for genuine Efficient Frontier
+  optimization, a real filings/NLP data feed — says so explicitly in its
+  own section rather than being quietly faked.
 - No service is backed by the real infrastructure in
   `infra/docker/docker-compose.yml` (Postgres, Redpanda, ClickHouse) —
   they all run fully in-memory today. (Not for lack of trying this round:

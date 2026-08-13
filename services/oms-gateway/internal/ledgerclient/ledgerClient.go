@@ -130,3 +130,108 @@ func (client *LedgerClient) PostTradeSettlementJournalEntry(
 
 	return nil
 }
+
+// PostMarginFundingDisbursementJournalEntry posts a real balanced journal
+// entry disbursing a margin-funding cash advance to an account: per
+// doubleEntryLedgerCore's convention ("debit increases the named
+// account"), the account is DEBITED (increased — mirrors how
+// PostTradeSettlementJournalEntry debits the selling account, the other
+// side that receives cash, above) by `amountInMinorUnits`, and the
+// margin-funding clearing account is CREDITED (decreased) by the same
+// amount — see internal/marginfunding's package doc for the full
+// FEATURES.md §2 context. This is genuinely REAL cash movement through
+// the same ledger every trade settles through, not a local bookkeeping
+// fiction.
+func (client *LedgerClient) PostMarginFundingDisbursementJournalEntry(
+	clientAccountIdentifier string,
+	amountInMinorUnits int64,
+	humanReadableDescription string,
+) error {
+	return client.postSingleAccountJournalEntry(clientAccountIdentifier, amountInMinorUnits, humanReadableDescription, true)
+}
+
+// PostMarginFundingRepaymentJournalEntry posts the reverse of
+// PostMarginFundingDisbursementJournalEntry: the account is CREDITED
+// (decreased) by `amountInMinorUnits` and the margin-funding clearing
+// account is DEBITED (increased) by the same amount, paying down real
+// principal. Not yet wired to an HTTP endpoint (see internal/
+// marginfunding's package doc gap §3) but exercised directly by this
+// package's own tests.
+func (client *LedgerClient) PostMarginFundingRepaymentJournalEntry(
+	clientAccountIdentifier string,
+	amountInMinorUnits int64,
+	humanReadableDescription string,
+) error {
+	return client.postSingleAccountJournalEntry(clientAccountIdentifier, amountInMinorUnits, humanReadableDescription, false)
+}
+
+// marginFundingClearingAccountIdentifier mirrors
+// marginfunding.FirmMarginFundingClearingAccountIdentifier — duplicated
+// as a plain string constant here (rather than importing internal/
+// marginfunding) to keep ledgerclient decoupled from that package, the
+// same decoupling convention every other internal package here follows.
+// See that constant's doc comment for the honest gap on why this reuses
+// firm-clearing-acct instead of a dedicated margin-funding account.
+const marginFundingClearingAccountIdentifier = "firm-clearing-acct"
+
+// postSingleAccountJournalEntry posts a balanced two-line journal entry
+// moving `amountInMinorUnits` between `clientAccountIdentifier` and
+// marginFundingClearingAccountIdentifier. Per doubleEntryLedgerCore's
+// uniform convention ("debit increases the named account, credit
+// decreases it" — see that package's PostJournalEntry comment): when
+// creditClientAccountFalseMeansDebit is true this is a DISBURSEMENT — the
+// client account is DEBITED (increased) and the clearing account
+// CREDITED (decreased), the exact same debit/credit assignment
+// PostTradeSettlementJournalEntry already uses for the account on the
+// receiving side of cash (there: the seller; here: the borrowing
+// client). When false, this is a REPAYMENT and the assignment reverses.
+func (client *LedgerClient) postSingleAccountJournalEntry(
+	clientAccountIdentifier string,
+	amountInMinorUnits int64,
+	humanReadableDescription string,
+	isDisbursementNotRepayment bool,
+) error {
+	wireRequest := PostJournalEntryWireRequest{
+		HumanReadableDescription: humanReadableDescription,
+	}
+	if isDisbursementNotRepayment {
+		wireRequest.DebitLines = []JournalEntryLineWireFormat{
+			{LedgerAccountIdentifier: clientAccountIdentifier, AmountInMinorUnits: amountInMinorUnits},
+		}
+		wireRequest.CreditLines = []JournalEntryLineWireFormat{
+			{LedgerAccountIdentifier: marginFundingClearingAccountIdentifier, AmountInMinorUnits: amountInMinorUnits},
+		}
+	} else {
+		wireRequest.DebitLines = []JournalEntryLineWireFormat{
+			{LedgerAccountIdentifier: marginFundingClearingAccountIdentifier, AmountInMinorUnits: amountInMinorUnits},
+		}
+		wireRequest.CreditLines = []JournalEntryLineWireFormat{
+			{LedgerAccountIdentifier: clientAccountIdentifier, AmountInMinorUnits: amountInMinorUnits},
+		}
+	}
+
+	requestBodyBytes, marshalError := json.Marshal(wireRequest)
+	if marshalError != nil {
+		return fmt.Errorf("failed to marshal journal entry: %w", marshalError)
+	}
+
+	httpResponse, requestError := client.httpClient.Post(
+		client.ledgerBaseUrl+"/journal-entries",
+		"application/json",
+		bytes.NewReader(requestBodyBytes),
+	)
+	if requestError != nil {
+		return fmt.Errorf("could not reach ledger at %s: %w", client.ledgerBaseUrl, requestError)
+	}
+	defer httpResponse.Body.Close()
+
+	var wireResponse PostJournalEntryWireResponse
+	if decodeError := json.NewDecoder(httpResponse.Body).Decode(&wireResponse); decodeError != nil {
+		return fmt.Errorf("malformed response from ledger: %w", decodeError)
+	}
+	if !wireResponse.WasJournalEntryPosted {
+		return fmt.Errorf("ledger rejected the journal entry: %s", wireResponse.ErrorMessage)
+	}
+
+	return nil
+}

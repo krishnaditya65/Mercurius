@@ -5,7 +5,16 @@
 // zero-copy decode — these `String`/`Vec` based types are fine for the
 // skeleton but must NOT survive into the allocation-free hot path.
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+use serde::{Deserialize, Serialize};
+
+/// `Serialize`/`Deserialize` here are for `writeAheadLog.rs` only — the
+/// cross-service wire contract (`wireProtocol.rs`) deliberately does NOT
+/// derive serde on these domain enums directly, converting through
+/// explicit boolean flags instead so the OMS-facing JSON shape stays
+/// decoupled from this crate's internal representation. The WAL is
+/// this crate's own private durability file, not a cross-service
+/// contract, so deriving directly here is the simpler, lower-risk choice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OrderSide {
     Buy,
     Sell,
@@ -18,7 +27,7 @@ pub enum OrderSide {
 /// crosses the order's trigger price — at which point they convert to a
 /// live `Limit`/`Market` order and enter normal matching, exactly like an
 /// order a client just submitted fresh.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OrderType {
     Limit,
     Market,
@@ -36,7 +45,11 @@ pub enum OrderType {
 /// already assigned a global sequence number upstream (see
 /// ARCHITECTURE.md §4 — sequencing happens at the OMS, not here — that's
 /// a separate, OMS-owned sequence space from `orderSequenceNumber` below).
-#[derive(Debug, Clone)]
+/// `PartialEq` is derived so tests (notably the WAL replay / deterministic
+/// replay harness) can assert two `IncomingOrderRequest`s — e.g. one
+/// still parked in `pendingStopOrders` on a live book vs. its counterpart
+/// on a WAL-replayed book — are exactly equal, field for field.
+#[derive(Debug, Clone, PartialEq)]
 pub struct IncomingOrderRequest {
     pub clientAccountId: String,
     pub orderSide: OrderSide,
@@ -68,7 +81,10 @@ pub struct IncomingOrderRequest {
 }
 
 /// An order resting on the book after partial or zero fill.
-#[derive(Debug, Clone)]
+///
+/// `PartialEq` is derived for the same testing reason as
+/// `IncomingOrderRequest` above.
+#[derive(Debug, Clone, PartialEq)]
 pub struct RestingLimitOrder {
     pub restingOrderSequenceNumber: u64,
     pub clientAccountId: String,

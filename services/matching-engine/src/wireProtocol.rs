@@ -1,17 +1,25 @@
 // The TCP JSON bridge between oms-gateway and matching-engine.
 //
 // TODO(real build): this is a pragmatic bridge to prove the service
-// boundary end-to-end — a synchronous TCP+JSON round-trip per order. It
-// is explicitly NOT the lock-free ring-buffer ingress with a zero-copy
-// binary (SBE) encoding described in ARCHITECTURE.md §3.1/§3.5. Replace
-// this before it is anywhere near a real hot path. Field names are
-// deliberately identical to oms-gateway's `orders.OrderSubmissionRequest`
-// JSON shape (see services/oms-gateway/internal/orders/orderTypes.go) so
-// the wire contract reads the same on both sides of the boundary.
+// boundary end-to-end — a synchronous TCP+JSON round-trip per order. The
+// types in this file describe the wire SHAPE only; what actually carries
+// requests/responses between the network thread and the matching-core
+// thread inside this process IS a real lock-free SPSC ring buffer now
+// (`src/lockFreeSpscRingBuffer.rs`, wired up in `main.rs` — see the
+// README's "Lock-free ring buffer ingress/egress" section). What's still
+// explicitly a placeholder here is the wire encoding itself: JSON, not the
+// zero-copy binary (SBE) encoding described in ARCHITECTURE.md §3.5, and
+// one connection per request rather than a persistent multiplexed
+// session. Field names are deliberately identical to oms-gateway's
+// `orders.OrderSubmissionRequest` JSON shape (see
+// services/oms-gateway/internal/orders/orderTypes.go) so the wire
+// contract reads the same on both sides of the boundary.
 
 use serde::{Deserialize, Serialize};
 
-use crate::orderTypes::{IncomingOrderRequest, OrderSide, OrderStatusQueryResult, OrderType, TradeExecutionEvent};
+use crate::orderTypes::{
+    IncomingOrderRequest, OrderSide, OrderStatusQueryResult, OrderType, TradeExecutionEvent,
+};
 
 #[derive(Debug, Deserialize)]
 pub struct IncomingOrderWireRequest {
@@ -272,10 +280,12 @@ impl OutgoingDepthPublishWireMessage {
             instrumentSymbol: instrumentSymbol.to_string(),
             deltas: depthSnapshot
                 .into_iter()
-                .map(|(isBidSide, priceInMinorUnits, newTotalQuantityAtPrice)| OutgoingPriceLevelDeltaWireUpdate {
-                    isBidSide,
-                    priceInMinorUnits,
-                    newTotalQuantityAtPrice,
+                .map(|(isBidSide, priceInMinorUnits, newTotalQuantityAtPrice)| {
+                    OutgoingPriceLevelDeltaWireUpdate {
+                        isBidSide,
+                        priceInMinorUnits,
+                        newTotalQuantityAtPrice,
+                    }
                 })
                 .collect(),
             tradeTicks: tradeExecutionEvents
@@ -359,7 +369,10 @@ mod tests {
 
         let parsed: IncomingOrderWireRequest =
             serde_json::from_str(jsonLine).expect("should parse even without the newer field");
-        assert_eq!(parsed.intoInternalOrderRequest().orderType, OrderType::Limit);
+        assert_eq!(
+            parsed.intoInternalOrderRequest().orderType,
+            OrderType::Limit
+        );
     }
 
     #[test]
@@ -474,25 +487,34 @@ mod tests {
     fn statusResponseEncodesEachQueryResultVariantCorrectly() {
         use crate::orderTypes::{OrderSide, OrderStatusQueryResult};
 
-        let restingResponse = OrderSubmissionWireResponse::statusResponse(OrderStatusQueryResult::RestingLimit {
-            orderSide: OrderSide::Buy,
-            limitPriceInMinorUnits: 100,
-            remainingQuantity: 3,
-        });
-        assert_eq!(restingResponse.orderStatus, Some("RESTING_LIMIT".to_string()));
+        let restingResponse =
+            OrderSubmissionWireResponse::statusResponse(OrderStatusQueryResult::RestingLimit {
+                orderSide: OrderSide::Buy,
+                limitPriceInMinorUnits: 100,
+                remainingQuantity: 3,
+            });
+        assert_eq!(
+            restingResponse.orderStatus,
+            Some("RESTING_LIMIT".to_string())
+        );
         assert_eq!(restingResponse.orderStatusSideIsBuyNotSell, Some(true));
         assert_eq!(restingResponse.orderStatusPriceInMinorUnits, Some(100));
         assert_eq!(restingResponse.orderStatusQuantity, Some(3));
 
-        let pendingResponse = OrderSubmissionWireResponse::statusResponse(OrderStatusQueryResult::PendingStop {
-            orderSide: OrderSide::Sell,
-            stopTriggerPriceInMinorUnits: 90,
-            orderQuantity: 5,
-        });
-        assert_eq!(pendingResponse.orderStatus, Some("PENDING_STOP".to_string()));
+        let pendingResponse =
+            OrderSubmissionWireResponse::statusResponse(OrderStatusQueryResult::PendingStop {
+                orderSide: OrderSide::Sell,
+                stopTriggerPriceInMinorUnits: 90,
+                orderQuantity: 5,
+            });
+        assert_eq!(
+            pendingResponse.orderStatus,
+            Some("PENDING_STOP".to_string())
+        );
         assert_eq!(pendingResponse.orderStatusSideIsBuyNotSell, Some(false));
 
-        let notFoundResponse = OrderSubmissionWireResponse::statusResponse(OrderStatusQueryResult::NotFound);
+        let notFoundResponse =
+            OrderSubmissionWireResponse::statusResponse(OrderStatusQueryResult::NotFound);
         assert_eq!(notFoundResponse.orderStatus, Some("NOT_FOUND".to_string()));
         assert_eq!(notFoundResponse.orderStatusQuantity, None);
     }
