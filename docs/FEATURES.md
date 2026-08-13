@@ -33,8 +33,10 @@ this order:
 - **Phase 4 — Institutional Grade:** Matching engine internals, DMA/FIX
   access, SOR, kernel-bypass networking, compliance surveillance tooling.
 
-Every feature below is tagged `[P0]`–`[P4]` accordingly. Build nothing
-tagged P2+ before its P0/P1 dependencies exist and are tested.
+Every feature below is tagged `[P0]`–`[P4]` accordingly, as a rough guide
+to typical build order — not a hard gate. A P2+ item can be picked up any
+time; if it has real P0/P1 dependencies that don't exist yet, build those
+alongside it in the same pass rather than treating the tag as a blocker.
 
 ---
 
@@ -93,7 +95,7 @@ onto an internal one later is expensive.
 
 - [ ] 🚧 `[P0]` Wallet/ledger core: double-entry accounting, idempotent transactions
 - [ ] `[P1]` UPI / NEFT / IMPS / net-banking deposit integration
-- [ ] `[P1]` Withdrawal workflow with T+N settlement holds
+- [ ] 🚧 `[P1]` Withdrawal workflow with T+N settlement holds
 - [ ] `[P1]` Auto-payment mandates for SIPs (eNACH/standing instructions)
 - [ ] `[P2]` Margin funding / instant margin against pledged collateral payout
 - [ ] `[P2]` Multi-currency wallet (for platforms offering global/US stocks)
@@ -208,7 +210,7 @@ onto an internal one later is expensive.
 ## 14. Customer Support & Ops Tooling
 
 - [ ] `[P1]` In-app support chat / ticketing integration
-- [ ] `[P1]` Admin/backoffice panel: KYC review queue, manual order intervention,
+- [ ] 🚧 `[P1]` Admin/backoffice panel: KYC review queue, manual order intervention,
       account freeze/unfreeze
 - [ ] `[P2]` Corporate actions processing: dividends, splits, bonuses, mergers
       reflected automatically in holdings and cost basis

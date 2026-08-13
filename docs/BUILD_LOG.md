@@ -1603,4 +1603,87 @@ pass-through from matching-engine's side, not verified as plain-language
 from oms-gateway's two files alone; a similar audit of matching-engine
 itself would be needed to close that out fully.
 
+## Entry 42 — kyc-onboarding: real KYC review queue + admin override
+
+FEATURES.md §14 (P1): "Admin/backoffice panel: KYC review queue, manual
+order intervention, account freeze/unfreeze." Account freeze/unfreeze
+was already real (early in the session). This closes the "KYC review
+queue" third: a real, additive capability that does NOT change the
+existing synchronous auto-verify path (avoiding regression risk to
+every already-verified flow this session built on top of it).
+
+- `internal/kycstate`: new `ListRecordsByStage(stage) []KycRecord` — the
+  actual review queue, sorted by account id, empty slice (not nil) for
+  no matches. New `OverrideStage(accountId, newStage, reason)` — the
+  admin decision a queue entry resolves to: force VERIFIED or REJECTED
+  (never back to NOT_SUBMITTED), clearing the rejection reason on an
+  override-to-VERIFIED, storing a new one on override-to-REJECTED.
+  Requires the account to have submitted at least once. 6 new tests (11
+  total, up from 5).
+- New routes: `GET /kyc/review-queue` (defaults to REJECTED — the
+  accounts actually worth a human looking at), `POST
+  /kyc/review-queue/override`.
+- Verified live: confirmed the normal auto-verify flow is completely
+  unaffected (a valid PAN still auto-verifies exactly as before); a
+  malformed PAN auto-rejects and immediately appears in the review
+  queue; overriding it to VERIFIED removes it from the queue and `GET
+  /kyc/status` reflects the override; overriding a never-submitted
+  account correctly fails.
+- Full verification: `gofmt`/`go vet`/`go build` clean, `go test -race
+  ./...` clean across all of kyc-onboarding.
+- **Known gaps, documented**: no auth on the override endpoint — anyone
+  who can reach it can flip any account's trading eligibility. No audit
+  trail entry for the override action itself (unlike oms-gateway's
+  `audittrail` package) — a real build needs one for compliance.
+
+## Entry 43 — ledger: real withdrawal workflow with T+N settlement holds
+
+FEATURES.md §2 (P1): "Withdrawal workflow with T+N settlement holds."
+
+- New `internal/withdrawalworkflow`: shares the SAME `doubleentry`
+  ledger book the rest of the service uses. `RequestWithdrawal` places a
+  HOLD (checked against `AvailableBalanceInMinorUnits` — raw balance
+  minus every currently-pending hold, so holds correctly stack and can't
+  double-spend each other) without touching the raw ledger balance yet.
+  `ProcessDueWithdrawals` sweeps every hold whose settlement period has
+  elapsed and posts a REAL, balanced journal entry through the same core
+  every other mutation uses — money genuinely leaves the account at that
+  point, not a status-field flip. `CancelWithdrawal` releases a still-
+  pending hold. 13 tests, including the actual load-bearing assertion
+  (the account's ledger balance genuinely drops and the clearing account
+  genuinely receives it once `ProcessDueWithdrawals` runs, not before).
+- New routes: `POST /withdrawals/request`, `POST /withdrawals/cancel`,
+  `GET /withdrawals?accountId=...`, `POST /withdrawals/process-due`.
+  `GET /accounts/balance` now returns both `currentBalanceInMinorUnits`
+  (raw) and `availableBalanceInMinorUnits` (raw minus pending holds) —
+  genuinely different numbers once any hold exists. New
+  `WITHDRAWAL_SETTLEMENT_HOLD_DAYS` env var (default 2, T+2) for
+  overriding the hold duration — set to 0 for live testing without
+  waiting real days.
+- Verified live end-to-end against a real running process
+  (`WITHDRAWAL_SETTLEMENT_HOLD_DAYS=0`): funded an account, requested a
+  withdrawal (available balance dropped by the hold amount, raw balance
+  untouched), confirmed a second request exceeding what was left was
+  correctly rejected (proving holds stack), ran `process-due` and
+  confirmed the raw balance ACTUALLY dropped this time (matching
+  available), then separately requested and cancelled another
+  withdrawal and confirmed the balance was fully restored.
+- Full verification: `gofmt`/`go vet`/`go build` clean, `go test -race
+  ./...` clean across all of ledger including the new package.
+- **Known gaps, documented loudly**: payout is a ledger-internal journal
+  entry, not a real bank transfer — no real payment rail anywhere in
+  this repo (same category of gap as kyc-onboarding's bank-verification
+  penny-drop). `POST /withdrawals/process-due` is externally triggered,
+  not run on a real scheduled job. In-memory only. No auth.
+
+## Entry 44 — housekeeping: eliminated the strict phase-gating rule in FEATURES.md
+
+Per explicit user instruction: FEATURES.md's phasing note previously
+read "Build nothing tagged P2+ before its P0/P1 dependencies exist and
+are tested" — a hard gate. Changed to make the `[P0]`–`[P4]` tags a
+rough sequencing guide, not a blocker: a P2+ item can be picked up any
+time, building any missing P0/P1 dependencies alongside it in the same
+pass rather than treating the tag as something that must be fully
+satisfied first. No code changes — a single doc-policy edit.
+
 <!-- Append new entries below this line as work continues. -->

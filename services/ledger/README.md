@@ -2,7 +2,7 @@
 
 Tier 2 component — see `ARCHITECTURE.md` §6 in the repo root.
 
-## Status: the accounting core is real, and it's now actually reachable end-to-end
+## Status: the accounting core is real, reachable end-to-end, and now has a real withdrawal workflow
 
 What's real:
 - Genuine double-entry bookkeeping (`internal/doubleentry`): every journal
@@ -22,6 +22,30 @@ What's real:
   `slog.SetDefault` upgrades every pre-existing `log.Printf` line (e.g.
   "journal entry rejected") to structured JSON too, for free. Stdout only
   — not yet shipped to a real log aggregation backend.
+- **Withdrawal workflow with T+N settlement holds**
+  (`internal/withdrawalworkflow`, FEATURES.md §2): `POST
+  /withdrawals/request` places a HOLD (not an immediate transfer) —
+  reduces the account's *available* balance without touching the raw
+  ledger balance, rejects if it would exceed what's actually available
+  (holds stack — a second request can't double-spend an amount an
+  earlier one already reserved). `POST /withdrawals/process-due` sweeps
+  every hold whose settlement period has elapsed and posts a REAL,
+  balanced journal entry through the exact same `doubleentry` core
+  everything else uses — money genuinely leaves the account at that
+  point, not just a status-field flip. `POST /withdrawals/cancel`
+  releases a still-pending hold. `GET /withdrawals?accountId=...` for
+  history, `GET /accounts/balance` now returns both
+  `currentBalanceInMinorUnits` (raw) and `availableBalanceInMinorUnits`
+  (raw minus pending holds) since they're genuinely different numbers
+  once any hold exists. 13 tests. Verified live end-to-end: funded an
+  account, requested a withdrawal (available balance dropped, raw
+  balance didn't), confirmed a second request exceeding what was left
+  was rejected, processed due withdrawals (raw balance actually dropped
+  this time, matching available), then separately requested and
+  cancelled another withdrawal and confirmed the balance was fully
+  restored. `WITHDRAWAL_SETTLEMENT_HOLD_DAYS` env var (default 2)
+  overridable for testing without waiting real days — set to 0 in the
+  live-verification run above.
 
 What's a placeholder:
 - In-memory only — no PostgreSQL persistence yet
@@ -33,11 +57,19 @@ What's a placeholder:
   uses one uniform debit/credit convention for the skeleton
 - No reconciliation/retry job if a settlement post fails — currently just
   logged loudly by oms-gateway (`SETTLEMENT FAILED`)
+- Withdrawal payout is still a ledger-internal journal entry, not a real
+  bank transfer — there's no real payment rail anywhere in this repo
+  (same category of gap as kyc-onboarding's bank-verification penny-drop)
+- `POST /withdrawals/process-due` is manually/externally triggered, not
+  run on a real scheduled job
+- No auth on any endpoint — anyone who can reach `/withdrawals/*` can
+  request or cancel a withdrawal for any account
 
 ## Run it
 
 ```bash
 go run ./cmd/server
+# WITHDRAWAL_SETTLEMENT_HOLD_DAYS (default 2) is overridable
 
 # fund an account (debit the account, credit the clearing account)
 curl -X POST localhost:8082/journal-entries -d '{
@@ -47,6 +79,23 @@ curl -X POST localhost:8082/journal-entries -d '{
 }'
 
 curl "localhost:8082/accounts/balance?accountId=acct-001"
+# -> {"currentBalanceInMinorUnits": 1000000, "availableBalanceInMinorUnits": 1000000}
 
-go test ./...
+# request a withdrawal — places a hold, doesn't move money yet
+curl -X POST localhost:8082/withdrawals/request -d '{
+  "accountIdentifier": "acct-001",
+  "amountInMinorUnits": 400000
+}'
+curl "localhost:8082/accounts/balance?accountId=acct-001"
+# -> availableBalanceInMinorUnits drops by 400000, currentBalanceInMinorUnits unchanged
+
+# once the settlement hold period elapses (or immediately, if
+# WITHDRAWAL_SETTLEMENT_HOLD_DAYS=0), sweep and actually pay out
+curl -X POST localhost:8082/withdrawals/process-due
+curl "localhost:8082/accounts/balance?accountId=acct-001"
+# -> currentBalanceInMinorUnits has now genuinely dropped too
+
+curl "localhost:8082/withdrawals?accountId=acct-001"
+
+go test ./... -race
 ```

@@ -567,20 +567,66 @@ touched; an entry referencing an unknown account is rejected.
 client-fund segregation at the account-structure level (FEATURES.md §1),
 no chart-of-accounts semantics.
 
+### `internal/withdrawalworkflow/withdrawalWorkflow.go` — new this build
+
+Real withdrawal workflow with T+N settlement holds (FEATURES.md §2).
+Shares the SAME `doubleentry` ledger book the rest of this service uses
+— a completed withdrawal is a real, balanced journal entry, not a
+separate bookkeeping system.
+
+| Item | Purpose |
+|---|---|
+| `WithdrawalStatus` | `PENDING_HOLD` / `COMPLETED` / `CANCELLED`. |
+| `AvailableBalanceInMinorUnits(accountId) -> (int64, error)` | Raw ledger balance MINUS every currently-`PENDING_HOLD` amount for that account — what a client should actually be allowed to withdraw or trade against. |
+| `RequestWithdrawal(accountId, amount, now) -> (*WithdrawalRequest, error)` | Places a hold (`EligibleForPayoutAt = now + settlementHoldDuration`) if `amount` doesn't exceed the AVAILABLE (not raw) balance — holds stack, so a second request is checked against what's left after the first, not the full ledger balance. |
+| `ProcessDueWithdrawals(now) -> (completed, failedIds)` | Sweeps every `PENDING_HOLD` request whose hold has elapsed and posts a REAL journal entry (credits the account, debits the firm withdrawal clearing account) — money genuinely leaves the ledger balance here, not just a status flip. A post failure leaves the request `PENDING_HOLD` and is reported, not silently dropped. |
+| `CancelWithdrawal(withdrawalId) -> (*WithdrawalRequest, error)` | Only valid while `PENDING_HOLD` — releases the hold, restoring the available balance. |
+| `RequestsForAccount` / `LookupRequest` | Read-only history/status. |
+
+**Tested behavior** (13 tests): available balance equals raw balance
+with no holds; a request reduces available but NOT raw balance; a
+request exceeding available balance is rejected; a second request
+can't double-spend what an earlier one already holds (proves holds
+stack, aren't independently checked against the full balance); non-
+positive amounts rejected; `ProcessDueWithdrawals` does nothing before
+the hold elapses; **after** it elapses, the money genuinely moves — the
+account's ledger balance actually drops and the clearing account
+actually receives it (the core load-bearing assertion of the whole
+feature); cancellation releases the hold and restores available
+balance; cancelling an already-completed or unknown withdrawal fails;
+requests list in requested order.
+
+**Known limitations:** payout is a ledger-internal journal entry, not a
+real bank transfer (no real payment rail anywhere in this repo, same
+category of gap as kyc-onboarding's bank-verification penny-drop).
+`ProcessDueWithdrawals` is externally triggered (an endpoint), not run
+on a real scheduled job. In-memory only. No auth.
+
 ### `cmd/server/main.go`
 
 | Route | Behavior |
 |---|---|
 | `GET /health` | Liveness check. |
-| `GET /accounts/balance?accountId=...` | Returns the current balance for an account, 404 if unknown. |
-| `POST /journal-entries` | **New this build.** Decodes `PostJournalEntryWireRequest` (own wire type, deliberately decoupled from `doubleentry.JournalEntry` which has no JSON tags), converts to the internal domain type, calls `PostJournalEntry`. Returns `422 Unprocessable Entity` with `errorMessage` set on rejection (unbalanced entry or unknown account), `200` with `wasJournalEntryPosted:true` on success. This is what `oms-gateway` posts trade settlements to — see its `internal/ledgerclient`. |
+| `GET /accounts/balance?accountId=...` | Returns the current balance for an account, 404 if unknown. Now ALSO returns `availableBalanceInMinorUnits` alongside the raw `currentBalanceInMinorUnits` — genuinely different numbers once any withdrawal hold exists. |
+| `POST /journal-entries` | Decodes `PostJournalEntryWireRequest` (own wire type, deliberately decoupled from `doubleentry.JournalEntry` which has no JSON tags), converts to the internal domain type, calls `PostJournalEntry`. Returns `422 Unprocessable Entity` with `errorMessage` set on rejection (unbalanced entry or unknown account), `200` with `wasJournalEntryPosted:true` on success. This is what `oms-gateway` posts trade settlements to — see its `internal/ledgerclient`. |
+| `POST /withdrawals/request` | `{accountIdentifier, amountInMinorUnits}` → the new `WithdrawalRequest` (`PENDING_HOLD`) or a 400 with the validation error. |
+| `POST /withdrawals/cancel` | `{withdrawalId}` → the now-`CANCELLED` request or a 400. |
+| `GET /withdrawals?accountId=...` | Full history for an account, any status. |
+| `POST /withdrawals/process-due` | Sweeps and actually pays out every elapsed hold — `{completedWithdrawalIds, failedWithdrawalIds}`. |
 
 Seed accounts are `acct-001`, `acct-002`, `firm-clearing-acct` —
 deliberately matching `oms-gateway`'s demo accounts so the two services
-exercise together without extra setup. **Verified end-to-end**
-(`docs/BUILD_LOG.md` entry 15): funded via `POST /journal-entries`,
+exercise together without extra setup. `WITHDRAWAL_SETTLEMENT_HOLD_DAYS`
+env var (default 2) overrides the settlement hold duration — set to 0 for
+live testing without waiting real days. **Verified end-to-end**
+(`docs/BUILD_LOG.md` entries 15, 42): funded via `POST /journal-entries`,
 balances moved correctly after a real trade routed through all three of
-ledger/matching-engine/oms-gateway.
+ledger/matching-engine/oms-gateway; separately, a full withdrawal
+lifecycle verified live with a real running process — request (available
+balance dropped, raw balance didn't) → a second over-limit request
+correctly rejected → `process-due` (raw balance ACTUALLY dropped this
+time) → a separate request-then-cancel round trip fully restored the
+balance.
 
 ---
 
@@ -591,13 +637,34 @@ ledger/matching-engine/oms-gateway.
 | Item | Purpose |
 |---|---|
 | `KycVerificationStage` | `NOT_SUBMITTED` / `VERIFIED` / `REJECTED`. |
-| `SubmitKycDetails(accountId, panNumber, fullName) KycRecord` | Validates full name is non-empty and PAN matches `^[A-Z]{5}[0-9]{4}[A-Z]$`; marks `VERIFIED` or `REJECTED` with a reason, stores the record. No async review step — see doc comment. |
+| `SubmitKycDetails(accountId, panNumber, fullName) KycRecord` | Validates full name is non-empty and PAN matches `^[A-Z]{5}[0-9]{4}[A-Z]$`; marks `VERIFIED` or `REJECTED` with a reason, stores the record. No async review step in the AUTOMATED path — see doc comment. |
 | `LookupKycStatus(accountId) KycRecord` | Returns the stored record, or a `NOT_SUBMITTED` placeholder if the account never submitted. |
 | `KycRecord.IsEligibleToPlaceOrders() bool` | `true` iff stage is `VERIFIED`. |
+| `ListRecordsByStage(stage) []KycRecord` — new this build | The actual "KYC review queue" (FEATURES.md §14): every record currently in `stage`, sorted by account id. `GET /kyc/review-queue` defaults to `StageRejected` — the accounts actually worth a human looking at. |
+| `OverrideStage(accountId, newStage, reason) (KycRecord, error)` — new this build | The admin DECISION a review-queue entry resolves to: force an account to `VERIFIED` or `REJECTED` (never back to `NOT_SUBMITTED`), overturning or retroactively reversing the automated result. Requires the account to have submitted at least once. |
 
-**Tested behavior** (5 tests): valid PAN → verified + eligible; malformed
-PAN → rejected with a reason; missing name → rejected; unknown account
-lookup → `NOT_SUBMITTED`; lookup after submit round-trips the stored data.
+**Tested behavior** (11 tests, up from 5): valid PAN → verified +
+eligible; malformed PAN → rejected with a reason; missing name →
+rejected; unknown account lookup → `NOT_SUBMITTED`; lookup after submit
+round-trips the stored data; `ListRecordsByStage` returns only matching
+records sorted by account id (and an empty slice, not nil, for no
+matches — correct `[]` not `null` JSON); `OverrideStage` can overturn an
+automated rejection (clearing the rejection reason) AND retroactively
+reject a previously-verified account (storing the override reason);
+overriding an account that never submitted, or overriding to an invalid
+target stage (`NOT_SUBMITTED`), both fail with distinct sentinel errors.
+
+**Verified live** (`docs/BUILD_LOG.md` entry 39.5 — see below): the
+normal auto-verify flow is completely unaffected by this addition (a
+valid PAN still auto-verifies); a malformed PAN auto-rejects and
+immediately shows up in `GET /kyc/review-queue`; overriding it to
+`VERIFIED` removes it from the queue and `GET /kyc/status` reflects the
+override; overriding an account that never submitted correctly fails.
+
+**Known limitation:** no auth on the override endpoint — anyone who can
+reach it can flip any account's trading eligibility. No audit trail
+entry recorded for the override action itself (unlike oms-gateway's
+`audittrail` package) — a real build needs one for compliance.
 
 ### `internal/bankverification/bankAccountVerifier.go` — new this build
 
@@ -658,6 +725,8 @@ accounts have independent profiles; the questionnaire shape itself
 | `GET /risk-profile/questionnaire` | Serves the static `StandardQuestionnaire` — no account context needed. |
 | `POST /risk-profile/submit` | Decodes account id + answers, calls `SubmitAnswers`, returns the scored profile or a 400 with the validation error. |
 | `GET /risk-profile?accountId=...` | Calls `LookupProfile`; 404 if never submitted. |
+| `GET /kyc/review-queue` (optionally `?stage=...`) | Calls `ListRecordsByStage`, defaulting to `StageRejected`. |
+| `POST /kyc/review-queue/override` | `{accountIdentifier, newStage, overrideReason?}` → the updated record or a 400 with the validation error. |
 
 **Verified end-to-end** (`docs/BUILD_LOG.md` entries 16, 34, 39): `oms-gateway`
 genuinely rejects orders for un-KYC'd accounts and accepts them once
@@ -1230,6 +1299,18 @@ real. What's consistently *not* real yet, across all of them:
   the client-facing response — fixed, verified live. The transport-
   failure cancel path also now returns a genuinely plain-language
   message instead of a raw wrapped Go error.
+- **Withdrawal workflow with T+N settlement holds** (`ledger`'s
+  `internal/withdrawalworkflow`, `docs/BUILD_LOG.md` entry 42): real
+  holds that reduce available balance without touching the raw ledger
+  balance, holds that correctly stack against each other (no double-
+  spend), and a real payout sweep that posts an actual balanced journal
+  entry through the shared `doubleentry` core once a hold's settlement
+  period elapses — money genuinely leaves the account, not a status
+  flip. 13 tests, verified live end-to-end including the full request →
+  reject-when-over-limit → process-due → cancel round trip against a
+  real running service. No real payment rail behind the payout (same
+  category of gap as bank-verification's penny-drop); the sweep is
+  externally triggered, not on a real schedule.
 - **Bank account verification — penny-drop / micro-deposit**
   (`kyc-onboarding`'s `internal/bankverification`, `docs/BUILD_LOG.md`
   entry 34): real random micro-deposit amount, real 3-attempt limit with
