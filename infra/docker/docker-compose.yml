@@ -1,0 +1,57 @@
+# Local dev infra only. Not representative of production topology —
+# see ARCHITECTURE.md §7 (Deployment Topology) for that. In particular:
+# the matching engine never runs against this compose file's Redpanda
+# in a latency-sensitive way; this is for Tier 1/2 development only.
+
+services:
+  # Ledger / user state — see ARCHITECTURE.md §6
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: trading
+      POSTGRES_PASSWORD: trading
+      POSTGRES_DB: ledger
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./volumes/postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U trading"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # Event backbone (Tier 1→2): market data + trade events fan-out
+  redpanda:
+    image: redpandadata/redpanda:latest
+    command:
+      - redpanda start
+      - --smp 1
+      - --memory 512M
+      - --overprovisioned
+      - --node-id 0
+      - --check=false
+      - --kafka-addr PLAINTEXT://0.0.0.0:9092
+      - --advertise-kafka-addr PLAINTEXT://localhost:9092
+    ports:
+      - "9092:9092"
+      - "9644:9644" # admin API
+    volumes:
+      - ./volumes/redpanda:/var/lib/redpanda/data
+
+  # Tick data / OHLCV storage — see ARCHITECTURE.md §6
+  clickhouse:
+    image: clickhouse/clickhouse-server:latest
+    ports:
+      - "8123:8123" # HTTP
+      - "9000:9000" # native
+    environment:
+      CLICKHOUSE_USER: trading
+      CLICKHOUSE_PASSWORD: trading
+      CLICKHOUSE_DB: ticks
+    volumes:
+      - ./volumes/clickhouse:/var/lib/clickhouse
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144

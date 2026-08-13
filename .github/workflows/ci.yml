@@ -1,0 +1,138 @@
+# CI for Mercurius. One job per service, deliberately not one giant
+# matrix job — a break in matching-engine's Rust build should never block
+# feedback on an unrelated ledger Go test failure. See
+# infra/ci/README.md for why this file lives here and not in infra/ci/
+# directly (GitHub only executes workflows from this exact path).
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  matching-engine:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: services/matching-engine
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --verbose
+      - run: cargo test --verbose
+
+  market-data:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: services/market-data
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --verbose
+      - run: cargo test --verbose
+
+  oms-gateway:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: services/oms-gateway
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+      - run: gofmt -l . | tee /dev/stderr | (! read -r)
+      - run: go vet ./...
+      - run: go build ./...
+      - run: go test ./...
+
+  ledger:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: services/ledger
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+      - run: gofmt -l . | tee /dev/stderr | (! read -r)
+      - run: go vet ./...
+      - run: go build ./...
+      - run: go test ./...
+
+  kyc-onboarding:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: services/kyc-onboarding
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+      - run: gofmt -l . | tee /dev/stderr | (! read -r)
+      - run: go vet ./...
+      - run: go build ./...
+      - run: go test ./...
+
+  backoffice:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: services/backoffice
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+      - run: gofmt -l . | tee /dev/stderr | (! read -r)
+      - run: go vet ./...
+      - run: go build ./...
+      - run: go test ./...
+
+  auth:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: services/auth
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+      - run: gofmt -l . | tee /dev/stderr | (! read -r)
+      - run: go vet ./...
+      - run: go build ./...
+      - run: go test ./... -race
+
+  quant-engine:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: services/quant-engine
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e ".[dev]"
+      - run: pytest -q
+
+  web:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: apps/web/package-lock.json
+      - run: npm ci
+      - run: npx tsc --noEmit
+      - run: npm run build
