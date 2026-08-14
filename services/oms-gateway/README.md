@@ -1949,3 +1949,174 @@ curl -X POST localhost:8081/corporate-actions/process -d '{
 }'
 curl "localhost:8081/corporate-actions/processed-actions?accountId=acct-001"
 ```
+
+## Real FEATURES.md §1 trade surveillance — spoofing/layering/wash-trade detection (`internal/tradesurveillance`)
+
+A real pattern-detection engine over `internal/audittrail`'s existing
+immutable order/fill/cancellation log, plus a compliance-officer query
+endpoint and minimal replay tooling. **HONEST STATUS**: the spoofing and
+layering detectors are documented heuristic PROXIES for the real
+regulatory definitions (Dodd-Frank/CFTC, SEC 10b-5, SEBI PFUTP) — not a
+certified market-surveillance product, and every flag is a lead for a
+human compliance officer to investigate, never an automated finding (a
+real spoofing/layering finding additionally requires proving intent,
+which no automated system can do from order data alone). The wash-trade
+check is the one exception: it's exact, not heuristic — same account,
+both sides of one trade, no threshold involved.
+
+To make this possible, `audittrail.Entry` gained new **additive**
+(all `omitempty`) fields — `OrderSideIsBuyNotSell`, `OrderQuantity`,
+`LimitPriceInMinorUnits`, `OrderIsMarketOrderNotLimit`,
+`BuyingClientAccountIdentifier`, `SellingClientAccountIdentifier`,
+`ExecutedPriceInMinorUnits`, `ExecutedQuantity` — and a new event type,
+`EventOrderRoutedToMatchingEngine`, appended once a live (non-paper)
+order is actually assigned a matching-engine sequence number. That new
+event exists solely as a join key: `POST /orders/cancel`'s request has
+no `ClientAccountIdentifier` at all, so a later `ORDER_CANCELLED` entry
+can only be attributed back to the account/order-shape that placed it by
+matching `MatchingEngineOrderSequenceNumber` against this earlier entry.
+No pre-existing audit entry's shape changed — every new field is
+additive and every pre-existing caller/entry is unaffected.
+
+**Real bug found and fixed while wiring this up end-to-end against a
+live matching-engine** (not just unit tests): `audittrail.EventOrderCancelled`
+entries carry no `ClientAccountIdentifier`, so a naive
+`EntriesForAccount(accountId)` filter silently drops every cancellation
+— which would make the spoofing/layering detectors permanently blind to
+the exact pattern they exist to catch. Fixed with
+`tradesurveillance.ScopeEntriesToAccount`, which does the correct join
+(via the new routed-order entries) instead; `GET /compliance/surveillance`
+now passes `AllEntries()`, not `EntriesForAccount(...)`. A regression
+test (`TestScopeEntriesToAccount_IncludesCancellationsThatCarryNoAccountField`)
+covers it.
+
+Detectors, all in `internal/tradesurveillance`:
+
+- **Spoofing** (`DetectSpoofing`): flags a LIMIT order when it's large
+  (`>=` a configurable quantity threshold), was cancelled within a
+  configurable "shortly after" window of being routed, AND was "never at
+  material risk of execution" — either priced away from the touch
+  (approximated using the account's OWN most recent fill price in that
+  instrument as a reference — oms-gateway has no real top-of-book feed,
+  a documented gap) or cancelled faster than a configurable
+  human/algo-implausible latency. A same-side smaller follow-up fill or
+  opposite-side fill shortly after cancellation is recorded as
+  corroborating evidence but never required to trigger the flag.
+- **Layering** (`DetectLayering`): flags a cluster of `>=` a configurable
+  count of same-side LIMIT orders at distinct successive price levels,
+  placed within a configurable window, followed by a fill on the
+  OPPOSITE side, followed by cancellation of most/all of the cluster
+  within a configurable window after that fill.
+- **Wash trades** (`DetectWashTrades`): exact — any `ORDER_FILLED` entry
+  where the buying and selling account are the same, non-empty account.
+  Scoped to same-account only; there's no linked-accounts/beneficial-
+  ownership concept anywhere in this codebase to extend it across two
+  different accounts.
+- **Replay** (`ReplayOrderSequenceNumber(s)`): reconstructs the exact
+  chronological audit-trail sequence for a flagged order (or a whole
+  layering cluster). No existing "tick-to-trade" concept exists anywhere
+  in oms-gateway/matching-engine/quant-engine to wire into (a repo-wide
+  search for `tickToTrade`/`latency` turns up only `internal/metrics`'
+  generic HTTP-handler latency histograms — unrelated) — stated in the
+  package doc rather than faked. Real tick-to-trade LATENCY correlation
+  would need matching-engine-side instrumentation this pass doesn't add.
+
+18 tests in `internal/tradesurveillance`, including explicit
+trigger AND false-positive-avoidance cases for every detector (e.g. a
+market order, a small order, an order that genuinely rests, or a layer
+that's never cancelled — none of these are flagged).
+
+Endpoint:
+
+```
+GET /compliance/surveillance?accountId=...&windowStartTime=RFC3339&windowEndTime=RFC3339
+```
+
+`accountId` is required. `windowStartTime`/`windowEndTime` are optional
+(default: everything). Returns a `tradesurveillance.SurveillanceReport`
+— genuinely computed from real audit-trail entries every call, never
+canned.
+
+**Verified live** against a real running `oms-gateway` + `matching-engine`
++ `ledger` + `kyc-onboarding` + `backoffice`: funded and KYC-verified
+`acct-001`/`acct-002`, had `acct-001` cross a resting `acct-002` sell
+order to set a real reference price, then had `acct-001` place a
+1000-share `DEMO-EQ` limit buy at less than half that reference price
+and cancel it ~51ms later. `GET /compliance/surveillance?accountId=acct-001`
+genuinely flagged it (`wasAwayFromTouch: true`, `wasFasterThanTypicalFillLatency: true`,
+with the real order/cancel audit entries as `replayEvents`) — and, as an
+unstaged side effect of the pre-existing matching-engine order-book state
+(a WAL-recovered book), the SAME live run also caught a genuine
+same-account wash trade in `washTradeIncidents`, computed from a real
+fill, not constructed for the demo.
+
+## Real FEATURES.md §21 conversational order placement — text/chat only (`internal/conversationalorderparser`)
+
+FEATURES.md's "conversational order placement (chat/voice)". **HONEST,
+LOUD SCOPE BOUNDARY**: "voice" is NOT built. This sandboxed environment
+has no audio input pipeline and no network access to a speech-to-text
+API — there's nothing real to build for that half, and faking it (a
+canned transcript) would be worse than not building it. Only the
+text/chat half is real here: a rule-based grammar/slot-extraction parser
+(tokenize -> side -> quantity -> instrument -> order-type clause), not a
+lookup table of exact phrases, and it never calls any external LLM API
+(none is available/authorized in this environment).
+
+`conversationalorderparser.ParseConversationalOrderCommand` NEVER submits
+an order. It returns a `ParsedOrderIntent` (instrument, side, quantity,
+order type, price if applicable) plus a human-readable
+`ConfirmationSummary` string — nothing else. Ambiguous/incomplete input
+(missing side, missing quantity, missing instrument, a limit with no
+price, both "buy" and "sell", both "market" and "limit") is REJECTED with
+a specific sentinel error explaining exactly what's wrong — never
+guessed. 14 tests cover several real successful phrasings ("buy 10 shares
+of RELIANCE at market", "sell 5 TCS at limit 3500", "buy 2 lots of NIFTY
+22000 CE" -- which also proves the parser handles an options instrument
+with a strike price and a CE/PE suffix, defaulting to a market order
+since no order-type clause is present) and every rejected-ambiguous case
+explicitly, asserting the exact sentinel error each time.
+
+A lot-based quantity ("N lots of X") is honestly flagged
+(`IsLotBasedQuantity`) rather than silently treated as shares — this repo
+has no instrument-master/contract-lot-size reference data anywhere to
+convert a lot count into a real share-equivalent quantity, so
+`OrderQuantity` for a lot-based command is the LOT COUNT AS STATED, and
+`ConfirmationSummary` says so explicitly.
+
+Turning a parsed intent into a submitted order requires a SEPARATE,
+explicit call — never automatic, per FEATURES.md's "explicit confirmation
+step before submission, never silently trade on ambiguous input":
+
+```
+POST /conversational-order/parse
+  {"commandText": "buy 10 shares of RELIANCE at market", "clientAccountIdentifier": "acct-001"}
+  -> {"parsedIntent": {...}, "orderSubmissionRequest": {...}}    # nothing submitted yet
+  -> 422 with a specific error message if ambiguous/incomplete
+
+POST /conversational-order/confirm-and-submit
+  {"explicitConfirmation": true, "orderSubmissionRequest": {...}}
+  -> processOrderSubmission — the EXACT SAME function backing POST /orders/submit
+  -> 400 if explicitConfirmation is not true (defense-in-depth: this endpoint
+     refuses to submit even if a client calls it automatically right after parsing)
+```
+
+There is no bespoke, gate-skipping "conversational" submission path —
+`confirm-and-submit` hands the built `orders.OrderSubmissionRequest`
+straight to `processOrderSubmission`, so every KYC/freeze/pledge/risk/
+exposure/strategy-limit gate, sequencing, matching-engine hand-off, and
+audit-trail entry a normal order goes through applies identically.
+
+**Verified live** against a real running `oms-gateway` (+ `ledger` +
+`kyc-onboarding` + `backoffice` + `matching-engine`, all funded/KYC'd):
+`POST /conversational-order/parse` with `"buy 10 DEMO-EQ at limit 100"`
+returned the parsed intent and a ready `orderSubmissionRequest`;
+`POST /conversational-order/confirm-and-submit` WITHOUT
+`explicitConfirmation` was rejected (`400`); the same request WITH
+`explicitConfirmation: true` produced a real
+`matchingEngineOrderSequenceNumber`, confirmed by `GET /audit-trail`
+showing genuine `ORDER_SUBMITTED` and `ORDER_ROUTED_TO_MATCHING_ENGINE`
+entries for it. Also verified `"buy shares of RELIANCE at market"`
+(missing quantity) is rejected with `422` and a specific message, and
+`"buy 2 lots of NIFTY 22000 CE"` parses to instrument
+`NIFTY-22000-CE-OPT` with the lot-count caveat in its confirmation
+summary.

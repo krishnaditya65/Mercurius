@@ -418,6 +418,45 @@ level and buy=2/sell=7 at another reproduced exactly.
 cap (older data silently drops); TPO's "letter A" starts at the
 earliest tick in a query result, not a real session-open time.
 
+### `watchlist.rs` sync extension, `livePnlWidget.rs` — new this build
+
+FEATURES.md §21 "Cross-device watchlist/alert sync with a home-screen
+live P&L widget" (`docs/BUILD_LOG.md` entry 80). The existing
+per-account `WatchlistStore` gained a real millisecond-resolution
+change log — `lastModifiedAtEpochMillisForAccount`,
+`changesForAccountSince(sinceEpochMillis)`, and an optional
+informational `deviceIdentifier` tag per change — the real technical
+substance of cross-device sync beyond shared account-scoped storage,
+letting a client ask "what changed since my last sync" instead of
+re-fetching everything. **A real bug was caught and fixed**:
+second-resolution timestamps let two same-second mutations collide
+and silently drop from a "since" query; moved to millisecond
+resolution. New `livePnlWidget.rs`: `computeLivePnlSnapshot` joins
+oms-gateway's real per-position cost basis (`GET /mark-to-market`,
+read-only) with market-data's own live last-trade price, computing
+genuine unrealized P&L per position and a per-account total. New
+routes: `GET /watchlist` (now includes `lastModifiedAtEpochMillis`),
+`GET /watchlist/changes?accountIdentifier=...&sinceEpochMillis=...`,
+`GET /pnl/live?accountIdentifier=...`. 19 new tests, 135 total (up
+from 116).
+
+**Verified live:** a real crossing trade produced a live P&L of
+-24,800 against a live market price, matching the manual calculation
+exactly; a `device-desktop`-tagged watchlist change was correctly and
+exclusively returned by a delta query against a prior `device-phone`
+sync point.
+
+**A real gap in oms-gateway was found (documented, not fixed — out of
+scope for this lane):** its mark-to-market endpoint only reveals a
+position's cost basis after a price has ever been explicitly pushed
+for that instrument, even though the cost basis exists internally from
+the fill immediately.
+
+**Known limitations:** still polling-based on both sides (no WebSocket
+push for watchlist changes or P&L); the change log is unbounded and
+unpersisted; a single blocking HTTP round-trip per P&L refresh with no
+retry/backoff.
+
 ---
 
 ## services/oms-gateway (Go) — Tier 1, risk-check path AND matching-engine hand-off are real
@@ -932,6 +971,47 @@ reflected in both this package's own holdings book and the existing
 `internal/positions.PositionBook`; a dividend moved a real ledger
 balance from 0 to 10,000 minor units.
 
+### `internal/tradesurveillance`, `internal/conversationalorderparser` — new this build
+
+FEATURES.md §1's surveillance system and §21's conversational order
+placement (`docs/BUILD_LOG.md` entry 78).
+
+`tradesurveillance`: real heuristic spoofing detection (a large LIMIT
+order cancelled before material execution risk — priced away from a
+reference price, or cancelled faster than a plausible fill-latency
+threshold), layering detection (a same-side order cluster across
+successive price levels, cancelled after an opposite-side fill), exact
+same-account wash-trade detection, and an audit-trail replay function
+for a flagged incident — honestly scoped as compliance-review
+heuristics, not certified surveillance (no linked-account concept
+exists in this repo, so wash-trade detection is same-account only; no
+tick-to-trade latency concept exists anywhere to reuse, documented
+rather than faked). `GET /compliance/surveillance?accountId=...&windowStartTime=...&windowEndTime=...`.
+**A real bug was found and fixed**: `EntriesForAccount` silently
+dropped every `ORDER_CANCELLED` entry (no account identifier on
+cancellations), which would have made spoofing/layering permanently
+blind to cancellations — fixed with a new `ScopeEntriesToAccount`
+helper.
+
+`conversationalorderparser`: a real rule-based grammar/slot extractor
+(side, quantity, instrument including options CE/PE strike, order
+type/price) for chat-style input like "buy 10 shares of RELIANCE at
+market" — no external LLM call. Never submits directly: returns a
+parsed intent + human-readable confirmation summary only; a separate
+`POST /conversational-order/confirm-and-submit` (requiring
+`explicitConfirmation:true`) submits through the exact same
+`processOrderSubmission` path as the regular order ticket, so every
+existing gate applies. Ambiguous/incomplete input is rejected with
+specific errors, never guessed. Voice/speech-to-text explicitly out of
+scope — no audio pipeline available in this sandbox, documented loudly
+in the package doc comment.
+
+32 new tests (603 → 635 for the service). Verified live: a constructed
+spoofing sequence against a live matching-engine was genuinely flagged
+(and incidentally also caught a real wash trade); a parsed-and-confirmed
+conversational order produced a real fill with a real matching-engine
+sequence number.
+
 ---
 
 ## services/ledger (Go) — Tier 2, double-entry core is real
@@ -1403,6 +1483,51 @@ true multi-region failover.
 
 ---
 
+## services/reporting (Go) — new service this build: contract notes, statements, FIFO tax P&L, AIS reconciliation
+
+FEATURES.md §1 "Regulatory reporting" + §21 "One-click capital gains
+statement export" (`docs/BUILD_LOG.md` entry 79). Listens on `:8090`
+(the next free port after the repo's existing 8081-8089 allocations).
+Reads real data read-only from live `oms-gateway` (:8081) and `ledger`
+(:8082) HTTP APIs — no fabricated transactions.
+
+| Package | Purpose |
+|---|---|
+| `internal/omsgatewayclient`, `internal/ledgerclient` | Read-only HTTP clients to the two real upstream services. |
+| `internal/filltrail` | Parses oms-gateway's real audit trail into structured fills. |
+| `internal/contractnotegenerator` | Real per-trade-day contract-note generator: instrument/side/quantity/price/charges/net-amount breakdown. |
+| `internal/ledgerstatement` | Real running-balance account statement over a date range, derived from ledger cash movements plus oms-gateway fills (ledger exposes no journal-history endpoint, so trade-settlement rows are derived, with an honest reconciliation-delta note against ledger's real balance). |
+| `internal/capitalgains` | Real FIFO lot-matching STCG/LTCG computation using India's 12-month equity threshold. |
+| `internal/aisreconciliation` | Real discrepancy-detection logic (mismatched amounts, missing transactions) against an honestly-labeled MOCK Annual Information Statement — no real government AIS feed exists in this sandbox. |
+| `internal/capitalgainsexport` | Real CSV writer for the one-click capital-gains export. |
+
+`GET /health`, `GET /contract-notes/generate?accountId&date`,
+`GET /ledger-statements/generate?accountId&startDate&endDate`,
+`GET /capital-gains/compute?accountId&financialYear`,
+`GET /capital-gains/export?accountId&financialYear` (real CSV),
+`GET /ais-reconciliation/run?accountId&financialYear`. 41 tests,
+including a hand-worked FIFO example (buy 100@₹100.00 + buy
+100@₹120.00, partial sell 150@₹150.00 → exactly LTCG ₹5000.00 + STCG
+₹1500.00, verified to the minor unit).
+
+**A real bug was found and worked around** (oms-gateway was out of
+scope to edit in this lane): `GET /audit-trail?accountId=X` only
+returns `ORDER_FILLED` entries under the *taker* account, never the
+resting/maker counterparty — verified live with a real crossing trade.
+Worked around by fetching the full unfiltered trail and filtering on
+the entry's own structured buyer/seller fields instead.
+
+**Verified live** end-to-end against real running matching-engine/
+ledger/oms-gateway processes.
+
+**Known limitations:** illustrative charges fallback if oms-gateway's
+real calculator is unreachable; no PDF generation (JSON/CSV only);
+withdrawal timestamps use `eligibleForPayoutAt` as a proxy (ledger
+exposes no completion timestamp); the AIS mock is loudly labeled as
+not a real government feed.
+
+---
+
 ## services/kyc-onboarding (Go) — PAN-format-check AND bank penny-drop verification are both real
 
 ### `internal/kycstate/kycVerificationStateMachine.go`
@@ -1483,6 +1608,26 @@ all rejected with distinct sentinel errors; lookup before any submission
 returns not-found; a second submission overwrites the first; two
 accounts have independent profiles; the questionnaire shape itself
 (6 questions × 5 options) is asserted directly.
+
+### `internal/nomineedesignation`, `internal/jointholding` — new this build
+
+FEATURES.md §1 "Nominee management, joint holding support"
+(`docs/BUILD_LOG.md` entry 77). Split into two packages deliberately —
+joint holding answers "who legally co-owns the account," nominee
+designation answers "who receives assets on death" — distinct from
+`services/backoffice`'s `nomineesuccession`, which is the later
+death-claim workflow that would reference this designation record.
+`nomineedesignation`: percentage allocations across all nominees for
+an account must sum to exactly 100% or the account must explicitly
+opt out; a minor nominee (computed age < 18) requires guardian
+details. `jointholding`: INDIVIDUAL vs. JOINT accounts with three real
+standard modes — JOINTLY (requires every holder's consent),
+EITHER_OR_SURVIVOR (exactly 2 holders, any one's consent), ANYONE_OR_SURVIVOR
+(3+ holders, any one's consent) — plus a primary-holder designation.
+38 tests. Verified live on a running server. Known gap: nothing
+downstream (e.g. order submission) currently gates on a complete
+nomination or registered joint-holding structure — this service only
+records the designations.
 
 ### `cmd/server/main.go`
 
@@ -2214,6 +2359,21 @@ errors, and the homepage HTML contained the real translated default
 string plus the language switcher. Ports 8081/8082/8084/8085/8088
 confirmed clear after cleanup.
 
+### `app/watchlist/`, `app/homeScreenLivePnlWidget.tsx` — new this build
+
+FEATURES.md §21 "Cross-device watchlist/alert sync with a home-screen
+live P&L widget" (`docs/BUILD_LOG.md` entry 80). `app/watchlist/`:
+add/remove symbols against market-data's `WatchlistStore`, a real
+per-browser `deviceIdentifier` persisted in `localStorage` (genuinely
+different across two browser profiles/incognito sessions), live
+polling display, and a delta-sync panel hitting
+`GET /watchlist/changes?...&sinceEpochMillis=...`.
+`homeScreenLivePnlWidget.tsx` is embedded on the dashboard (`app/page.tsx`),
+polling market-data's real `GET /pnl/live` every 7s and honestly
+showing a "no live cost basis yet" state rather than a fake number
+when oms-gateway hasn't had a price pushed for that instrument yet.
+`tsc --noEmit`/`eslint`/`next build` all clean — 16 total routes.
+
 ## apps/terminal (Tauri v2 + React 19 + TypeScript) — FEATURES.md §10, new this build
 
 Scaffolded for real via `create-tauri-app` and built out into a real
@@ -2646,6 +2806,25 @@ real. What's consistently *not* real yet, across all of them:
   tests/assertions across TS/Rust/Go/Python, real live verification
   throughout (including three real endpoint-shape mismatches the
   frontend pass caught by curling before coding, rather than assuming).
+- **§1/§21 closeout round** (`docs/BUILD_LOG.md` entries 77–81) — every
+  remaining unchecked item anywhere in FEATURES.md sections 1-22: real
+  nominee designation + joint-holding registration in `kyc-onboarding`;
+  real heuristic trade surveillance (spoofing/layering/wash-trade
+  detection + replay) and a real text-based conversational order
+  parser (explicit-confirmation-gated, voice honestly out of scope) in
+  `oms-gateway`; a brand-new `services/reporting` (port :8090) doing
+  real contract notes, ledger statements, FIFO STCG/LTCG tax P&L
+  against a hand-worked example, mock-AIS reconciliation, and one-click
+  CSV capital-gains export, all computed from live oms-gateway/ledger
+  data; and real cross-device watchlist delta-sync plus a live P&L
+  widget across `market-data`/`apps/web`. Four lanes, each isolated to
+  non-overlapping directories, ~130 new tests, real live verification
+  throughout. Three more real bugs caught and fixed or honestly worked
+  around (an audit-trail cancellation-scoping blind spot in
+  surveillance, a millisecond-resolution watchlist-sync race, and an
+  oms-gateway audit-trail maker-side filtering gap worked around from
+  the read-only reporting service). The ~250-item FEATURES.md backlog
+  is now fully marked 🚧 end to end.
 - No service is backed by the real infrastructure in
   `infra/docker/docker-compose.yml` (Postgres, Redpanda, ClickHouse) —
   they all run fully in-memory today. (Not for lack of trying this round:

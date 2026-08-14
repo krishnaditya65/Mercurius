@@ -3011,4 +3011,107 @@ could plausibly still be bound to (3000/3100, 8081-8089, 9101-9106)
 and confirmed all clear — no orphaned processes left running from any
 of the four lanes.
 
+## Entry 77 — §1 nominee management + joint holding support, kyc-onboarding
+
+Two new packages: `internal/nomineedesignation` (real percentage-sum-
+to-100 validation across nominees, guardian details required when
+computed age < 18, opt-out flag) and `internal/jointholding`
+(INDIVIDUAL vs. JOINT accounts, three real standard modes — JOINTLY
+requires all holders' consent, EITHER_OR_SURVIVOR/ANYONE_OR_SURVIVOR
+allow any one holder's — plus a primary-holder designation).
+Deliberately kept distinct from `services/backoffice`'s
+`nomineesuccession` (the death-claim workflow) — this is the earlier
+KYC-time designation record that a later claim would reference. 38
+tests. Verified live: minor-without-guardian correctly rejected then
+accepted with guardian details, EITHER_OR_SURVIVOR holder-count
+validation, JOINTLY partial-vs-full consent. **§1 item completed.**
+
+## Entry 78 — §1 trade surveillance + §21 conversational order placement, oms-gateway
+
+`internal/tradesurveillance`: real heuristic spoofing detection (large
+orders cancelled before material execution risk, priced away from a
+reference price or cancelled faster than plausible fill latency),
+layering detection (successive-price-level order clusters cancelled
+after an opposite-side fill), exact same-account wash-trade detection,
+and audit-trail replay for a flagged incident — honestly documented as
+compliance-review heuristics, not certified surveillance (no linked-
+account concept exists in this repo, so wash-trade detection is
+same-account only). A real bug was found and fixed during live
+testing: `EntriesForAccount` silently dropped all `ORDER_CANCELLED`
+entries (no account identifier on them), which would have made
+spoofing/layering permanently blind to cancellations — fixed with a
+new `ScopeEntriesToAccount` helper plus a regression test.
+
+`internal/conversationalorderparser`: a real rule-based grammar/slot
+extractor (side, quantity, instrument, order type/price) for chat-
+style commands like "buy 10 shares of RELIANCE at market" — never
+submits directly, only returns a parsed intent + confirmation summary;
+a separate explicit-confirmation endpoint submits through the exact
+same code path as the regular order-ticket. Ambiguous/incomplete
+input is rejected with specific errors, never guessed. Voice/speech-
+to-text explicitly out of scope (no audio pipeline in this sandbox) —
+only the real text-parsing half was built.
+
+32 new tests (603 → 635 for the service). Verified live: a
+constructed spoofing sequence against a live matching-engine was
+genuinely flagged (and incidentally also caught a real wash trade); a
+parsed-and-confirmed conversational order produced a real fill with a
+real matching-engine sequence number. **Both items completed.**
+
+## Entry 79 — §1 regulatory reporting + §21 capital gains export: new services/reporting
+
+New service `services/reporting` (Go, port :8090 — the next free port
+after the existing 8081-8089 allocations), reading real data
+read-only from live `oms-gateway`/`ledger` HTTP APIs, no fabricated
+transactions: real per-trade-day contract notes; real ledger account
+statements; real FIFO-matched STCG/LTCG capital-gains computation
+(India's 12-month equity threshold) with a hand-worked two-lot
+partial-sell example verified to the minor unit (LTCG ₹5000.00 + STCG
+₹1500.00); an honestly-labeled mock Annual Information Statement
+reconciliation proving real discrepancy-detection logic even though
+the second data source is illustrative; and a one-click real CSV
+capital-gains export. 41 tests. A real bug was found and worked
+around (oms-gateway's read-only audit-trail filter silently drops the
+maker/resting side of a fill) — fixed by fetching the full trail and
+filtering on the entry's own buyer/seller fields instead, since
+oms-gateway itself was out of scope to edit in this lane. Verified
+live end-to-end against real running matching-engine/ledger/
+oms-gateway processes. **Both items completed.**
+
+## Entry 80 — §21 cross-device watchlist/alert sync + live P&L widget: market-data + apps/web
+
+Extended market-data's existing per-account `WatchlistStore` with a
+real millisecond-resolution change log (`lastModifiedAtEpochMillisForAccount`,
+`changesForAccountSince`, an optional informational `deviceIdentifier`
+tag) — the real technical meat of "cross-device sync" beyond shared
+account-scoped storage, letting a client ask "what changed since my
+last sync" instead of re-fetching everything. A real bug was caught
+and fixed during development: second-resolution timestamps let two
+same-second mutations collide and silently drop from a "since" query;
+moved to millisecond resolution. New `livePnlWidget.rs`: real
+unrealized P&L per position, joining oms-gateway's real cost-basis
+data with market-data's own live last-trade price, summed per
+account. A real gap in oms-gateway was found (not fixed, since
+oms-gateway was out of scope for this lane): its mark-to-market
+endpoint only reveals a position's cost basis after a price has ever
+been explicitly pushed for that instrument — documented honestly.
+19 new Rust tests (116 → 135). New `apps/web` routes: `/watchlist`
+(add/remove, a real per-browser device identifier in localStorage,
+live polling, a delta-sync panel) and a `homeScreenLivePnlWidget`
+embedded on the dashboard. Verified live: a real crossing trade
+produced a live P&L of -24,800 matching the manual calculation
+exactly; cross-device delta-sync correctly isolated a
+`device-desktop`-tagged change from a `device-phone` sync point.
+`tsc`/`lint`/`build` clean. **Item completed.**
+
+## Entry 81 — housekeeping: independently re-verified the §1/§21 closeout round
+
+Before consolidating the shared docs, the orchestrating session
+independently re-ran the full build/test sweep for every service
+touched across entries 77-80: `kyc-onboarding`, `oms-gateway`,
+`services/reporting` (new), `market-data`, and `apps/web`. This round
+closes out every remaining unchecked item anywhere in FEATURES.md
+sections 1-22 — the ~250-item backlog is now fully marked 🚧
+end to end.
+
 <!-- Append new entries below this line as work continues. -->

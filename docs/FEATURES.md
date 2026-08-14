@@ -80,15 +80,15 @@ onto an internal one later is expensive.
       check + selfie match, e-signature for account opening docs
 - [ ] 🚧 `[P1]` Bank account verification (penny-drop / micro-deposit)
 - [ ] 🚧 `[P1]` Risk profiling questionnaire → investor risk category (feeds Robo-Advisory)
-- [ ] `[P1]` Nominee management, joint holding support
-- [ ] `[P1]` Regulatory reporting: contract notes, ledger statements, tax P&L
+- [ ] 🚧 `[P1]` Nominee management, joint holding support
+- [ ] 🚧 `[P1]` Regulatory reporting: contract notes, ledger statements, tax P&L
       (STCG/LTCG), Annual Information Statement reconciliation
 - [ ] 🚧 `[P2]` AML transaction monitoring (unusual pattern flags, PEP screening)
 - [ ] 🚧 `[P2]` Audit trail: immutable log of every order, modification, cancellation
       with actor, timestamp, IP — required for regulator inquiries
 - [ ] 🚧 `[P2]` Segregation of client funds vs. firm funds (regulatory requirement
       in most jurisdictions — client money must be ring-fenced)
-- [ ] `[P3]` Surveillance system: spoofing/layering/wash-trade detection for
+- [ ] 🚧 `[P3]` Surveillance system: spoofing/layering/wash-trade detection for
       compliance officers, replay tooling tied to Tick-to-Trade Analytics
 
 ## 2. Payments & Banking Rails
@@ -320,7 +320,7 @@ onto an internal one later is expensive.
 - [ ] 🚧 `[P2]` Idempotent order status with WebSocket-reconnect reconciliation —
       never let a user wonder "did my order actually go through?" after a
       dropped connection
-- [ ] `[P2]` One-click capital gains statement export (broker-generated,
+- [ ] 🚧 `[P2]` One-click capital gains statement export (broker-generated,
       pre-formatted for common tax-filing tools)
 - [ ] 🚧 `[P2]` Liquidity/fill-probability badge on the order ticket for
       illiquid instruments, with expected-time-to-fill estimate
@@ -336,9 +336,9 @@ onto an internal one later is expensive.
 - [ ] 🚧 `[P3]` Nominee succession workflow: documented, auditable transfer
       process triggered by a death certificate submission — currently a
       multi-week ordeal at most brokers
-- [ ] `[P3]` Cross-device watchlist/alert sync with a home-screen live P&L
+- [ ] 🚧 `[P3]` Cross-device watchlist/alert sync with a home-screen live P&L
       widget (mobile)
-- [ ] `[P4]` Conversational order placement (chat/voice) with an explicit
+- [ ] 🚧 `[P4]` Conversational order placement (chat/voice) with an explicit
       confirm-before-execute step, aimed at less tech-savvy investors
 
 ## 22. Deep Quant & Algorithmic Trading Internals
