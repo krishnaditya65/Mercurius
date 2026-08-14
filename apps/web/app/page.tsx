@@ -78,6 +78,9 @@ export default function RetailTradingDashboardPage() {
         <nav className="mt-2 flex gap-4 text-sm underline">
           <Link href="/optionsChain">Options chain</Link>
           <Link href="/strategies">Follow strategies</Link>
+          <Link href="/volumeProfile">Volume Profile / TPO</Link>
+          <Link href="/orderFlowFootprint">Order-flow footprint</Link>
+          <Link href="/domReplay">Historical DOM replay</Link>
         </nav>
       </div>
 

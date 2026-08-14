@@ -1437,3 +1437,408 @@ curl "localhost:8081/loan-against-securities?accountId=acct-001"
 curl -X POST localhost:8081/loan-against-securities/repay -d '{
   "clientAccountIdentifier":"acct-001","amountInMinorUnits":5000
 }'
+
+## Round N additions: behavioral nudges, F&O disclosure gating, square-off countdown, live interest cost, stress test, large-order friction, liquidity badge, idempotent reconciliation, corporate-action explainer, and fractional shares
+
+Ten more FEATURES.md items, built and verified against a real running
+server (and, where money genuinely moved, a real running `ledger` and
+`matching-engine` too). Every package below follows the existing
+convention: sentinel errors, mutex-guarded state, explicit `now`
+parameters (never an internal wall-clock read except at the one real
+call site in `cmd/server/main.go`), and a loud, honest "known gaps"
+section.
+
+- **Fractional share investing** (`internal/fractionalshares`,
+  FEATURES.md §17 — previously explicitly deferred for its blast
+  radius): a documented MILLI-SHARE INTEGER precision scheme (1000 =
+  1.000 share), NOT float — exact integer arithmetic throughout,
+  including round-half-up notional computation
+  (`NotionalInMinorUnits`). Per the previous round's own recommendation,
+  this is purely ADDITIVE: a new, optional `MilliShareQuantity *uint64`
+  field on `orders.OrderSubmissionRequest`, layered alongside the
+  pre-existing `OrderQuantity uint64` (whole-share) field, which is
+  completely untouched — every pre-existing test, consumer, and client
+  that never sets the new field is 100% unaffected (verified: the full
+  `internal/orders` and `internal/positions` test suites, and the whole
+  service's `go test ./...`, stayed green throughout this change).
+  **HONEST, LOUD, LOAD-BEARING SCOPE BOUNDARY**: matching-engine's wire
+  protocol (`internal/matchingengineclient`) has NO milli-share-precision
+  field — extending it is out of this service's boundary (a different,
+  Rust-written service). A fractional order is therefore only genuinely
+  FILLABLE through paper trading (`internal/papertrading`'s new
+  `SimulateFractionalFill`, additive alongside the pre-existing
+  `SimulateFill`) — `fractionalshares.ValidateMilliShareQuantity`, called
+  from `buildSubmitOrderHandler` before any gate runs, REJECTS a live
+  (non-paper) order that sets `MilliShareQuantity` with a clear 400 and a
+  plain-language reason, rather than silently rounding/truncating it into
+  a whole-share live order (which would be a real financial-correctness
+  bug: ask for 0.3 shares, get charged for 1). A fractional paper fill
+  updates a brand-new, completely separate `fractionalshares.
+  MilliSharePositionBook` (mirroring `internal/positions.PositionBook`'s
+  own signed-net-quantity design exactly) — never the existing whole-share
+  `paperPositionBook` — via `POST /orders/submit` (with `isPaperTradingOrder:
+  true` and `milliShareQuantity` set) and read via `GET /paper-positions/
+  fractional?accountId=...`. The pre-trade risk check's notional is
+  computed with the milli-share-aware formula whenever `MilliShareQuantity`
+  is set (real integer math, not the whole-share formula). 21 tests
+  across `internal/fractionalshares` (hand-worked notional cases including
+  round-half-up/round-half-down boundaries, whole/milli-part formatting,
+  position-book accumulation) plus 6 more in `internal/papertrading` for
+  `SimulateFractionalFill` and 3 more in `internal/positions` for the new
+  additive `SetPositionDirectly` method (used by item 10 below, not this
+  one). Verified live: a live (non-paper) order with `milliShareQuantity`
+  set was rejected with the exact documented error; a zero
+  `milliShareQuantity` was rejected even for a paper order; a paper BUY of
+  0.300 share then another of 0.250 share against a real running server
+  left `netMilliShareQuantity:550` (exactly 0.550 share, integer-exact,
+  no float drift) in `/paper-positions/fractional`, while `/paper-positions`
+  (the whole-share book) stayed completely empty throughout — proving the
+  two books never cross-contaminate.
+  **Known, loudly documented gaps**: (1) `internal/chargescalculator` and
+  `internal/marginengine`'s SPAN/exposure calculators still operate on
+  whole-share `OrderQuantity` only — a fractional order's charges/margin
+  estimate is not yet fractional-aware, out of this round's time budget;
+  (2) live (matching-engine-routed) fractional orders remain unsupported
+  by design until matching-engine itself gains a milli-share field; (3)
+  in-memory only, same as every other package in this service.
+
+- **Overtrading / revenge-trading pattern detection with cool-down
+  nudges** (`internal/overtradingdetection`, FEATURES.md §19): a real
+  pattern detector over an account's own real recent order-submission
+  history — RAPID-FIRE BURST (a configurable minimum order count within
+  a recent window with an unusually small gap between the two most
+  recent submissions) and ELEVATED ORDER VELOCITY (recent-window order
+  count exceeding a multiple of the account's OWN longer-lookback
+  baseline rate, never a cross-account population baseline). This is a
+  real, NON-BLOCKING behavioral nudge — `POST /orders/submit`'s handler
+  records every real submission attempt (accepted or rejected) and
+  evaluates the detector AFTER `processOrderSubmission` runs, attaching
+  an `overtradingNudge` field to the response without ever touching
+  `wasOrderAccepted`. A real, queryable, mutex-guarded cool-down period
+  (15 minutes, illustrative default) is armed the instant a nudge fires
+  and suppresses repeat nudges until it expires — `GET
+  /overtrading-detection/status?accountId=...` is a pure read. **Honest
+  scope boundary**: a textbook "revenge trading" definition ties the
+  burst specifically to a REALIZED LOSS, which this codebase has no
+  event feed for (no realized-P&L/trade-journal stream exists anywhere
+  in oms-gateway) — this detector uses order-submission VELOCITY as the
+  practical, real-data-driven proxy instead, loudly documented in the
+  package doc as not equivalent to a true loss-triggered detector. 15
+  tests including exact-boundary tests for both patterns, a
+  cooldown-suppresses-then-expires-and-refires test, and a concurrency
+  test. Verified live: 7 rapid order submissions to a real running
+  server armed a real cool-down (`isInCooldown:true,
+  recentOrderCount:7`), with the 5th response itself carrying a
+  `RAPID_FIRE_BURST` nudge inline.
+
+- **Mandatory F&O risk disclosure + cooling-off gate**
+  (`internal/riskdisclosuregate`, FEATURES.md §19): real per-account
+  acknowledgement state (`POST /risk-disclosure/acknowledge`) and a real
+  gate, run in `processOrderSubmission` right after the pledged-holding
+  gate, that REJECTS an account's FIRST-EVER F&O order
+  (`FNO_RISK_DISCLOSURE_REQUIRED`) until it has acknowledged AND at
+  least a configurable cooling-off duration (24 hours, illustrative
+  default) has genuinely elapsed since that acknowledgement — enforced
+  with an explicit `now` parameter throughout, exactly reproducible in
+  tests, never the wall clock internally except at the one real call
+  site. F&O classification reuses `internal/exposurelimits.
+  ClassifySegment` verbatim (not reimplemented) — an equity order is
+  never gated by this package at all. Once an account's first F&O order
+  is genuinely accepted, it's permanently exempted from the gate going
+  forward (a one-time onboarding friction, not a check re-run on every
+  order) — the exemption is recorded only after the order clears every
+  earlier gate, so a check for an order that's later rejected downstream
+  never wrongly consumes the milestone. 14 tests including an
+  exact-cooling-off-boundary pair (23h59m59s still rejected, exactly 24h
+  passes) and a permanently-exempt-after-first-order test. Verified
+  live against a real running server: an F&O order for a
+  never-acknowledged account was rejected with the disclosure-required
+  reason; immediately after acknowledging, the SAME order was still
+  rejected (cooling-off not yet elapsed, since the test used the real
+  wall clock); a plain equity order for a different never-acknowledged
+  account was never touched by this gate at all (it failed only on the
+  unrelated, pre-existing KYC check).
+
+- **Intraday auto square-off countdown timer + reminder-eligibility
+  check** (`internal/marketsession/squareOffCountdown.go`, FEATURES.md
+  §21): extends `internal/marketsession` — real countdown math
+  (`ComputeSquareOffCountdown`, given a real configured cutoff
+  time-of-day and the current time, computes real remaining seconds,
+  floored at 0 once cutoff has passed) and a real, mutex-guarded,
+  DEDUP'D reminder-eligibility check
+  (`SquareOffReminderTracker.DueReminders`): each configured threshold
+  (30/15/5 minutes before cutoff, illustrative default) fires AT MOST
+  ONCE per (account, trading-day cutoff instant) pair, so repeated
+  polling (the real shape a frontend push-notification poller would use)
+  never double-fires the same reminder — proven by a dedicated
+  never-refires test and a concurrency test (50 simultaneous pollers at
+  the same instant produce exactly 3 total firings, not 150).
+  `GET /market-session/square-off/countdown[?now=RFC3339]` and `GET
+  /market-session/square-off/reminders?accountId=...[&now=RFC3339]` are
+  the two new endpoints; both accept an optional `now` override (falling
+  back to the real wall clock) so they're exactly testable live too. 16
+  tests including exact-threshold-boundary cases, a
+  multiple-thresholds-crossed-at-once-all-fire-together case (a client
+  polling for the first time with only 3 minutes left correctly gets all
+  three reminders in one response), and per-account/per-trading-day
+  independence. Verified live: a pinned `now` 25 minutes before the
+  default 15:20 UTC cutoff correctly fired the 30-minute reminder (25 <
+  30); a pinned `now` with 4 minutes left fired all three thresholds at
+  once on first poll; an immediate repeat poll for the same account/time
+  returned zero NEW reminders; a `now` past cutoff showed
+  `isPastCutoff:true, remainingSeconds:0`. **Scope boundary, stated
+  loudly**: this is the backend countdown/reminder-eligibility SIGNAL
+  only — it does not itself force a closure (that's
+  `internal/autoliquidation`'s different, margin-breach-triggered
+  concern) and does not deliver an actual push notification (out of
+  oms-gateway's boundary per the task's own framing).
+
+- **Margin/leverage interest cost calculator shown live**
+  (`internal/marginfunding/costCalculator.go`, FEATURES.md §21): extends
+  `internal/marginfunding` with a real "cost so far" figure
+  (`CalculateCostSoFarInMinorUnits`, interest genuinely accrued from a
+  new, real, mutex-guarded `disbursementStartTimeByAccount` — recorded
+  once per account's first outstanding draw, cleared automatically the
+  moment `RepayFunding` brings principal back to exactly zero so a
+  future fresh draw restarts the clock) AND a real "projected cost if
+  held N more days" figure (`CalculateProjectedCostInMinorUnits`) — both
+  reusing the EXACT SAME `CalculateIllustrativeAccruedInterest`
+  simple-interest formula this package already had; no new rate, no new
+  model. `GET /margin-funding/interest-cost?accountId=...[&now=RFC3339]
+  [&projectDays=N]` returns both figures plus the incremental projected
+  cost (`ProjectedTotalCostInMinorUnits - CostSoFarInMinorUnits`). 18
+  tests including a floored-partial-day case and full disbursement-
+  start-time lifecycle coverage (first draw sets it, a second draw on
+  top doesn't reset it — a documented blended-principal simplification —
+  full repayment clears it, partial repayment doesn't, a fresh draw
+  after full repayment genuinely restarts the clock). Verified live end-
+  to-end with REAL money movement through a real running `ledger`: seeded
+  ₹10,000.00 into `acct-001` via a real journal entry, bought and matched
+  50 DEMO-EQ shares against a real running `matching-engine`, pledged 20
+  of them (₹1,700.00 margin), drew ₹1,000.00 margin funding (a real
+  ledger disbursement), then queried interest cost at a pinned `now` 30
+  days later projecting 30 more days — got back exactly
+  `costSoFarInMinorUnits:986` and `projectedTotalCostInMinorUnits:1973`,
+  matching the hand-worked 12%-p.a.-simple-interest formula to the paisa
+  (₹9.86 at 30 days, ₹19.73 at 60 days).
+  **Known gap**: same blended-single-start-time-per-account
+  simplification the struct field's own doc comment states loudly — a
+  real build would track each disbursement tranche's own start date.
+
+- **Portfolio stress test** (`internal/portfoliostresstest`, FEATURES.md
+  §21): given an account's real positions (equity from
+  `internal/positions`, options supplied by the caller in the same shape
+  `internal/optionschain`'s live Greeks already produce) and a
+  hypothetical market-wide shock percentage, computes a real estimated
+  P&L impact. Equity math is EXACT (`netQuantity * currentPrice *
+  shockPercent` — a position's value genuinely does move linearly with
+  its own price); option math is an explicit, LOUDLY documented
+  FIRST-ORDER DELTA APPROXIMATION (`netContracts * contractMultiplier *
+  deltaPerContract * (underlyingPrice * shockPercent)`) — NOT a full
+  Black-Scholes repricing at the shocked price (ignores gamma/convexity/
+  IV changes a real large shock would also cause), with every
+  per-position result carrying an explicit `isFirstOrderApproximation`
+  flag so a client can distinguish exact equity impact from
+  approximated option impact. `POST /portfolio-stress-test/compute`
+  looks up the account's REAL equity positions server-side from
+  `internal/positions` (never client-asserted quantities) — the caller
+  only supplies each held instrument's current price (no live price feed
+  exists, the same documented gap this codebase repeats everywhere) and
+  any option legs directly (no server-side options-position book exists
+  in this build). 13 tests including hand-worked long/short equity and
+  option cases and a mixed-portfolio summation case. Verified live: a
+  real 50-share DEMO-EQ position (bought and matched against a real
+  running matching-engine) plus a synthetic 10-contract delta-0.5 option
+  leg, under a -10% shock, returned exactly `-50000` (equity) and
+  `-5000` (option) for a total of `-55000` paise (₹550.00) — matching
+  the hand-worked numbers exactly.
+
+- **Large-order friction** (`internal/largeorderfriction`, FEATURES.md
+  §21): a real comparison of an incoming order's notional against the
+  account's OWN real historical average order size — a new, real,
+  mutex-guarded `Tracker` fed by every order that actually proceeds past
+  the gate (the same "fed by the real order-submission path" pattern
+  `internal/overtradingdetection` already established), not audit-trail
+  parsing. An order exceeding a configurable multiple (5x, illustrative
+  default) of the account's own average — once it has enough history to
+  have a meaningful baseline — OR a configurable fraction (10%,
+  illustrative default) of a caller-supplied average-instrument-volume
+  figure, is SOFT-rejected with `LARGE_ORDER_CONFIRMATION_REQUIRED` and
+  a clear, specific plain-language reason. This is genuinely NOT a
+  permanent block: the client resubmits the EXACT SAME order with a new,
+  additive `confirmedLargeOrder: true` field on
+  `orders.OrderSubmissionRequest` (mirroring the `IsPaperTradingOrder`
+  precedent) and the friction gate steps aside. Checked early in
+  `processOrderSubmission`, right after the exposure-limits gate and
+  before KYC. 15 tests including exact-multiplier-boundary cases,
+  independent account/volume triggers, a combined-both-reasons message
+  test, and a proof that `EvaluateOrder` never itself mutates history
+  (only a genuinely-proceeding order does, via a separate
+  `RecordOrderNotional` call). Verified live against a real running
+  server: 5 baseline orders of 100 paise notional each, then a
+  100,000x-larger order was soft-rejected with the exact multiplier and
+  average called out in the message; the identical order resubmitted
+  with `confirmedLargeOrder:true` cleared the friction gate (it was then
+  rejected only by the unrelated, pre-existing KYC check, proving the
+  friction gate genuinely stepped aside rather than blocking forever).
+
+- **Liquidity/fill-probability badge** (`internal/liquiditybadge`,
+  FEATURES.md §21): given real order book depth — REUSING
+  `internal/impactcostestimator.OrderBookDepthSnapshot` verbatim, not
+  reimplementing it — computes a real liquidity classification
+  (HIGH/MEDIUM/LOW, based on real summed depth-at-price on the order's
+  relevant side against configurable thresholds) and an
+  ILLUSTRATIVE expected-time-to-fill estimate, explicitly flagged
+  `isIllustrativeEstimate:true` on every response — loudly documented as
+  a directionally-sensible formula (deeper book relative to order size
+  scales the estimate down), NOT a real ML-fitted model trained on
+  actual historical fill data, which this codebase has none of. `POST
+  /liquidity-badge/compute` takes the same snapshot/side/quantity shape
+  `POST /impact-cost/estimate` already uses. 13 tests including
+  exact-classification-boundary cases, a hand-worked time-to-fill
+  scaling case (a 100-unit order against 50 units of LOW-classified
+  depth scales the 30s base estimate to exactly 60s), and a
+  zero-depth-is-maximally-illiquid case. Verified live: a real 30-unit
+  depth book classified LOW with a 30s estimate; a thin 5-unit book
+  under a 50-unit hypothetical order classified LOW with a 300s
+  estimate (10x the base, matching the 10x depth-consumption ratio
+  exactly).
+
+- **Idempotent order status with reconnect reconciliation** — verified
+  and extended, not rebuilt: `internal/idempotency` already substantially
+  covered this via replay-by-resubmission. The real, genuine gap this
+  round closed: a client shouldn't have to resubmit the FULL order body
+  just to ask "what happened while I was disconnected" — it may not even
+  have the original request handy after a reconnect. `Reconcile`
+  (`internal/idempotency/reconciliation.go`) is a new, PURE, NON-BLOCKING
+  read by idempotency key alone — never claims a key, never waits on the
+  owner's completion channel, safe to call any number of times (e.g. on
+  every WS reconnect) — returning one of three real states: `UNKNOWN`
+  (never claimed), `IN_PROGRESS` (owner still working), or `COMPLETED`
+  (the real, final `OrderAcknowledgementResponse`, identical across every
+  repeated call — the same idempotency guarantee a full resubmission
+  already provided, without requiring one). `GET /orders/reconcile?
+  idempotencyKey=...` is the new endpoint. 12 new tests (16 total in the
+  package) including a never-blocks-while-in-progress test (a goroutine
+  proving `Reconcile` returns promptly even while the real owner is still
+  working), a repeated-calls-return-identical-response test, and a
+  concurrent-reconcile-and-complete race test. Verified live: an unknown
+  key returned `{"status":"UNKNOWN"}`; submitting a real order with a key
+  then reconciling that key returned `{"status":"COMPLETED","response":
+  {...}}` with the EXACT SAME response body the original submission got,
+  reproduced identically on a repeat query.
+
+- **Corporate-action explainer** (`internal/corporateactionexplainer`,
+  FEATURES.md §21 — explicitly NOT §14 corporate-actions processing,
+  which does not exist anywhere in this codebase and remains out of
+  scope): given a (today always manual/synthetic, since there's no real
+  corporate-actions feed — loudly documented) quantity/average-price
+  adjustment event on a position, generates a real, accurate,
+  human-readable one-line explanation reflecting the ACTUAL supplied
+  before/after numbers — not a canned template. `Explain` computes an
+  exact quantity ratio (e.g. a genuine 1:2 split reads "quantity ratio
+  2.00x", real numbers, not a vague "your quantity changed") and adapts
+  its phrasing depending on whether the average price also changed. A
+  new, real, additive `positions.PositionBook.SetPositionDirectly` method
+  (mirroring `ApplyFill`'s existing style, but an absolute overwrite
+  instead of a delta — used ONLY by this feature, never by ordinary
+  trading flow) lets `POST /positions/corporate-action-adjustments/apply`
+  genuinely update the account's real position AND record the real
+  explanation together, exposed via the positions API as the task
+  specified; `GET /positions/corporate-action-adjustments[?accountId=...]`
+  is a pure read of the real, append-only explainer log (mirrors
+  `internal/audittrail`'s own no-update/no-delete convention). 15 tests
+  in the new package plus 3 more in `internal/positions` for
+  `SetPositionDirectly`. Verified live: applying a 1:2 stock split
+  adjustment (10→20 shares, avg ₹200.00→₹100.00) to a real, empty
+  `acct-ca` position produced the exact explanation `"A stock split
+  changed your DEMO-EQ holding from 10 shares @ avg ₹200.00 to 20 shares
+  @ avg ₹100.00 (quantity ratio 2.00x) -- your total invested value is
+  unchanged, only how it's split across shares."`, and `GET /positions`
+  immediately reflected the real new quantity of 20 — both the real
+  position mutation and the real explanation are genuinely linked, not
+  two independent stubs.
+
+### Curl examples for this round's ten additions
+
+```bash
+# Fractional shares: a live (non-paper) order with milliShareQuantity is
+# genuinely REJECTED (matching-engine has no milli-share field yet)
+curl -X POST localhost:8081/orders/submit -d '{
+  "clientAccountIdentifier":"acct-001","instrumentSymbol":"DEMO-EQ",
+  "orderSideIsBuyNotSell":true,"limitPriceInMinorUnits":10000,
+  "orderQuantity":1,"milliShareQuantity":300
+}'
+# -> 400: "fractional share orders ... only supported for paper trading"
+
+# A paper order buying 0.300 share, then 0.250 more -- exact integer sum
+curl -X POST localhost:8081/orders/submit -d '{
+  "clientAccountIdentifier":"acct-002","instrumentSymbol":"DEMO-EQ",
+  "orderSideIsBuyNotSell":true,"isPaperTradingOrder":true,
+  "limitPriceInMinorUnits":10000,"orderQuantity":1,"milliShareQuantity":300
+}'
+curl "localhost:8081/paper-positions/fractional?accountId=acct-002"
+
+# Overtrading nudge status (non-blocking; never rejects an order itself)
+curl "localhost:8081/overtrading-detection/status?accountId=acct-001"
+
+# F&O risk disclosure: acknowledge, then check status
+curl -X POST localhost:8081/risk-disclosure/acknowledge -d '{
+  "clientAccountIdentifier":"acct-001"
+}'
+curl "localhost:8081/risk-disclosure/status?accountId=acct-001"
+
+# Square-off countdown + reminder-eligibility check (optional pinned `now`)
+curl "localhost:8081/market-session/square-off/countdown?now=2026-08-14T14:55:00Z"
+curl "localhost:8081/market-session/square-off/reminders?accountId=acct-001&now=2026-08-14T15:16:00Z"
+
+# Live margin-funding interest cost: cost so far + projected cost
+curl "localhost:8081/margin-funding/interest-cost?accountId=acct-001&projectDays=30"
+
+# Portfolio stress test: -10% shock on real equity + supplied option legs
+curl -X POST localhost:8081/portfolio-stress-test/compute -d '{
+  "clientAccountIdentifier":"acct-001",
+  "shockPercent":-0.10,
+  "equityCurrentPricesInMinorUnits":{"DEMO-EQ":10000},
+  "optionPositions":[
+    {"instrumentSymbol":"DEMO-EQ-CALL","positionType":"OPTION","netContracts":10,"contractMultiplier":1,"deltaPerContract":0.5,"underlyingCurrentPriceInMinorUnits":10000}
+  ]
+}'
+
+# Large-order friction: soft-reject, then resubmit with confirmation
+curl -X POST localhost:8081/orders/submit -d '{
+  "clientAccountIdentifier":"acct-001","instrumentSymbol":"DEMO-EQ",
+  "orderSideIsBuyNotSell":true,"limitPriceInMinorUnits":100,"orderQuantity":100000
+}'
+curl -X POST localhost:8081/orders/submit -d '{
+  "clientAccountIdentifier":"acct-001","instrumentSymbol":"DEMO-EQ",
+  "orderSideIsBuyNotSell":true,"limitPriceInMinorUnits":100,"orderQuantity":100000,
+  "confirmedLargeOrder":true
+}'
+
+# Liquidity badge for an illiquid instrument
+curl -X POST localhost:8081/liquidity-badge/compute -d '{
+  "snapshot": {"instrumentSymbol":"THIN-STOCK",
+    "bidLevels":[{"priceInMinorUnits":9900,"quantity":5}],
+    "askLevels":[{"priceInMinorUnits":10000,"quantity":5}]},
+  "isBuyNotSell": true,
+  "hypotheticalQuantity": 50
+}'
+
+# Idempotent reconciliation: what happened to order X while disconnected
+curl -X POST localhost:8081/orders/submit -d '{
+  "clientAccountIdentifier":"acct-001","instrumentSymbol":"DEMO-EQ",
+  "orderSideIsBuyNotSell":true,"limitPriceInMinorUnits":100,"orderQuantity":1,
+  "idempotencyKey":"reconnect-test-1"
+}'
+curl "localhost:8081/orders/reconcile?idempotencyKey=reconnect-test-1"
+
+# Corporate-action explainer: apply a synthetic 1:2 split, get the real
+# one-line explanation, see the real position reflect it immediately
+curl -X POST localhost:8081/positions/corporate-action-adjustments/apply -d '{
+  "clientAccountIdentifier":"acct-001","instrumentSymbol":"DEMO-EQ",
+  "actionType":"STOCK_SPLIT","quantityBefore":10,"quantityAfter":20,
+  "averagePriceBeforeInMinorUnits":20000,"averagePriceAfterInMinorUnits":10000
+}'
+curl "localhost:8081/positions/corporate-action-adjustments?accountId=acct-001"
+```

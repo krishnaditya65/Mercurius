@@ -28,9 +28,11 @@ mod l1QuotePublisher;
 mod l1QuoteWebSocketServer;
 mod l1QuoteWireProtocol;
 mod marketDataEventTypes;
+mod orderFlowFootprintAggregator;
 mod pricealerts;
 mod simulatedExchangeFeedGenerator;
 mod udpMulticastPublisher;
+mod volumeProfileAggregator;
 mod watchlist;
 
 use std::io::{BufRead, BufReader};
@@ -305,24 +307,29 @@ fn ingestDepthPublishMessage(
                 .lock()
                 .expect("candle aggregator mutex poisoned");
             for tradeTick in &depthPublishMessage.tradeTicks {
-                candleAggregator.recordTrade(
+                candleAggregator.recordTradeWithAggressorSide(
                     &instrumentSymbol,
                     tradeTick.executedPriceInMinorUnits,
                     tradeTick.executedQuantity,
                     executedAtEpochSeconds,
+                    tradeTick.isBuyAggressor,
                 );
             }
         }
         // Every real (or simulated) trade tick also gets appended to the
         // columnar (struct-of-arrays) tick store for replay/backtest
-        // range queries — FEATURES.md §8 [P3]. Same ingestion call site
-        // as the candle aggregator above; no separate/parallel path.
+        // range queries — FEATURES.md §8 [P3] — including the real
+        // aggressor side (FEATURES.md §20 "Order-flow footprint charts"),
+        // which `volumeProfileAggregator.rs`/`orderFlowFootprintAggregator.rs`
+        // read straight back off this same store. Same ingestion call
+        // site as the candle aggregator above; no separate/parallel path.
         for tradeTick in &depthPublishMessage.tradeTicks {
-            sharedState.columnarTickStore.appendTick(
+            sharedState.columnarTickStore.appendTickWithAggressorSide(
                 &instrumentSymbol,
                 executedAtEpochSeconds,
                 tradeTick.executedPriceInMinorUnits,
                 tradeTick.executedQuantity,
+                tradeTick.isBuyAggressor,
             );
             if let Some(udpMulticastPublisher) = udpMulticastPublisher {
                 let _ = udpMulticastPublisher.publishTradeTick(

@@ -158,6 +158,57 @@ What's real:
   socket joined `239.1.1.1:9105` and received real trade-tick and
   L1-quote datagrams (`kind=0`/`kind=1`) sent by the live process, both
   decodable and symbol-tagged correctly.
+- **A real trade-tick aggressor-side flag** (`isBuyAggressor` on
+  `TradeTick`/`TickRecord`, FEATURES.md §20) — a real, additive extension
+  sourced all the way from matching-engine's `TradeExecutionEvent::
+  isBuyAggressor` (known for free at the exact call site each trade is
+  produced there, never inferred after the fact). Threaded through the
+  wire protocol (`IncomingTradeTickWireEvent::isBuyAggressor`, `#[serde(default)]`
+  for backward compatibility with a matching-engine build that predates
+  it), the columnar tick store (`ColumnarTickStore::
+  appendTickWithAggressorSide`, a 4th parallel column), and the trade
+  tape (`CandleAggregator::recordTradeWithAggressorSide`) — added as new
+  sibling methods next to the existing `appendTick`/`recordTrade` rather
+  than widening their signatures, so no pre-existing call site (or test)
+  needed to change. The simulated feed (`simulatedExchangeFeedGenerator.rs`)
+  derives a real, deterministic aggressor flag too — `true` when a
+  tick's price rose or held versus the prior tick, `false` when it fell —
+  so the simulated feed can exercise the order-flow footprint aggregator
+  below with no matching-engine running at all.
+- **Real Volume Profile / Market Profile (TPO) charts**
+  (`src/volumeProfileAggregator.rs`, FEATURES.md §20 `[P3]`) — given the
+  real trade tape held in `ColumnarTickStore`, computes a real Volume
+  Profile: total volume per fixed-width price bucket over a requested
+  time window, a real Point of Control (POC — the bucket with the single
+  largest volume, ties broken toward the lower price), and a real Value
+  Area (the smallest contiguous price range around the POC containing at
+  least a configurable fraction of total volume — 70% by default, the
+  standard Market Profile convention, built by greedily growing the range
+  outward toward whichever adjacent bucket has more volume at each step).
+  Also computes a real, simplified-but-genuinely-correct TPO (Time Price
+  Opportunity) profile: ticks are bucketed into fixed-width time
+  intervals ("letters" — `A`, `B`, ... `Z`, `AA`, `AB`, ... exactly the
+  spreadsheet-column lettering scheme real Market Profile charts use past
+  26 intervals), and for each letter, every price bucket touched by at
+  least one trade during that interval is recorded — the real "time
+  spent at a price" a TPO chart renders, distinct from the Volume
+  Profile's volume-based view of the same trade tape. Exposed over HTTP:
+  `GET /volumeProfile?instrumentSymbol=...&startEpochSeconds=...&endEpochSeconds=...&priceBucketSizeInMinorUnits=...&valueAreaVolumeFraction=...&tpoIntervalSeconds=...`,
+  returning both profiles together. 26 unit tests, including hand-worked
+  POC/Value Area fixtures (see the module's test comments for the exact
+  manual arithmetic) and TPO letter-rollover tests.
+- **Real order-flow footprint charts (bid/ask volume per price per
+  candle)** (`src/orderFlowFootprintAggregator.rs`, FEATURES.md §20
+  `[P3]`) — given the real trade tape WITH the real aggressor-side flag
+  above, computes real buy-volume-vs-sell-volume per price level within
+  each fixed-width candle interval (the same absolute-wall-clock
+  bucketing convention `CandleAggregator`'s own OHLCV candles use, so a
+  footprint candle and an OHLCV candle for the same interval width line
+  up on the same x-axis) — exactly the per-cell "buy x sell" numbers a
+  real footprint chart renders. Exposed over HTTP: `GET
+  /orderFlowFootprint?instrumentSymbol=...&startEpochSeconds=...&endEpochSeconds=...&priceBucketSizeInMinorUnits=...&candleIntervalSeconds=...`.
+  11 unit tests with a hand-worked buy/sell-split fixture (see the
+  module's test comments).
 
 What's a placeholder:
 - Fan-out (both the depth-delta println sink AND the L1 WS feed) is
@@ -199,6 +250,22 @@ What's a placeholder:
   shared clock/NTP discipline set up in this skeleton
 - Everything is in-memory only — a restart loses the entire trade tape
   and candle history
+- Volume Profile / TPO / order-flow footprint (FEATURES.md §20) are
+  computed on demand from whatever the columnar tick store still has
+  retained (capped at 50,000 ticks/instrument, see above) — there's no
+  separate longer-lived storage for them, so a very old window silently
+  returns fewer ticks than were actually traded once the store has
+  evicted them, same "bounded in-memory history" caveat as `GET
+  /ticks/range` already has.
+- The TPO profile's "letter A" always starts at the EARLIEST tick in the
+  query result, not a real trading-session open time — there's no
+  concept of a session calendar in this skeleton, so back-to-back queries
+  with different windows can each start their own letter "A" at a
+  different absolute time.
+- Volume Profile/TPO/footprint price bucketing and the OHLCV candle
+  aggregator's fixed 60-second width are independent, caller-supplied
+  parameters — nothing enforces that a chart's bucket size lines up with
+  what a client's tick-size/lot-size conventions would actually want.
 - The HTTP query API (`GET /trades`, `GET /candles`, watchlists, alerts)
   is still a polling stopgap for everything OTHER than L1 quotes — only
   the L1 feed got a real WS push in this build. A real build would also
@@ -285,6 +352,21 @@ curl "http://127.0.0.1:9103/candles?instrumentSymbol=DEMO-EQ"
 # optional, default to the full retained history (up to 50,000 ticks)
 curl "http://127.0.0.1:9103/ticks/range?instrumentSymbol=DEMO-EQ"
 curl "http://127.0.0.1:9103/ticks/range?instrumentSymbol=DEMO-EQ&startEpochSeconds=1700000000&endEpochSeconds=1700003600"
+
+# Volume Profile + TPO profile (FEATURES.md §20 [P3]) — real POC/Value
+# Area, computed from the same columnar tick store above
+curl "http://127.0.0.1:9103/volumeProfile?instrumentSymbol=DEMO-EQ&priceBucketSizeInMinorUnits=100"
+curl "http://127.0.0.1:9103/volumeProfile?instrumentSymbol=DEMO-EQ&priceBucketSizeInMinorUnits=100&valueAreaVolumeFraction=0.70&tpoIntervalSeconds=60"
+
+# Order-flow footprint (FEATURES.md §20 [P3]) — real buy/sell volume per
+# price level per candle, using the real aggressor-side flag
+curl "http://127.0.0.1:9103/orderFlowFootprint?instrumentSymbol=DEMO-EQ&priceBucketSizeInMinorUnits=100&candleIntervalSeconds=60"
+
+# NOTE: Historical DOM replay (FEATURES.md §20 [P4]) is NOT served here —
+# it's a matching-engine endpoint (GET /domReplay on 127.0.0.1:9106,
+# services/matching-engine/src/domReplayHttpServer.rs), since the WAL and
+# the deterministic replay machinery it reuses both live there. See that
+# service's README for why and for curl examples.
 
 # watchlist
 curl -X POST localhost:9103/watchlist/add -d '{"accountIdentifier":"acct-001","instrumentSymbol":"DEMO-EQ"}'

@@ -107,6 +107,7 @@ pub struct TradeExecutionWireEvent {
     pub sellingClientAccountId: String,
     pub executedPriceInMinorUnits: i64,
     pub executedQuantity: u64,
+    pub isBuyAggressor: bool,
 }
 
 impl From<&TradeExecutionEvent> for TradeExecutionWireEvent {
@@ -116,6 +117,7 @@ impl From<&TradeExecutionEvent> for TradeExecutionWireEvent {
             sellingClientAccountId: internalEvent.sellingClientAccountId.clone(),
             executedPriceInMinorUnits: internalEvent.executedPriceInMinorUnits,
             executedQuantity: internalEvent.executedQuantity,
+            isBuyAggressor: internalEvent.isBuyAggressor,
         }
     }
 }
@@ -256,11 +258,13 @@ pub struct OutgoingPriceLevelDeltaWireUpdate {
 /// can build a trade tape / OHLCV candles — see market-data's
 /// `candleAggregator.rs`. Deliberately a much narrower shape than the
 /// internal `TradeExecutionEvent`: market-data has no business need to
-/// know either counterparty's account id, only price and size.
+/// know either counterparty's account id, only price, size, and (FEATURES.md
+/// §20 — order-flow footprint charts) which side aggressed.
 #[derive(Debug, Serialize)]
 pub struct OutgoingTradeTickWireEvent {
     pub executedPriceInMinorUnits: i64,
     pub executedQuantity: u64,
+    pub isBuyAggressor: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -293,6 +297,7 @@ impl OutgoingDepthPublishWireMessage {
                 .map(|tradeEvent| OutgoingTradeTickWireEvent {
                     executedPriceInMinorUnits: tradeEvent.executedPriceInMinorUnits,
                     executedQuantity: tradeEvent.executedQuantity,
+                    isBuyAggressor: tradeEvent.isBuyAggressor,
                 })
                 .collect(),
         }

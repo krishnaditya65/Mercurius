@@ -25,6 +25,14 @@ pub struct IncomingPriceLevelDeltaWireUpdate {
 pub struct IncomingTradeTickWireEvent {
     pub executedPriceInMinorUnits: i64,
     pub executedQuantity: u64,
+    /// Which side aggressed this trade — FEATURES.md §20 "Order-flow
+    /// footprint charts". `#[serde(default)]` so this stays backward-
+    /// compatible with any matching-engine build that predates this field
+    /// (same pattern as `tradeTicks` on `IncomingDepthPublishWireMessage`
+    /// below) — omitting the key defaults to `false` (treated as a
+    /// sell-side aggressor) rather than a hard parse failure.
+    #[serde(default)]
+    pub isBuyAggressor: bool,
 }
 
 /// One full depth publish from matching-engine, covering one instrument.

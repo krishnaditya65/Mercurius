@@ -68,6 +68,13 @@ pub struct TradeTick {
     pub executedAtEpochSeconds: u64,
     pub priceInMinorUnits: i64,
     pub quantity: u64,
+    /// `true` when the buy side aggressed (crossed the spread against a
+    /// resting sell), `false` when the sell side aggressed. Real, additive
+    /// extension (FEATURES.md §20 "Order-flow footprint charts") — sourced
+    /// from matching-engine's `TradeExecutionEvent::isBuyAggressor`, which
+    /// is known for free at the exact call site each trade is produced
+    /// (see that struct's doc comment), never inferred after the fact.
+    pub isBuyAggressor: bool,
 }
 
 /// One OHLCV bar for a fixed-width time bucket

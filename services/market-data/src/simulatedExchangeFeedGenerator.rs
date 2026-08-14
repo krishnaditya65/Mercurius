@@ -72,6 +72,16 @@ pub struct SimulatedTick {
     pub bestBidQuantity: u64,
     pub bestAskPriceInMinorUnits: i64,
     pub bestAskQuantity: u64,
+    /// Deterministically derived, not fabricated arbitrarily: `true` when
+    /// this tick's price rose or held versus the PRIOR tick's price
+    /// (walked "up into the ask" — modeled as a buy aggressor), `false`
+    /// when it fell (walked "down into the bid" — a sell aggressor). Real,
+    /// deterministic function of the same random-walk state everything
+    /// else here derives from — see `nextTickForSymbolIndex` — needed so
+    /// the simulated feed can exercise the real order-flow footprint
+    /// aggregator end-to-end without matching-engine running (FEATURES.md
+    /// §20).
+    pub isBuyAggressor: bool,
 }
 
 impl SimulatedTick {
@@ -93,6 +103,7 @@ impl SimulatedTick {
             tradeTicks: vec![IncomingTradeTickWireEvent {
                 executedPriceInMinorUnits: self.priceInMinorUnits,
                 executedQuantity: self.quantity,
+                isBuyAggressor: self.isBuyAggressor,
             }],
         }
     }
@@ -161,12 +172,14 @@ impl SimulatedExchangeFeedGenerator {
             (randomDraw % (2 * volatility + 1)) as i64 - volatility as i64
         };
 
+        let previousPriceInMinorUnits = symbolState.currentPriceInMinorUnits;
         let candidatePrice =
             symbolState.currentPriceInMinorUnits + symbolState.config.driftInMinorUnitsPerTick + randomStepInMinorUnits;
         // A price can't walk to zero or negative — floor it at 1 minor
         // unit rather than letting the walk produce a nonsensical price,
         // same "clamp, don't panic" posture as the rest of this skeleton.
         symbolState.currentPriceInMinorUnits = candidatePrice.max(1);
+        let isBuyAggressor = symbolState.currentPriceInMinorUnits >= previousPriceInMinorUnits;
 
         let quantityRandomDraw = splitmix64Next(&mut symbolState.pseudoRandomGeneratorState);
         let quantity = 1 + (quantityRandomDraw % 100);
@@ -183,6 +196,7 @@ impl SimulatedExchangeFeedGenerator {
             bestBidQuantity: quantity,
             bestAskPriceInMinorUnits,
             bestAskQuantity: quantity,
+            isBuyAggressor,
         }
     }
 }
@@ -367,6 +381,7 @@ mod tests {
             bestBidQuantity: 7,
             bestAskPriceInMinorUnits: 10_051,
             bestAskQuantity: 7,
+            isBuyAggressor: true,
         };
 
         let wireMessage = tick.intoDepthPublishWireMessage();
@@ -375,6 +390,7 @@ mod tests {
         assert_eq!(wireMessage.tradeTicks.len(), 1);
         assert_eq!(wireMessage.tradeTicks[0].executedPriceInMinorUnits, 10_050);
         assert_eq!(wireMessage.tradeTicks[0].executedQuantity, 7);
+        assert!(wireMessage.tradeTicks[0].isBuyAggressor);
         assert_eq!(wireMessage.deltas.len(), 2);
         assert!(
             wireMessage

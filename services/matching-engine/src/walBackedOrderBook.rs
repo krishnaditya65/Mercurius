@@ -25,6 +25,7 @@
 
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::orderBookCore::{FullOrderBookStateSnapshotForTesting, OrderBookCore};
 use crate::orderTypes::{IncomingOrderRequest, OrderStatusQueryResult, OrderSubmissionOutcome};
@@ -101,14 +102,19 @@ impl WalBackedOrderBook {
         let orderAcceptedRecordSource = incomingOrderRequest.clone();
         let submissionOutcome = self.orderBookCore.submitIncomingOrder(incomingOrderRequest);
 
+        let acceptedAtEpochMillis = currentEpochMillis();
         self.walWriter
             .appendEvent(&WalEventRecord::orderAcceptedFrom(
                 submissionOutcome.assignedOrderSequenceNumber,
                 &orderAcceptedRecordSource,
+                acceptedAtEpochMillis,
             ))?;
         for tradeExecutionEvent in &submissionOutcome.tradeExecutionEvents {
             self.walWriter
-                .appendEvent(&WalEventRecord::tradeExecutedFrom(tradeExecutionEvent))?;
+                .appendEvent(&WalEventRecord::tradeExecutedFrom(
+                    tradeExecutionEvent,
+                    currentEpochMillis(),
+                ))?;
         }
 
         Ok(submissionOutcome)
@@ -122,6 +128,7 @@ impl WalBackedOrderBook {
             .appendEvent(&WalEventRecord::OrderCancelled {
                 orderSequenceNumberToCancel,
                 wasOrderCancelled,
+                epochMillis: currentEpochMillis(),
             })?;
         Ok(wasOrderCancelled)
     }
@@ -149,6 +156,20 @@ impl WalBackedOrderBook {
     pub fn walFilePath(&self) -> &Path {
         &self.walFilePath
     }
+}
+
+/// Wall-clock milliseconds since the Unix epoch, stamped onto every WAL
+/// event as it's durably logged — see `WalEventRecord::OrderAccepted`'s
+/// `epochMillis` doc comment for why this matters (FEATURES.md §20
+/// "Historical DOM replay for a chosen instrument/time window"). Falls
+/// back to `0` on a clock error (the same "unknown time" sentinel
+/// documented on that field) rather than panicking — a durability-critical
+/// WAL append must never fail just because the system clock is confused.
+fn currentEpochMillis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 #[cfg(test)]

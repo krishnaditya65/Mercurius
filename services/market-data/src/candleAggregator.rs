@@ -40,12 +40,48 @@ impl CandleAggregator {
     /// Records one executed trade, appending it to the trade tape and
     /// folding it into the current (or a newly-opened) candle bucket for
     /// this instrument.
+    /// Not called from `main.rs` any more (the real ingestion path always
+    /// has an aggressor flag to pass, via `recordTradeWithAggressorSide`)
+    /// — kept `pub` and exercised by this module's own pre-existing test
+    /// suite, which predates the aggressor-side field and shouldn't need
+    /// to widen every call site just to keep compiling.
+    #[allow(dead_code)]
     pub fn recordTrade(
         &mut self,
         instrumentSymbol: &str,
         priceInMinorUnits: i64,
         quantity: u64,
         executedAtEpochSeconds: u64,
+    ) {
+        // Aggressor side isn't needed for OHLCV candle bucketing itself —
+        // only the columnar tick store (`columnarTickStore.rs`) and the
+        // order-flow footprint aggregator built on top of it care — so
+        // this trade tape still defaults it to `false` rather than
+        // widening every call site here too. See `main.rs`'s
+        // `ingestDepthPublishMessage`, which passes the REAL aggressor
+        // flag on to `columnarTickStore.appendTick` instead.
+        self.recordTradeWithAggressorSide(
+            instrumentSymbol,
+            priceInMinorUnits,
+            quantity,
+            executedAtEpochSeconds,
+            false,
+        );
+    }
+
+    /// Same as `recordTrade`, but also stamps the real aggressor side onto
+    /// the trade-tape entry (FEATURES.md §20 "Order-flow footprint
+    /// charts"). Kept as a separate method (rather than widening
+    /// `recordTrade`'s signature) purely to avoid touching every existing
+    /// `recordTrade` call site across this module's own test suite for a
+    /// field the OHLCV candle itself never reads.
+    pub fn recordTradeWithAggressorSide(
+        &mut self,
+        instrumentSymbol: &str,
+        priceInMinorUnits: i64,
+        quantity: u64,
+        executedAtEpochSeconds: u64,
+        isBuyAggressor: bool,
     ) {
         let tickHistory = self
             .recentTicksByInstrument
@@ -56,6 +92,7 @@ impl CandleAggregator {
             executedAtEpochSeconds,
             priceInMinorUnits,
             quantity,
+            isBuyAggressor,
         });
         if tickHistory.len() > MAX_RETAINED_TICKS_PER_INSTRUMENT {
             tickHistory.remove(0);

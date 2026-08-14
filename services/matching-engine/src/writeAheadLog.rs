@@ -69,6 +69,18 @@ pub enum WalEventRecord {
         limitPriceInMinorUnits: i64,
         stopTriggerPriceInMinorUnits: Option<i64>,
         orderQuantity: u64,
+        /// Wall-clock time (milliseconds since the Unix epoch) this event
+        /// was durably logged, stamped by `WalBackedOrderBook` right
+        /// before the append. Additive field (FEATURES.md §20 "Historical
+        /// DOM replay for a chosen instrument/time window") — `#[serde(default)]`
+        /// so a WAL file written before this field existed still reads
+        /// back cleanly (as `0`, i.e. "unknown time," rather than a hard
+        /// parse failure). Not needed for correctness of book-state
+        /// replay (`replayWalEventRecordsIntoFreshOrderBook` never reads
+        /// it) — it exists purely so a time-windowed DOM replay can know
+        /// which snapshots fall inside the requested window.
+        #[serde(default)]
+        epochMillis: u64,
     },
     /// A cancellation was requested against `orderSequenceNumberToCancel`.
     /// `wasOrderCancelled` records whether it actually matched anything
@@ -77,6 +89,9 @@ pub enum WalEventRecord {
     OrderCancelled {
         orderSequenceNumberToCancel: u64,
         wasOrderCancelled: bool,
+        /// See `OrderAccepted::epochMillis`.
+        #[serde(default)]
+        epochMillis: u64,
     },
     /// One executed trade, produced as a side effect of the most recently
     /// logged `OrderAccepted` (which may itself have cascaded through
@@ -88,6 +103,14 @@ pub enum WalEventRecord {
         sellingClientAccountId: String,
         executedPriceInMinorUnits: i64,
         executedQuantity: u64,
+        /// See `TradeExecutionEvent::isBuyAggressor` (FEATURES.md §20
+        /// "Order-flow footprint charts"). `#[serde(default)]` for the
+        /// same backward-compatibility reason as `epochMillis` below.
+        #[serde(default)]
+        isBuyAggressor: bool,
+        /// See `OrderAccepted::epochMillis`.
+        #[serde(default)]
+        epochMillis: u64,
     },
 }
 
@@ -95,6 +118,7 @@ impl WalEventRecord {
     pub fn orderAcceptedFrom(
         assignedOrderSequenceNumber: u64,
         order: &IncomingOrderRequest,
+        epochMillis: u64,
     ) -> Self {
         WalEventRecord::OrderAccepted {
             assignedOrderSequenceNumber,
@@ -104,15 +128,18 @@ impl WalEventRecord {
             limitPriceInMinorUnits: order.limitPriceInMinorUnits,
             stopTriggerPriceInMinorUnits: order.stopTriggerPriceInMinorUnits,
             orderQuantity: order.orderQuantity,
+            epochMillis,
         }
     }
 
-    pub fn tradeExecutedFrom(tradeExecutionEvent: &TradeExecutionEvent) -> Self {
+    pub fn tradeExecutedFrom(tradeExecutionEvent: &TradeExecutionEvent, epochMillis: u64) -> Self {
         WalEventRecord::TradeExecuted {
             buyingClientAccountId: tradeExecutionEvent.buyingClientAccountId.clone(),
             sellingClientAccountId: tradeExecutionEvent.sellingClientAccountId.clone(),
             executedPriceInMinorUnits: tradeExecutionEvent.executedPriceInMinorUnits,
             executedQuantity: tradeExecutionEvent.executedQuantity,
+            isBuyAggressor: tradeExecutionEvent.isBuyAggressor,
+            epochMillis,
         }
     }
 }
@@ -229,6 +256,10 @@ pub fn replayWalEventRecordsIntoFreshOrderBook(
                 // the same order allocates the same id on its own — see
                 // module docs.
                 assignedOrderSequenceNumber: _,
+                // Not needed for book-state replay — see the field's doc
+                // comment. Used by `replayWalEventRecordsCollectingDepthSnapshotsInWindow`
+                // below instead.
+                epochMillis: _,
             } => {
                 let replayedOrderRequest = IncomingOrderRequest {
                     clientAccountId: clientAccountId.clone(),
@@ -245,6 +276,7 @@ pub fn replayWalEventRecordsIntoFreshOrderBook(
             WalEventRecord::OrderCancelled {
                 orderSequenceNumberToCancel,
                 wasOrderCancelled: _,
+                epochMillis: _,
             } => {
                 reconstructedOrderBook.cancelOrder(*orderSequenceNumberToCancel);
             }
@@ -260,6 +292,116 @@ pub fn replayWalEventRecordsIntoFreshOrderBook(
         reconstructedOrderBook,
         tradeExecutionEventsProducedDuringReplay,
     )
+}
+
+/// One point-in-time order-book depth snapshot produced during a
+/// time-windowed DOM (Depth Of Market) replay — FEATURES.md §20
+/// "Historical DOM replay for a chosen instrument/time window". Genuinely
+/// reuses the WAL + `replayWalEventRecordsIntoFreshOrderBook`'s
+/// deterministic-replay machinery above rather than reinventing it: see
+/// `replayWalEventRecordsCollectingDepthSnapshotsInWindow`.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct DomReplaySnapshot {
+    pub epochMillis: u64,
+    /// Position of the WAL event that produced this snapshot, 0-based —
+    /// a stable tie-breaker/ordering key for snapshots that share the
+    /// same `epochMillis` (millisecond resolution can't always
+    /// distinguish two events logged back-to-back).
+    pub walEventIndex: usize,
+    /// Best bid first (highest price first).
+    pub bidLevelsBestFirst: Vec<(i64, u64)>,
+    /// Best ask first (lowest price first).
+    pub askLevelsBestFirst: Vec<(i64, u64)>,
+}
+
+/// Replays `eventRecords` from the very start of the WAL (book state
+/// depends on the FULL history, not just the requested window — genuine
+/// deterministic replay, not a fabricated animation seeded from nowhere),
+/// exactly the same command-replay loop as
+/// `replayWalEventRecordsIntoFreshOrderBook` uses, but additionally
+/// captures a `DomReplaySnapshot` of `currentBookDepthSnapshot()` after
+/// every mutating event (`OrderAccepted`/`OrderCancelled`) whose
+/// `epochMillis` falls within `[startEpochMillis, endEpochMillis]`
+/// (inclusive both ends). This is what lets a caller ask for "what did
+/// the DOM look like between 10:00 and 10:05" without needing to replay
+/// and inspect the whole WAL by hand.
+///
+/// A record with `epochMillis == 0` (i.e. logged before this field
+/// existed, or never stamped) is never considered "in window" unless the
+/// caller explicitly passes `startEpochMillis == 0` — same honest
+/// treatment as any other unknown/default value in this codebase.
+pub fn replayWalEventRecordsCollectingDepthSnapshotsInWindow(
+    instrumentSymbol: &str,
+    eventRecords: &[WalEventRecord],
+    startEpochMillis: u64,
+    endEpochMillis: u64,
+) -> Vec<DomReplaySnapshot> {
+    let mut reconstructedOrderBook = OrderBookCore::newEmptyOrderBook(instrumentSymbol);
+    let mut snapshotsInWindow = Vec::new();
+
+    for (walEventIndex, eventRecord) in eventRecords.iter().enumerate() {
+        let eventEpochMillisOpt = match eventRecord {
+            WalEventRecord::OrderAccepted {
+                clientAccountId,
+                orderSide,
+                orderType,
+                limitPriceInMinorUnits,
+                stopTriggerPriceInMinorUnits,
+                orderQuantity,
+                assignedOrderSequenceNumber: _,
+                epochMillis,
+            } => {
+                let replayedOrderRequest = IncomingOrderRequest {
+                    clientAccountId: clientAccountId.clone(),
+                    orderSide: *orderSide,
+                    orderType: *orderType,
+                    limitPriceInMinorUnits: *limitPriceInMinorUnits,
+                    stopTriggerPriceInMinorUnits: *stopTriggerPriceInMinorUnits,
+                    orderQuantity: *orderQuantity,
+                    orderSequenceNumber: 0,
+                };
+                reconstructedOrderBook.submitIncomingOrder(replayedOrderRequest);
+                Some(*epochMillis)
+            }
+            WalEventRecord::OrderCancelled {
+                orderSequenceNumberToCancel,
+                wasOrderCancelled: _,
+                epochMillis,
+            } => {
+                reconstructedOrderBook.cancelOrder(*orderSequenceNumberToCancel);
+                Some(*epochMillis)
+            }
+            WalEventRecord::TradeExecuted { .. } => None,
+        };
+
+        if let Some(eventEpochMillis) = eventEpochMillisOpt
+            && eventEpochMillis >= startEpochMillis
+            && eventEpochMillis <= endEpochMillis
+        {
+            let depthSnapshot = reconstructedOrderBook.currentBookDepthSnapshot();
+            let mut bidLevelsBestFirst: Vec<(i64, u64)> = depthSnapshot
+                .iter()
+                .filter(|(isBidSide, _, _)| *isBidSide)
+                .map(|(_, price, quantity)| (*price, *quantity))
+                .collect();
+            bidLevelsBestFirst.sort_by(|a, b| b.0.cmp(&a.0));
+            let mut askLevelsBestFirst: Vec<(i64, u64)> = depthSnapshot
+                .iter()
+                .filter(|(isBidSide, _, _)| !*isBidSide)
+                .map(|(_, price, quantity)| (*price, *quantity))
+                .collect();
+            askLevelsBestFirst.sort_by(|a, b| a.0.cmp(&b.0));
+
+            snapshotsInWindow.push(DomReplaySnapshot {
+                epochMillis: eventEpochMillis,
+                walEventIndex,
+                bidLevelsBestFirst,
+                askLevelsBestFirst,
+            });
+        }
+    }
+
+    snapshotsInWindow
 }
 
 #[cfg(test)]
@@ -311,6 +453,7 @@ mod tests {
             limitPriceInMinorUnits: 100,
             stopTriggerPriceInMinorUnits: None,
             orderQuantity: 5,
+            epochMillis: 1_000,
         };
         walWriter
             .appendEvent(&orderAcceptedRecord)
@@ -319,6 +462,7 @@ mod tests {
             .appendEvent(&WalEventRecord::OrderCancelled {
                 orderSequenceNumberToCancel: 1,
                 wasOrderCancelled: true,
+                epochMillis: 2_000,
             })
             .expect("append should succeed");
 
@@ -331,6 +475,7 @@ mod tests {
             WalEventRecord::OrderCancelled {
                 orderSequenceNumberToCancel: 1,
                 wasOrderCancelled: true,
+                epochMillis: 2_000,
             }
         );
 
@@ -350,6 +495,7 @@ mod tests {
             .appendEvent(&WalEventRecord::orderAcceptedFrom(
                 sellOutcome.assignedOrderSequenceNumber,
                 &sellOrder,
+                1_000,
             ))
             .unwrap();
 
@@ -359,11 +505,12 @@ mod tests {
             .appendEvent(&WalEventRecord::orderAcceptedFrom(
                 buyOutcome.assignedOrderSequenceNumber,
                 &buyOrder,
+                1_000,
             ))
             .unwrap();
         for tradeEvent in &buyOutcome.tradeExecutionEvents {
             walWriter
-                .appendEvent(&WalEventRecord::tradeExecutedFrom(tradeEvent))
+                .appendEvent(&WalEventRecord::tradeExecutedFrom(tradeEvent, 1_000))
                 .unwrap();
         }
 
@@ -394,6 +541,7 @@ mod tests {
             .appendEvent(&WalEventRecord::orderAcceptedFrom(
                 sellOutcome.assignedOrderSequenceNumber,
                 &sellOrder,
+                1_000,
             ))
             .unwrap();
 
@@ -405,6 +553,7 @@ mod tests {
             .appendEvent(&WalEventRecord::orderAcceptedFrom(
                 buyOutcome.assignedOrderSequenceNumber,
                 &buyOrder,
+                1_000,
             ))
             .unwrap();
 
@@ -436,6 +585,7 @@ mod tests {
             .appendEvent(&WalEventRecord::orderAcceptedFrom(
                 restingOutcome.assignedOrderSequenceNumber,
                 &restingOrder,
+                1_000,
             ))
             .unwrap();
 
@@ -445,6 +595,7 @@ mod tests {
             .appendEvent(&WalEventRecord::OrderCancelled {
                 orderSequenceNumberToCancel: restingOutcome.assignedOrderSequenceNumber,
                 wasOrderCancelled: wasCancelled,
+                epochMillis: 2_000,
             })
             .unwrap();
 
@@ -481,6 +632,7 @@ mod tests {
                 .appendEvent(&WalEventRecord::orderAcceptedFrom(
                     outcome.assignedOrderSequenceNumber,
                     order,
+                    1_000,
                 ))
                 .unwrap();
         }
@@ -530,6 +682,7 @@ mod tests {
             .appendEvent(&WalEventRecord::orderAcceptedFrom(
                 outcome.assignedOrderSequenceNumber,
                 &stopOrder,
+                1_000,
             ))
             .unwrap();
 
@@ -559,6 +712,7 @@ mod tests {
             limitPriceInMinorUnits: 100,
             stopTriggerPriceInMinorUnits: None,
             orderQuantity: 5,
+            epochMillis: 1_000,
         };
         walWriter.appendEvent(&goodRecord).unwrap();
 
@@ -593,5 +747,220 @@ mod tests {
         );
 
         fs::remove_file(&walFilePath).ok();
+    }
+
+    // --- replayWalEventRecordsCollectingDepthSnapshotsInWindow (FEATURES.md
+    // §20 "Historical DOM replay for a chosen instrument/time window") ---
+    // These construct `WalEventRecord`s directly in memory (no WAL file
+    // needed — the function under test operates purely on the event slice)
+    // and hand-verify the exact resulting depth snapshots.
+
+    fn orderAcceptedRecordAt(
+        assignedOrderSequenceNumber: u64,
+        clientAccountId: &str,
+        orderSide: OrderSide,
+        price: i64,
+        quantity: u64,
+        epochMillis: u64,
+    ) -> WalEventRecord {
+        WalEventRecord::OrderAccepted {
+            assignedOrderSequenceNumber,
+            clientAccountId: clientAccountId.to_string(),
+            orderSide,
+            orderType: OrderType::Limit,
+            limitPriceInMinorUnits: price,
+            stopTriggerPriceInMinorUnits: None,
+            orderQuantity: quantity,
+            epochMillis,
+        }
+    }
+
+    #[test]
+    fn emptyEventListReturnsNoSnapshots() {
+        let snapshots =
+            replayWalEventRecordsCollectingDepthSnapshotsInWindow("TEST", &[], 0, u64::MAX);
+        assert!(snapshots.is_empty());
+    }
+
+    #[test]
+    fn singleOrderAcceptedInsideWindowProducesOneSnapshotWithThatLevel() {
+        let events = vec![orderAcceptedRecordAt(
+            1,
+            "buyer",
+            OrderSide::Buy,
+            100,
+            5,
+            1_000,
+        )];
+        let snapshots =
+            replayWalEventRecordsCollectingDepthSnapshotsInWindow("TEST", &events, 500, 1_500);
+
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].epochMillis, 1_000);
+        assert_eq!(snapshots[0].walEventIndex, 0);
+        assert_eq!(snapshots[0].bidLevelsBestFirst, vec![(100, 5)]);
+        assert!(snapshots[0].askLevelsBestFirst.is_empty());
+    }
+
+    #[test]
+    fn eventOutsideTheRequestedWindowProducesNoSnapshot() {
+        let events = vec![orderAcceptedRecordAt(
+            1,
+            "buyer",
+            OrderSide::Buy,
+            100,
+            5,
+            5_000,
+        )];
+        let snapshots =
+            replayWalEventRecordsCollectingDepthSnapshotsInWindow("TEST", &events, 0, 1_000);
+        assert!(snapshots.is_empty());
+    }
+
+    #[test]
+    fn windowBoundsAreInclusiveOnBothEnds() {
+        let events = vec![
+            orderAcceptedRecordAt(1, "buyer1", OrderSide::Buy, 100, 5, 1_000),
+            orderAcceptedRecordAt(2, "buyer2", OrderSide::Buy, 101, 5, 2_000),
+        ];
+        let exactBoundarySnapshots =
+            replayWalEventRecordsCollectingDepthSnapshotsInWindow("TEST", &events, 1_000, 2_000);
+        assert_eq!(exactBoundarySnapshots.len(), 2);
+
+        let strictlyInsideSnapshots =
+            replayWalEventRecordsCollectingDepthSnapshotsInWindow("TEST", &events, 1_001, 1_999);
+        assert!(strictlyInsideSnapshots.is_empty());
+    }
+
+    #[test]
+    fn bookStateBeforeTheWindowStillAffectsInWindowSnapshotsFullReplayNotJustTheWindow() {
+        // A resting order placed BEFORE the window (epochMillis=500) must
+        // still show up in a snapshot taken from an event INSIDE the
+        // window (epochMillis=1_500) — genuine full-history replay, not a
+        // truncated replay that starts only at the window boundary.
+        let events = vec![
+            orderAcceptedRecordAt(1, "buyer1", OrderSide::Buy, 100, 5, 500),
+            orderAcceptedRecordAt(2, "buyer2", OrderSide::Buy, 101, 3, 1_500),
+        ];
+        let snapshots =
+            replayWalEventRecordsCollectingDepthSnapshotsInWindow("TEST", &events, 1_000, 2_000);
+
+        assert_eq!(snapshots.len(), 1);
+        // Both the pre-window resting order (100,5) AND the in-window one
+        // (101,3) are present — best bid (101) first.
+        assert_eq!(snapshots[0].bidLevelsBestFirst, vec![(101, 3), (100, 5)]);
+    }
+
+    #[test]
+    fn multipleEventsInsideWindowEachProduceASnapshotInChronologicalOrder() {
+        let events = vec![
+            orderAcceptedRecordAt(1, "buyer1", OrderSide::Buy, 100, 5, 1_000),
+            orderAcceptedRecordAt(2, "buyer2", OrderSide::Buy, 101, 2, 1_100),
+            orderAcceptedRecordAt(3, "buyer3", OrderSide::Buy, 102, 1, 1_200),
+        ];
+        let snapshots =
+            replayWalEventRecordsCollectingDepthSnapshotsInWindow("TEST", &events, 0, u64::MAX);
+
+        assert_eq!(snapshots.len(), 3);
+        assert_eq!(
+            snapshots.iter().map(|s| s.epochMillis).collect::<Vec<_>>(),
+            vec![1_000, 1_100, 1_200]
+        );
+        assert_eq!(snapshots[2].bidLevelsBestFirst.len(), 3);
+    }
+
+    #[test]
+    fn cancelledOrderDisappearsFromTheNextSnapshotsDepth() {
+        let events = vec![
+            orderAcceptedRecordAt(1, "buyer", OrderSide::Buy, 100, 5, 1_000),
+            WalEventRecord::OrderCancelled {
+                orderSequenceNumberToCancel: 1,
+                wasOrderCancelled: true,
+                epochMillis: 2_000,
+            },
+        ];
+        let snapshots =
+            replayWalEventRecordsCollectingDepthSnapshotsInWindow("TEST", &events, 0, u64::MAX);
+
+        assert_eq!(snapshots.len(), 2);
+        assert_eq!(snapshots[0].bidLevelsBestFirst, vec![(100, 5)]);
+        assert!(snapshots[1].bidLevelsBestFirst.is_empty());
+    }
+
+    #[test]
+    fn tradeExecutedEventsNeverProduceASnapshotOfTheirOwn() {
+        let events = vec![
+            orderAcceptedRecordAt(1, "seller", OrderSide::Sell, 100, 10, 1_000),
+            orderAcceptedRecordAt(2, "buyer", OrderSide::Buy, 100, 4, 2_000),
+            WalEventRecord::TradeExecuted {
+                buyingClientAccountId: "buyer".into(),
+                sellingClientAccountId: "seller".into(),
+                executedPriceInMinorUnits: 100,
+                executedQuantity: 4,
+                isBuyAggressor: true,
+                epochMillis: 2_000,
+            },
+        ];
+        let snapshots =
+            replayWalEventRecordsCollectingDepthSnapshotsInWindow("TEST", &events, 0, u64::MAX);
+
+        // Two OrderAccepted events => exactly two snapshots, even though
+        // three events total were replayed.
+        assert_eq!(snapshots.len(), 2);
+        // After the cross, only the remaining 6 on the sell side is left.
+        assert_eq!(snapshots[1].askLevelsBestFirst, vec![(100, 6)]);
+    }
+
+    #[test]
+    fn bidLevelsAreSortedHighestFirstAndAskLevelsLowestFirst() {
+        let events = vec![
+            orderAcceptedRecordAt(1, "buyer1", OrderSide::Buy, 99, 1, 1_000),
+            orderAcceptedRecordAt(2, "buyer2", OrderSide::Buy, 101, 1, 1_000),
+            orderAcceptedRecordAt(3, "buyer3", OrderSide::Buy, 100, 1, 1_000),
+            orderAcceptedRecordAt(4, "seller1", OrderSide::Sell, 205, 1, 1_000),
+            orderAcceptedRecordAt(5, "seller2", OrderSide::Sell, 203, 1, 1_000),
+            orderAcceptedRecordAt(6, "seller3", OrderSide::Sell, 204, 1, 1_000),
+        ];
+        let snapshots =
+            replayWalEventRecordsCollectingDepthSnapshotsInWindow("TEST", &events, 1_000, 1_000);
+
+        let lastSnapshot = snapshots.last().unwrap();
+        assert_eq!(
+            lastSnapshot.bidLevelsBestFirst,
+            vec![(101, 1), (100, 1), (99, 1)]
+        );
+        assert_eq!(
+            lastSnapshot.askLevelsBestFirst,
+            vec![(203, 1), (204, 1), (205, 1)]
+        );
+    }
+
+    #[test]
+    fn zeroEpochMillisRecordsAreExcludedUnlessTheWindowExplicitlyStartsAtZero() {
+        // epochMillis=0 is the documented "unknown time" sentinel for a
+        // record logged before this field existed — it should NOT show up
+        // in an open-ended window that doesn't explicitly ask for time 0.
+        let events = vec![orderAcceptedRecordAt(1, "buyer", OrderSide::Buy, 100, 5, 0)];
+
+        let windowStartingAtOne =
+            replayWalEventRecordsCollectingDepthSnapshotsInWindow("TEST", &events, 1, u64::MAX);
+        assert!(windowStartingAtOne.is_empty());
+
+        let windowStartingAtZero =
+            replayWalEventRecordsCollectingDepthSnapshotsInWindow("TEST", &events, 0, u64::MAX);
+        assert_eq!(windowStartingAtZero.len(), 1);
+    }
+
+    #[test]
+    fn walEventIndexReflectsPositionInTheFullEventListNotJustInWindowEvents() {
+        let events = vec![
+            orderAcceptedRecordAt(1, "buyer1", OrderSide::Buy, 100, 5, 500), // index 0, outside window
+            orderAcceptedRecordAt(2, "buyer2", OrderSide::Buy, 101, 5, 1_500), // index 1, inside window
+        ];
+        let snapshots =
+            replayWalEventRecordsCollectingDepthSnapshotsInWindow("TEST", &events, 1_000, 2_000);
+
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].walEventIndex, 1);
     }
 }

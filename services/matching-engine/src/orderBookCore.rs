@@ -339,6 +339,10 @@ impl OrderBookCore {
                     sellingClientAccountId: oldestRestingSellOrder.clientAccountId.clone(),
                     executedPriceInMinorUnits: bestRestingSellPrice,
                     executedQuantity,
+                    // The incoming order in THIS function is always the
+                    // buy side — it is, by construction, the aggressor
+                    // crossing against a resting sell.
+                    isBuyAggressor: true,
                 });
 
                 incomingBuyOrder.orderQuantity -= executedQuantity;
@@ -410,6 +414,10 @@ impl OrderBookCore {
                     sellingClientAccountId: incomingSellOrder.clientAccountId.clone(),
                     executedPriceInMinorUnits: bestRestingBuyPrice,
                     executedQuantity,
+                    // The incoming order in THIS function is always the
+                    // sell side — it is, by construction, the aggressor
+                    // crossing against a resting buy.
+                    isBuyAggressor: false,
                 });
 
                 incomingSellOrder.orderQuantity -= executedQuantity;

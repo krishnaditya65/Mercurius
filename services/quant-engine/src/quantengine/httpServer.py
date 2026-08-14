@@ -27,6 +27,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from quantengine.arbitrageScanner import scanForTheoreticalVersusLivePriceDeviation
 from quantengine.blackScholesOptionPricer import (
     BlackScholesInputParameters,
+    OptionGreeksResult,
     calculateBlackScholesCallOptionPrice,
     calculateBlackScholesPutOptionPrice,
     calculateOptionGreeks,
@@ -40,11 +41,34 @@ from quantengine.esgScoringEngine import (
     EsgScreeningCriteria,
     screenCandidateSymbolsAgainstEsgCriteria,
 )
+from quantengine.factorRiskModel import (
+    PortfolioHoldingWithFactorExposures,
+    computeFactorAttribution,
+    computePortfolioFactorExposures,
+)
 from quantengine.garchVolatilityForecaster import (
     calculateExpectedIntradayRangeFromForecastVariance,
     fitGarchOneOneParametersByGridSearchQuasiMaximumLikelihood,
 )
+from quantengine.deltaHedgingMonitor import evaluateDeltaHedgingThreshold
+from quantengine.ivRankCalculator import calculateImpliedVolatilityRankAndPercentile
+from quantengine.latencyBenchmarkDashboard import compareLatencyAcrossVenues
+from quantengine.kellyCriterionSizer import (
+    applyFractionalKelly,
+    calculateKellyFractionFromWinLossStatistics,
+)
 from quantengine.marketMakingSandbox import MarketMakingSandbox, QuoteRejectedError, QuoteSide
+from quantengine.optionsCorporateActionHandler import (
+    OptionContractSide,
+    OptionExerciseStyle,
+    OptionPosition,
+    applyStockSplitAdjustmentToOptionPosition,
+    evaluateEarlyExerciseRiskAroundExDividendDate,
+)
+from quantengine.portfolioGreeksAggregator import (
+    PortfolioPosition,
+    aggregatePortfolioGreeks,
+)
 from quantengine.riskStatistics import (
     calculateAnnualizedSharpeRatio,
     calculateAnnualizedSortinoRatio,
@@ -124,6 +148,22 @@ class QuantEngineRequestHandler(BaseHTTPRequestHandler):
             self._handleMarketMakingInventoryRequest(requestBody)
         elif self.path == "/esg/screen":
             self._handleEsgScreenRequest(requestBody)
+        elif self.path == "/portfolio/greeks":
+            self._handlePortfolioGreeksRequest(requestBody)
+        elif self.path == "/volatility/iv-rank":
+            self._handleIvRankRequest(requestBody)
+        elif self.path == "/portfolio/delta-hedge-check":
+            self._handleDeltaHedgeCheckRequest(requestBody)
+        elif self.path == "/sizing/kelly-criterion":
+            self._handleKellyCriterionRequest(requestBody)
+        elif self.path == "/portfolio/factor-risk":
+            self._handleFactorRiskRequest(requestBody)
+        elif self.path == "/latency/benchmark":
+            self._handleLatencyBenchmarkRequest(requestBody)
+        elif self.path == "/options/corporate-action/split-adjustment":
+            self._handleStockSplitAdjustmentRequest(requestBody)
+        elif self.path == "/options/corporate-action/early-exercise-risk":
+            self._handleEarlyExerciseRiskRequest(requestBody)
         else:
             self._writeJsonResponse(404, {"errorMessage": f"no POST route for {self.path}"})
 
@@ -569,6 +609,366 @@ class QuantEngineRequestHandler(BaseHTTPRequestHandler):
             },
         )
 
+    def _handlePortfolioGreeksRequest(self, requestBody: dict) -> None:
+        """`POST /portfolio/greeks` — body carries `positions`, a list of
+        `{identifier, quantity, delta, gamma, vegaPerOnePercentVolatilityChange,
+        thetaPerCalendarDay}` objects (pre-computed per-contract Greeks,
+        e.g. from repeated `/options/price` calls, plus a signed contract
+        quantity). Returns real net portfolio Greeks — the quantity-
+        weighted sum across every position (FEATURES.md §22,
+        `portfolioGreeksAggregator.py`). An empty `positions` list is
+        legitimate (a flat book) and returns all-zero Greeks, not a 422.
+        """
+        try:
+            positions = [
+                PortfolioPosition(
+                    identifier=str(onePosition["identifier"]),
+                    quantity=float(onePosition["quantity"]),
+                    perContractGreeks=OptionGreeksResult(
+                        delta=float(onePosition["delta"]),
+                        gamma=float(onePosition["gamma"]),
+                        vegaPerOnePercentVolatilityChange=float(
+                            onePosition["vegaPerOnePercentVolatilityChange"]
+                        ),
+                        thetaPerCalendarDay=float(onePosition["thetaPerCalendarDay"]),
+                    ),
+                )
+                for onePosition in requestBody["positions"]
+            ]
+        except (KeyError, TypeError, ValueError) as validationError:
+            self._writeJsonResponse(400, {"errorMessage": f"invalid request body: {validationError}"})
+            return
+
+        result = aggregatePortfolioGreeks(positions)
+        self._writeJsonResponse(
+            200,
+            {
+                "netDelta": result.netDelta,
+                "netGamma": result.netGamma,
+                "netVegaPerOnePercentVolatilityChange": result.netVegaPerOnePercentVolatilityChange,
+                "netThetaPerCalendarDay": result.netThetaPerCalendarDay,
+                "positionCount": result.positionCount,
+            },
+        )
+
+    def _handleIvRankRequest(self, requestBody: dict) -> None:
+        """`POST /volatility/iv-rank` — body carries
+        `currentImpliedVolatility` and `historicalImpliedVolatilitySeries`
+        (an ILLUSTRATIVE/FIXTURE 1-year-lookback series a caller
+        supplies — this service does no historical IV ingestion of its
+        own). Returns both real IV Rank and real IV Percentile — see
+        `quantengine/ivRankCalculator.py` (FEATURES.md §22).
+        """
+        try:
+            currentImpliedVolatility = float(requestBody["currentImpliedVolatility"])
+            historicalImpliedVolatilitySeries = [
+                float(v) for v in requestBody["historicalImpliedVolatilitySeries"]
+            ]
+        except (KeyError, TypeError, ValueError) as validationError:
+            self._writeJsonResponse(400, {"errorMessage": f"invalid request body: {validationError}"})
+            return
+
+        try:
+            result = calculateImpliedVolatilityRankAndPercentile(
+                currentImpliedVolatility, historicalImpliedVolatilitySeries
+            )
+        except ValueError as rankError:
+            self._writeJsonResponse(422, {"errorMessage": str(rankError)})
+            return
+
+        self._writeJsonResponse(
+            200,
+            {
+                "currentImpliedVolatility": result.currentImpliedVolatility,
+                "historicalMinimumImpliedVolatility": result.historicalMinimumImpliedVolatility,
+                "historicalMaximumImpliedVolatility": result.historicalMaximumImpliedVolatility,
+                "impliedVolatilityRank": result.impliedVolatilityRank,
+                "impliedVolatilityPercentile": result.impliedVolatilityPercentile,
+            },
+        )
+
+    def _handleDeltaHedgeCheckRequest(self, requestBody: dict) -> None:
+        """`POST /portfolio/delta-hedge-check` — body carries the SAME
+        `positions` shape as `/portfolio/greeks` plus `deltaThreshold`
+        (a positive number) and an optional `sharesPerContractMultiplier`
+        (defaults to 100, the standard equity option contract
+        multiplier). Aggregates net portfolio delta (reusing
+        `/portfolio/greeks`'s real aggregation) and returns the real
+        `isThresholdBreached` alert boolean plus the exact
+        `hedgeQuantityInShares` needed to flatten net delta-equivalent
+        exposure — see `quantengine/deltaHedgingMonitor.py`
+        (FEATURES.md §22). Never places a real hedge order.
+        """
+        try:
+            positions = [
+                PortfolioPosition(
+                    identifier=str(onePosition["identifier"]),
+                    quantity=float(onePosition["quantity"]),
+                    perContractGreeks=OptionGreeksResult(
+                        delta=float(onePosition["delta"]),
+                        gamma=float(onePosition["gamma"]),
+                        vegaPerOnePercentVolatilityChange=float(
+                            onePosition["vegaPerOnePercentVolatilityChange"]
+                        ),
+                        thetaPerCalendarDay=float(onePosition["thetaPerCalendarDay"]),
+                    ),
+                )
+                for onePosition in requestBody["positions"]
+            ]
+            deltaThreshold = float(requestBody["deltaThreshold"])
+            sharesPerContractMultiplier = float(requestBody.get("sharesPerContractMultiplier", 100.0))
+        except (KeyError, TypeError, ValueError) as validationError:
+            self._writeJsonResponse(400, {"errorMessage": f"invalid request body: {validationError}"})
+            return
+
+        portfolioGreeks = aggregatePortfolioGreeks(positions)
+        try:
+            hedgeResult = evaluateDeltaHedgingThreshold(portfolioGreeks, deltaThreshold, sharesPerContractMultiplier)
+        except ValueError as hedgeError:
+            self._writeJsonResponse(422, {"errorMessage": str(hedgeError)})
+            return
+
+        self._writeJsonResponse(
+            200,
+            {
+                "netDelta": hedgeResult.netDelta,
+                "deltaThreshold": hedgeResult.deltaThreshold,
+                "isThresholdBreached": hedgeResult.isThresholdBreached,
+                "hedgeQuantityInShares": hedgeResult.hedgeQuantityInShares,
+                "sharesPerContractMultiplierUsed": hedgeResult.sharesPerContractMultiplierUsed,
+            },
+        )
+
+    def _handleKellyCriterionRequest(self, requestBody: dict) -> None:
+        """`POST /sizing/kelly-criterion` — body carries `winProbability`,
+        `winLossPayoutRatio` (the classic discrete Kelly formula's
+        inputs), and an optional `fractionalMultiplier` (defaults to
+        0.5, i.e. half-Kelly). Returns the real full-Kelly fraction AND
+        the recommended fractional-Kelly allocation — see
+        `quantengine/kellyCriterionSizer.py` (FEATURES.md §22). Returns
+        a bankroll FRACTION only; never places an order or knows account
+        size.
+        """
+        try:
+            winProbability = float(requestBody["winProbability"])
+            winLossPayoutRatio = float(requestBody["winLossPayoutRatio"])
+            fractionalMultiplier = float(requestBody.get("fractionalMultiplier", 0.5))
+        except (KeyError, TypeError, ValueError) as validationError:
+            self._writeJsonResponse(400, {"errorMessage": f"invalid request body: {validationError}"})
+            return
+
+        try:
+            fullKellyFraction = calculateKellyFractionFromWinLossStatistics(winProbability, winLossPayoutRatio)
+            fractionalResult = applyFractionalKelly(fullKellyFraction, fractionalMultiplier)
+        except ValueError as kellyError:
+            self._writeJsonResponse(422, {"errorMessage": str(kellyError)})
+            return
+
+        self._writeJsonResponse(
+            200,
+            {
+                "fullKellyFraction": fractionalResult.fullKellyFraction,
+                "fractionalMultiplier": fractionalResult.fractionalMultiplier,
+                "recommendedAllocationFraction": fractionalResult.recommendedAllocationFraction,
+            },
+        )
+
+    def _handleFactorRiskRequest(self, requestBody: dict) -> None:
+        """`POST /portfolio/factor-risk` — body carries `holdings` (a list
+        of `{symbol, portfolioWeight, factorExposuresByName}` objects —
+        the per-holding factor exposures are ILLUSTRATIVE/CALLER-SUPPLIED,
+        NOT sourced from any real Fama-French/Barra factor-loading
+        estimation, see `factorRiskModel.py`'s module docstring),
+        `factorReturnsByName` (a return per factor over some period), and
+        `actualOrExpectedPortfolioReturn`. Returns the real weight-
+        weighted portfolio factor exposures AND a real linear factor-
+        attribution decomposition of the supplied return into per-factor
+        contributions plus an idiosyncratic residual (FEATURES.md §22,
+        `factorRiskModel.py`).
+        """
+        try:
+            holdings = [
+                PortfolioHoldingWithFactorExposures(
+                    symbol=str(oneHolding["symbol"]),
+                    portfolioWeight=float(oneHolding["portfolioWeight"]),
+                    factorExposuresByName={
+                        str(factorName): float(exposure)
+                        for factorName, exposure in oneHolding["factorExposuresByName"].items()
+                    },
+                )
+                for oneHolding in requestBody["holdings"]
+            ]
+            factorReturnsByName = {
+                str(factorName): float(factorReturn)
+                for factorName, factorReturn in requestBody["factorReturnsByName"].items()
+            }
+            actualOrExpectedPortfolioReturn = float(requestBody["actualOrExpectedPortfolioReturn"])
+        except (KeyError, TypeError, ValueError) as validationError:
+            self._writeJsonResponse(400, {"errorMessage": f"invalid request body: {validationError}"})
+            return
+
+        try:
+            exposureResult = computePortfolioFactorExposures(holdings)
+            attributionResult = computeFactorAttribution(
+                exposureResult.portfolioExposureByFactor, factorReturnsByName, actualOrExpectedPortfolioReturn
+            )
+        except ValueError as factorRiskError:
+            self._writeJsonResponse(422, {"errorMessage": str(factorRiskError)})
+            return
+
+        self._writeJsonResponse(
+            200,
+            {
+                "portfolioExposureByFactor": exposureResult.portfolioExposureByFactor,
+                "totalPortfolioWeight": exposureResult.totalPortfolioWeight,
+                "holdingCount": exposureResult.holdingCount,
+                "contributionByFactor": attributionResult.contributionByFactor,
+                "totalFactorContribution": attributionResult.totalFactorContribution,
+                "idiosyncraticReturn": attributionResult.idiosyncraticReturn,
+                "actualOrExpectedPortfolioReturn": attributionResult.actualOrExpectedPortfolioReturn,
+            },
+        )
+
+    def _handleLatencyBenchmarkRequest(self, requestBody: dict) -> None:
+        """`POST /latency/benchmark` — body carries
+        `roundTripTimeSamplesInMillisecondsByVenue` (a dict of venue
+        label -> list of ALREADY-OBSERVED round-trip-time samples in
+        milliseconds; this endpoint does not itself perform live network
+        timing over HTTP request/response — that's
+        `measureRoundTripTimeSamplesOverHttp` in
+        `latencyBenchmarkDashboard.py`, used offline/pytest-side against
+        a real running server, see the module docstring and README for
+        why an HTTP handler cannot synchronously time ANOTHER HTTP
+        round trip as part of serving its own request without conflating
+        the two measurements) and an optional `bucketCount` (default 10).
+        Returns a real histogram plus real p50/p95/p99/max percentile
+        statistics PER VENUE, side by side (FEATURES.md §22,
+        `latencyBenchmarkDashboard.py`).
+        """
+        try:
+            samplesByVenue = {
+                str(venueLabel): [float(sample) for sample in samples]
+                for venueLabel, samples in requestBody["roundTripTimeSamplesInMillisecondsByVenue"].items()
+            }
+            bucketCount = int(requestBody.get("bucketCount", 10))
+        except (KeyError, TypeError, ValueError) as validationError:
+            self._writeJsonResponse(400, {"errorMessage": f"invalid request body: {validationError}"})
+            return
+
+        try:
+            resultsByVenue = compareLatencyAcrossVenues(samplesByVenue, bucketCount)
+        except ValueError as latencyError:
+            self._writeJsonResponse(422, {"errorMessage": str(latencyError)})
+            return
+
+        self._writeJsonResponse(
+            200,
+            {
+                venueLabel: {
+                    "sampleCount": result.sampleCount,
+                    "minimumMilliseconds": result.minimumMilliseconds,
+                    "maximumMilliseconds": result.maximumMilliseconds,
+                    "p50Milliseconds": result.p50Milliseconds,
+                    "p95Milliseconds": result.p95Milliseconds,
+                    "p99Milliseconds": result.p99Milliseconds,
+                    "histogramBuckets": [
+                        {
+                            "lowerBoundInclusive": bucket.lowerBoundInclusive,
+                            "upperBoundExclusive": bucket.upperBoundExclusive,
+                            "sampleCount": bucket.sampleCount,
+                        }
+                        for bucket in result.histogramBuckets
+                    ],
+                }
+                for venueLabel, result in resultsByVenue.items()
+            },
+        )
+
+    def _buildOptionPositionFromRequestBody(self, requestBody: dict) -> OptionPosition:
+        return OptionPosition(
+            symbol=str(requestBody["symbol"]),
+            strikePrice=float(requestBody["strikePrice"]),
+            quantity=float(requestBody["quantity"]),
+            exerciseStyle=OptionExerciseStyle(str(requestBody["exerciseStyle"]).upper()),
+            contractSide=OptionContractSide(str(requestBody["contractSide"]).upper()),
+        )
+
+    def _handleStockSplitAdjustmentRequest(self, requestBody: dict) -> None:
+        """`POST /options/corporate-action/split-adjustment` — body
+        carries an option position (`symbol`, `strikePrice`, `quantity`,
+        `exerciseStyle` in {AMERICAN, EUROPEAN}, `contractSide` in
+        {CALL, PUT}) and `splitRatio` (new shares per old share; a
+        2-for-1 split is `2.0`, a 1-for-4 reverse split is `0.25`).
+        Returns the REAL, standard adjusted strike/quantity —
+        `newStrike = oldStrike / splitRatio`,
+        `newQuantity = oldQuantity * splitRatio` — see
+        `optionsCorporateActionHandler.py` (FEATURES.md §22).
+        """
+        try:
+            position = self._buildOptionPositionFromRequestBody(requestBody)
+            splitRatio = float(requestBody["splitRatio"])
+        except (KeyError, TypeError, ValueError) as validationError:
+            self._writeJsonResponse(400, {"errorMessage": f"invalid request body: {validationError}"})
+            return
+
+        try:
+            result = applyStockSplitAdjustmentToOptionPosition(position, splitRatio)
+        except ValueError as splitError:
+            self._writeJsonResponse(422, {"errorMessage": str(splitError)})
+            return
+
+        self._writeJsonResponse(
+            200,
+            {
+                "splitRatio": result.splitRatio,
+                "originalStrikePrice": result.originalPosition.strikePrice,
+                "originalQuantity": result.originalPosition.quantity,
+                "adjustedStrikePrice": result.adjustedStrikePrice,
+                "adjustedQuantity": result.adjustedQuantity,
+                "notionalExposureIsPreserved": result.notionalExposureIsPreserved(),
+            },
+        )
+
+    def _handleEarlyExerciseRiskRequest(self, requestBody: dict) -> None:
+        """`POST /options/corporate-action/early-exercise-risk` — body
+        carries the same option-position shape as the split-adjustment
+        endpoint plus `underlyingSpotPrice`, `callMarketPrice`, and
+        `dividendAmount`. Returns the REAL textbook early-exercise-risk
+        flag for an American call near an ex-dividend date (dividend
+        exceeding remaining call time value) — see
+        `optionsCorporateActionHandler.py` (FEATURES.md §22). European
+        contracts and puts are always returned unflagged with an
+        explanatory `reason`, never silently evaluated against a formula
+        that doesn't apply to them.
+        """
+        try:
+            position = self._buildOptionPositionFromRequestBody(requestBody)
+            underlyingSpotPrice = float(requestBody["underlyingSpotPrice"])
+            callMarketPrice = float(requestBody["callMarketPrice"])
+            dividendAmount = float(requestBody["dividendAmount"])
+        except (KeyError, TypeError, ValueError) as validationError:
+            self._writeJsonResponse(400, {"errorMessage": f"invalid request body: {validationError}"})
+            return
+
+        try:
+            result = evaluateEarlyExerciseRiskAroundExDividendDate(
+                position, underlyingSpotPrice, callMarketPrice, dividendAmount
+            )
+        except ValueError as riskError:
+            self._writeJsonResponse(422, {"errorMessage": str(riskError)})
+            return
+
+        self._writeJsonResponse(
+            200,
+            {
+                "intrinsicValue": result.intrinsicValue,
+                "callTimeValue": result.callTimeValue,
+                "dividendAmount": result.dividendAmount,
+                "isFlaggedForEarlyExerciseRisk": result.isFlaggedForEarlyExerciseRisk,
+                "reason": result.reason,
+            },
+        )
+
     def _writeJsonResponse(self, statusCode: int, responseBody: dict) -> None:
         responseBytes = json.dumps(responseBody).encode("utf-8")
         self.send_response(statusCode)
@@ -591,7 +991,11 @@ def runQuantEngineHttpServer() -> None:
         "POST /options/implied-volatility, POST /risk/statistics, POST /arbitrage/scan, "
         "POST /volatility/garch-forecast, POST /correlation/matrix, POST /risk/value-at-risk, "
         "POST /market-making/quote, POST /market-making/simulate-fill, POST /market-making/inventory, "
-        "POST /esg/screen)"
+        "POST /esg/screen, POST /portfolio/greeks, POST /volatility/iv-rank, "
+        "POST /portfolio/delta-hedge-check, POST /sizing/kelly-criterion, "
+        "POST /portfolio/factor-risk, POST /latency/benchmark, "
+        "POST /options/corporate-action/split-adjustment, "
+        "POST /options/corporate-action/early-exercise-risk)"
     )
     httpServer.serve_forever()
 

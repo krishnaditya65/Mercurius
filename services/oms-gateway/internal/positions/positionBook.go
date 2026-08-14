@@ -50,6 +50,24 @@ func (positionBook *PositionBook) adjustPositionLocked(accountIdentifier string,
 	positionBook.netQuantityByAccountAndInstrument[accountIdentifier][instrumentSymbol] += signedQuantityDelta
 }
 
+// SetPositionDirectly overwrites an account's net quantity for one
+// instrument to an absolute value, bypassing the normal buy/sell
+// ApplyFill delta path entirely. NOT used by ordinary trading flow —
+// exists for FEATURES.md §21's corporate-action explainer
+// (internal/corporateactionexplainer), where a split/bonus/merger
+// changes a real holding's quantity outside of any trade fill. Callers
+// are responsible for computing the correct new quantity themselves;
+// this method performs no corporate-action math of its own.
+func (positionBook *PositionBook) SetPositionDirectly(accountIdentifier string, instrumentSymbol string, newQuantity int64) {
+	positionBook.mutexGuardingPositions.Lock()
+	defer positionBook.mutexGuardingPositions.Unlock()
+
+	if positionBook.netQuantityByAccountAndInstrument[accountIdentifier] == nil {
+		positionBook.netQuantityByAccountAndInstrument[accountIdentifier] = make(map[string]int64)
+	}
+	positionBook.netQuantityByAccountAndInstrument[accountIdentifier][instrumentSymbol] = newQuantity
+}
+
 // PositionsForAccount returns a copy of the account's current positions
 // (instrument -> net signed quantity). Instruments with a net-zero
 // position are omitted rather than returned as an explicit zero.

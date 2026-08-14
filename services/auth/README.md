@@ -73,11 +73,63 @@ What's real:
   with a wrong code (401) → login with the correct code (real tokens) →
   disable → login without a code succeeds again → enroll without a valid
   bearer token (401). Every step against a real running process, not
-  just `go test`. `go test -race ./...` clean (53 tests across 8
+  just `go test`. `go test -race ./...` clean (71 tests across 9
   packages: passwordhashing, jwtauth, sessionstore, accountstore,
-  httplogging, ratelimiter, totp, mfastate).
+  httplogging, ratelimiter, totp, mfastate, anomalouslogindetection).
+
+- **Anomalous-login / account-takeover detection** (`internal/
+  anomalouslogindetection`), FEATURES.md §19 — a REAL, DISTINCT
+  capability from the AML monitoring in FEATURES.md §1/ledger (that's
+  money-laundering-shaped fund movement; this is account-takeover-shaped
+  login behavior — different domain, no shared code). **Honesty note on
+  "ML-based" in the FEATURES.md item name**: this is NOT a trained
+  machine-learning model — there is no labeled historical account-
+  takeover dataset in this repo (or anywhere close to enough of one) to
+  train anything on. What's built is real RULE-BASED/heuristic detection
+  over real per-account login history: (1) new-device/new-network
+  detection — a real per-account history of opaque, caller-supplied
+  `deviceFingerprint`/`ipAddressPrefix` values, flagging a login from one
+  genuinely never seen before on that account (an account's very first
+  attempt establishes no alert — nothing to compare against yet); (2)
+  impossible travel — given an optional illustrative `latitude`/
+  `longitude` per login, a real haversine great-circle distance
+  calculation between two SUCCESSFUL logins for the same account divided
+  by real elapsed wall-clock time, flagged if the implied speed exceeds
+  1000 km/h (faster than a commercial aircraft cruises); (3)
+  rapid-repeated-failed-then-success — a real sliding count of
+  consecutive failed attempts within a 10-minute window, flagged if a
+  success follows 3+ of them (the credential-stuffing/brute-force-then-
+  guessed-it signature). Every alert is a real, structured, retained (never
+  mutated/deleted) `Alert` record, queryable via `GET /auth/security/
+  login-alerts?accountId=...` (omit `accountId` for every alert across
+  every account) and surfaced inline in a login response's
+  `securityAlerts` field. Detection only — no automated response (no
+  forced step-up MFA, no session revocation, no account lock). 18 tests.
+  Anomaly detection is keyed on the normalized email throughout the login
+  handler, not `accountIdentifier` — a failed login (wrong password or
+  unknown email) never learns a real `accountIdentifier` by design (the
+  same timing-parity dummy-hash comparison `accountstore` already does to
+  avoid leaking which emails are registered), so keying on
+  `accountIdentifier` would make failed and successful attempts for the
+  same account untraceable to each other, silently breaking the
+  rapid-failures-then-success detector. **Verified live**: registered an
+  account, logged in from device A/NYC (no alert — first attempt), same
+  device/network again (no alert), then a genuinely new device
+  fingerprint from Tokyo moments later — got BOTH `NEW_DEVICE_OR_NETWORK`
+  and `IMPOSSIBLE_TRAVEL` alerts in the same response; separately, 3 rapid
+  wrong-password attempts followed by the correct password raised
+  `RAPID_FAILURES_THEN_SUCCESS`. Both confirmed queryable afterward via
+  `GET /auth/security/login-alerts`.
 
 What's a placeholder / not built:
+- `internal/anomalouslogindetection` is in-memory only (all login/device/
+  location history and every alert is lost on restart); no real device-
+  fingerprint generation or IP geolocation (both accepted as opaque
+  caller-supplied values, trusting the caller entirely); the
+  `login-alerts` query endpoint has no auth — a real build gates it
+  behind a security/admin role; thresholds (1000 km/h, 3 failures, a
+  10-minute window) are hand-picked illustrative constants, not tuned
+  against real fraud data because none exists here.
 - **`apps/web` can register/login/logout for real now, but nothing GATES
   on it yet** — oms-gateway still accepts every request unauthenticated;
   there's no `RequireValidAccessToken` middleware anywhere, and the order
@@ -172,6 +224,21 @@ curl -X POST localhost:8086/auth/login -d '{
 # -> real tokens
 
 curl -X POST localhost:8086/auth/mfa/disable -H "Authorization: Bearer <accessToken>"
+
+# anomalous-login detection: optional fields on login feed the detector
+curl -X POST localhost:8086/auth/login -d '{
+  "email": "jane@example.com",
+  "password": "correct horse battery staple",
+  "deviceFingerprint": "device-abc",
+  "ipAddressPrefix": "203.0.113.0/24",
+  "latitude": 40.7128,
+  "longitude": -74.0060
+}'
+# -> real tokens + "securityAlerts": [] on a login raising no anomaly
+
+# query every anomalous-login alert raised for an account (or omit
+# accountId for every alert across every account)
+curl "localhost:8086/auth/security/login-alerts?accountId=jane@example.com"
 
 go test ./... -race
 ```

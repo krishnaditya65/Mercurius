@@ -124,9 +124,9 @@ onto an internal one later is expensive.
 
 ## 5. Fixed Income
 
-- [ ] `[P2]` Primary market bidding UI: G-Secs, T-Bills, SGBs (RBI auction calendar)
-- [ ] `[P2]` Secondary market bond browsing + YTM calculator
-- [ ] `[P3]` Bond ladder builder, credit rating display, coupon calendar/reminders
+- [ ] 🚧 `[P2]` Primary market bidding UI: G-Secs, T-Bills, SGBs (RBI auction calendar)
+- [ ] 🚧 `[P2]` Secondary market bond browsing + YTM calculator
+- [ ] 🚧 `[P3]` Bond ladder builder, credit rating display, coupon calendar/reminders
 
 ## 6. Quant Math Engine (as a standalone internal service, not scattered logic)
 
@@ -255,17 +255,17 @@ onto an internal one later is expensive.
 
 ## 17. Wealth & Product Breadth
 
-- [ ] `[P3]` Fractional share investing
+- [ ] 🚧 `[P3]` Fractional share investing
 - [ ] 🚧 `[P3]` Dividend Reinvestment Plans (DRIP), auto-compounding toggle
 - [ ] 🚧 `[P3]` ESG/sustainability scoring and screening filters
 - [ ] 🚧 `[P3]` Loan Against Securities (LAS) — instant credit line against holdings
-- [ ] `[P4]` Global markets access (US/international stocks via GDR/ADR or
+- [ ] 🚧 `[P4]` Global markets access (US/international stocks via GDR/ADR or
       partner brokerage rails)
-- [ ] `[P4]` Retirement account wrappers (NPS/IRA-equivalent, tax-advantaged
+- [ ] 🚧 `[P4]` Retirement account wrappers (NPS/IRA-equivalent, tax-advantaged
       structures per jurisdiction)
-- [ ] `[P4]` Structured products desk (capital-protected notes, market-linked
+- [ ] 🚧 `[P4]` Structured products desk (capital-protected notes, market-linked
       debentures)
-- [ ] `[P4]` Insurance cross-sell (term/health) — separate regulated entity,
+- [ ] 🚧 `[P4]` Insurance cross-sell (term/health) — separate regulated entity,
       integrated via API only
 
 ## 18. Platform, Ecosystem & Institutional Tooling
@@ -286,22 +286,22 @@ onto an internal one later is expensive.
 
 ## 19. Trust, Safety & Behavioral Design
 
-- [ ] `[P2]` Overtrading / revenge-trading pattern detection with cool-down
+- [ ] 🚧 `[P2]` Overtrading / revenge-trading pattern detection with cool-down
       nudges (behavioral finance, not just risk-limit enforcement)
-- [ ] `[P2]` Mandatory risk disclosure + cooling-off flow before first F&O
+- [ ] 🚧 `[P2]` Mandatory risk disclosure + cooling-off flow before first F&O
       order (increasingly a regulatory requirement, not optional UX)
-- [ ] `[P3]` ML-based account-takeover / anomalous-login detection, distinct
+- [ ] 🚧 `[P3]` ML-based account-takeover / anomalous-login detection, distinct
       from the AML monitoring in §1
-- [ ] `[P3]` Explicit "paper trading only" mode gate for strategies below a
+- [ ] 🚧 `[P3]` Explicit "paper trading only" mode gate for strategies below a
       track-record threshold before they can request live capital
-- [ ] `[P4]` Verified-track-record social/copy-trading leaderboards with
+- [ ] 🚧 `[P4]` Verified-track-record social/copy-trading leaderboards with
       disclosed, audited performance (not self-reported returns)
 
 ## 20. Advanced Charting & Market Microstructure Views
 
-- [ ] `[P3]` Volume Profile / Market Profile (TPO) charts
-- [ ] `[P3]` Order-flow footprint charts (bid/ask volume per price per candle)
-- [ ] `[P4]` Historical DOM replay for a chosen instrument/time window (ties
+- [ ] 🚧 `[P3]` Volume Profile / Market Profile (TPO) charts
+- [ ] 🚧 `[P3]` Order-flow footprint charts (bid/ask volume per price per candle)
+- [ ] 🚧 `[P4]` Historical DOM replay for a chosen instrument/time window (ties
       into the Tick-to-Trade Analytics replay tool in §4 of the original brief)
 
 ## 21. Customer Pain-Point Features (the stuff users actually complain about)
@@ -312,28 +312,28 @@ onto an internal one later is expensive.
 - [ ] 🚧 `[P1]` Full charges breakdown *before* order confirmation: brokerage,
       STT/CTT, stamp duty, GST, exchange transaction charges, DP charges —
       shown as a receipt, not discovered after the fact
-- [ ] `[P1]` Intraday auto square-off countdown timer + push reminder before
+- [ ] 🚧 `[P1]` Intraday auto square-off countdown timer + push reminder before
       forced closure, with the exact cutoff time per exchange/segment
-- [ ] `[P2]` Corporate-action explainer: when a split/bonus/merger changes
+- [ ] 🚧 `[P2]` Corporate-action explainer: when a split/bonus/merger changes
       quantity or average price, show a one-line "why did this change"
       inline on the holding, not buried in a statement
-- [ ] `[P2]` Idempotent order status with WebSocket-reconnect reconciliation —
+- [ ] 🚧 `[P2]` Idempotent order status with WebSocket-reconnect reconciliation —
       never let a user wonder "did my order actually go through?" after a
       dropped connection
 - [ ] `[P2]` One-click capital gains statement export (broker-generated,
       pre-formatted for common tax-filing tools)
-- [ ] `[P2]` Liquidity/fill-probability badge on the order ticket for
+- [ ] 🚧 `[P2]` Liquidity/fill-probability badge on the order ticket for
       illiquid instruments, with expected-time-to-fill estimate
-- [ ] `[P2]` Margin/leverage interest cost calculator shown live — real cost
+- [ ] 🚧 `[P2]` Margin/leverage interest cost calculator shown live — real cost
       of carrying a leveraged position, not just the margin required
-- [ ] `[P3]` Portfolio stress test: "if Nifty drops 10% tomorrow, your
+- [ ] 🚧 `[P3]` Portfolio stress test: "if Nifty drops 10% tomorrow, your
       portfolio loses ~₹X" using current Greeks/beta exposure
-- [ ] `[P3]` Large-order friction: a brief confirm-with-context step for
+- [ ] 🚧 `[P3]` Large-order friction: a brief confirm-with-context step for
       orders that are large relative to the user's history or the
       instrument's average volume (anti-fat-finger, anti-impulse)
-- [ ] `[P3]` Family/joint account views with granular permissions (view-only
+- [ ] 🚧 `[P3]` Family/joint account views with granular permissions (view-only
       access for a spouse/dependent, not full trading rights)
-- [ ] `[P3]` Nominee succession workflow: documented, auditable transfer
+- [ ] 🚧 `[P3]` Nominee succession workflow: documented, auditable transfer
       process triggered by a death certificate submission — currently a
       multi-week ordeal at most brokers
 - [ ] `[P3]` Cross-device watchlist/alert sync with a home-screen live P&L
@@ -343,42 +343,42 @@ onto an internal one later is expensive.
 
 ## 22. Deep Quant & Algorithmic Trading Internals
 
-- [ ] `[P3]` Portfolio-level Greeks aggregation: net delta/gamma/theta/vega
+- [ ] 🚧 `[P3]` Portfolio-level Greeks aggregation: net delta/gamma/theta/vega
       across *all* positions, not per-contract — this is what actually
       matters to an options seller managing risk, and almost no retail
       platform surfaces it
-- [ ] `[P3]` IV Rank / IV Percentile (current IV vs. its own 1-year range),
+- [ ] 🚧 `[P3]` IV Rank / IV Percentile (current IV vs. its own 1-year range),
       not just raw IV — the metric serious options traders actually use to
       decide whether to buy or sell premium (tastytrade-style)
-- [ ] `[P3]` Implied vs. realized volatility comparison chart, per instrument
-- [ ] `[P3]` Synthetic position builder (e.g., synthetic long = long call +
+- [ ] 🚧 `[P3]` Implied vs. realized volatility comparison chart, per instrument
+- [ ] 🚧 `[P3]` Synthetic position builder (e.g., synthetic long = long call +
       short put) with combined Greeks and margin shown as one unit
-- [ ] `[P3]` Delta-hedging automation: auto-hedge or alert when portfolio net
+- [ ] 🚧 `[P3]` Delta-hedging automation: auto-hedge or alert when portfolio net
       delta crosses a user-defined threshold
-- [ ] `[P4]` Cointegration testing (Engle-Granger/Johansen) for pairs-trade
+- [ ] 🚧 `[P4]` Cointegration testing (Engle-Granger/Johansen) for pairs-trade
       candidate selection — correlation alone produces false pairs; this is
       the actual statistical test quant desks use
-- [ ] `[P4]` Regime detection (Hidden Markov Model: trending/mean-reverting/
+- [ ] 🚧 `[P4]` Regime detection (Hidden Markov Model: trending/mean-reverting/
       high-vol classification) to gate which strategies are allowed to run
-- [ ] `[P4]` Factor risk model (Fama-French-style or custom Barra-lite) for
+- [ ] 🚧 `[P4]` Factor risk model (Fama-French-style or custom Barra-lite) for
       portfolio construction and exposure reporting
-- [ ] `[P4]` Monte Carlo engine for path-dependent option pricing (barrier,
+- [ ] 🚧 `[P4]` Monte Carlo engine for path-dependent option pricing (barrier,
       Asian options) and portfolio-level VaR simulation
-- [ ] `[P4]` Realistic backtest cost modeling: slippage, partial fills, and
+- [ ] 🚧 `[P4]` Realistic backtest cost modeling: slippage, partial fills, and
       market-impact curves (Almgren-Chriss-style) instead of idealized
       fill-at-close backtests — the single biggest reason backtested
       strategies fail live
-- [ ] `[P4]` Walk-forward optimization / out-of-sample validation built into
+- [ ] 🚧 `[P4]` Walk-forward optimization / out-of-sample validation built into
       the backtester, with automatic overfitting warnings (e.g. flag
       strategies with too many tunable parameters relative to sample size)
-- [ ] `[P4]` Kelly-criterion-based position sizing calculator per strategy
-- [ ] `[P4]` Strategy correlation matrix across a user's/desk's live
+- [ ] 🚧 `[P4]` Kelly-criterion-based position sizing calculator per strategy
+- [ ] 🚧 `[P4]` Strategy correlation matrix across a user's/desk's live
       strategies — surfaces when "5 algos" are secretly one correlated bet
-- [ ] `[P4]` Latency benchmarking dashboard for algo clients: order
+- [ ] 🚧 `[P4]` Latency benchmarking dashboard for algo clients: order
       round-trip histograms, per-venue comparison
-- [ ] `[P4]` Cross-asset macro dashboard (yields, DXY, crude, VIX vs. equity
+- [ ] 🚧 `[P4]` Cross-asset macro dashboard (yields, DXY, crude, VIX vs. equity
       indices) for macro/derivatives desks
-- [ ] `[P4]` Options-aware corporate-action handling: auto-adjust strike/
+- [ ] 🚧 `[P4]` Options-aware corporate-action handling: auto-adjust strike/
       quantity on splits, flag early-exercise risk around ex-dividend dates
       for American-style contracts
 

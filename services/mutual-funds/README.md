@@ -6,6 +6,12 @@ service builds all six items in that section — the three `[P1]` items
 SIPs) plus the `[P2]`/`[P3]` items (index/thematic rebalancing baskets
 with one-click rebalance, Robo-Advisory, goal-based investing).
 
+It also now builds `FEATURES.md` §5 "Fixed Income" in full (primary-market
+bidding, secondary-market YTM, bond ladders) and four `[P4]` items from
+§17 "Wealth & Product Breadth" (global markets access, retirement account
+wrappers, structured products, insurance cross-sell) — see "Fixed Income"
+and "Wealth & Product Breadth (§17 `[P4]` items)" below.
+
 ## Status: AMC routing, SIP scheduling, step-up math, basket rebalancing, Robo-Advisory, and goal tracking are all real (simulated) engines — none of it talks to a real AMC
 
 What's real:
@@ -116,9 +122,14 @@ What's real:
   exactly ₹591.12 against a ₹3000 target (NOT on track), with a real
   solved-for required monthly contribution of ₹92.53 to close that gap
   using the same formula run in reverse.
-- 88 tests across the six packages (6 `fundcatalog`, 11 `amcrouting`,
-  19 `sipscheduler`, 18 `basketrebalancing`, 15 `roboadvisory`,
-  19 `goalinvesting`), covering happy paths, pause/cancel/resume
+- 88 tests across the original six §4 packages (6 `fundcatalog`, 11
+  `amcrouting`, 19 `sipscheduler`, 18 `basketrebalancing`, 15
+  `roboadvisory`, 19 `goalinvesting`) — plus another 136 tests across the
+  eight packages added for §5 "Fixed Income" and §17's `[P4]` items (8
+  `fixedincome`, 14 `primarymarketbidding`, 17 `secondarymarketbonds`, 18
+  `bondladderbuilder`, 26 `globalmarketsaccess`, 17 `retirementaccounts`,
+  20 `structuredproducts`, 16 `insurancecrosssell`) — 224 tests total
+  across the whole service. The original 88 cover happy paths, pause/cancel/resume
   semantics, the hand-worked step-up boundary math at both the first and
   second anniversary, sweep idempotency (for both order confirmation and
   SIP execution), the hand-worked basket drift/rebalance example, every
@@ -154,6 +165,209 @@ What's real:
   return series; and a goal's progress calculation exactly matched the
   hand-worked ₹23,346 projected-value example from this package's test
   suite.
+
+## Fixed Income (FEATURES.md §5) — real bidding/allotment, real YTM math, real ladder-building, all over an illustrative catalog with NO real RBI/CCIL connectivity
+
+What's real:
+- **A static bond catalog** (`internal/fixedincome`): seven illustrative,
+  entirely fictitious G-Sec/T-Bill/SGB instruments (three G-Secs, two
+  T-Bills, two SGBs) spanning maturities from ~3 months to 10 years, each
+  with an issue name, issue date, maturity date, coupon rate (0 for
+  T-Bills — pure discount instruments), payments-per-year (2/semi-annual
+  for coupon-bearing instruments), face value, and a STATIC illustrative
+  credit rating (AAA/AA/A — every real instrument here is actually a
+  sovereign obligation; the varied ratings exist purely to illustrate a
+  broader ladder that might one day include corporate bonds). A fixed,
+  hand-rolled "auction calendar" (`SeedAuctionCalendar`) ties five of the
+  seven bonds (G-Secs and T-Bills; SGBs are sold via subscription in
+  reality, not competitive auction, so are deliberately excluded) to
+  illustrative scheduled auction dates and notified amounts.
+- **Primary market bidding: G-Secs/T-Bills, RBI auction calendar**
+  (`internal/primarymarketbidding`, FEATURES.md §5 item 1): a REAL
+  `SCHEDULED → OPEN → CLOSED` auction state machine, opened by
+  `OpenDueAuctions` sweeping past each auction's scheduled date (same
+  "sweep, don't push" pattern as `amcrouting.ConfirmDueOrders`), with
+  `SubmitBid` accepting a quantity (face value) + yield only while OPEN.
+  `CloseAuction` runs a REAL, documented allotment rule: a MULTIPLE-PRICE
+  ("French") yield-priority auction — bids sorted ascending by requested
+  yield (lowest yield = most competitive), allotted greedily against the
+  notified amount AT EACH BID'S OWN YIELD, with bids tied at the exact
+  cutoff yield split PRO-RATA by requested quantity (last tied bid absorbs
+  the rounding remainder so the split sums exactly), and everything past
+  the cutoff REJECTED outright. Hand-worked and tested: an oversubscribed
+  91-day T-Bill auction (notified ₹20,00,000.00) with two ₹15,00,000.00
+  bids at different yields allots the lower-yield bid in full and the
+  higher-yield bid exactly the remaining ₹5,00,000.00 (PARTIALLY_ALLOTTED);
+  a 364-day T-Bill auction (notified ₹15,00,000.00) with two TIED
+  ₹10,00,000.00 bids at the same yield splits the notified amount exactly
+  50/50 (₹7,50,000.00 each), summing EXACTLY to the notified amount.
+- **Secondary market bond browsing + YTM calculator**
+  (`internal/secondarymarketbonds`, FEATURES.md §5 item 2): a REAL
+  Newton-Raphson Yield-to-Maturity solver (`CalculateYieldToMaturity`)
+  over the standard bond-pricing equation, using the closed-form ANALYTIC
+  derivative of price with respect to yield at each iteration step (not a
+  numeric finite-difference approximation), annualizing the solved
+  periodic yield. A zero-coupon instrument (a T-Bill) is solved via the
+  exact closed form `y = (faceValue/price)^(1/years) - 1` directly — no
+  iteration, no rounding drift. Hand-worked and tested with THREE
+  independent, non-circular identities: (1) a PAR bond (price == face
+  value) has YTM exactly equal to its coupon rate — 7.10% face-value-priced
+  GSEC-07.10-2028 over 20 semi-annual periods recovers exactly 7.10%; (2) a
+  zero-coupon bond priced at exactly `faceValue/1.21` for a 2-year term
+  recovers exactly 10.00%; (3) a zero-coupon bond with a clean 1-year term
+  (face 1000, price 900) recovers the exact closed-form 11.1111...%. A
+  round-trip test also confirms `CalculateYieldToMaturity` recovers a
+  target yield a coupon bond was independently priced at.
+  `internal/secondarymarketbonds.SecondaryMarket` seeds an illustrative
+  current price per catalog bond (never moves on its own — only
+  `UpdatePrice`, same testing/demo-only hook pattern as
+  `fundcatalog.UpdateNav`) and `ListListings` returns a browsable listing
+  of every bond with its current price and real computed YTM.
+- **Bond ladder builder, credit rating display, coupon calendar/reminders**
+  (`internal/bondladderbuilder`, FEATURES.md §5 item 3): `BuildLadder`
+  spreads a target investment across a target number of rungs picked at
+  EVENLY-SPACED indices across the catalog sorted by maturity (so the
+  first rung is always the nearest-maturity bond, the last is always the
+  farthest, staggered in between — not just "the first N bonds"), split
+  evenly across rungs with the LAST rung absorbing the rounding remainder
+  (same convention as `basketrebalancing`'s per-leg split), each rung
+  carrying `fixedincome`'s static credit rating. `UpcomingCoupons` computes
+  a REAL coupon-payment calendar for a holder's ladder positions: coupon
+  dates are stepped forward genuinely from each bond's own `IssueDate` in
+  `12/PaymentsPerYear`-month increments (calendar-aware, via
+  `time.Time.AddDate` — same pattern `sipscheduler` uses for step-up
+  anniversaries) up to `MaturityDate`, filtered to dates after `asOf`; a
+  zero-coupon T-Bill correctly produces NO reminders. Hand-worked and
+  tested: holding GSEC-07.10-2028 (issued 2023-08-01, 7.10% semi-annual,
+  face 100000) at full face value, `asOf` 2026-08-14 (just past the
+  2026-08-01 coupon), the next reminder is computed as exactly 2027-02-01
+  for exactly ₹35.50 (3550 minor units) — the same amount the catalog's
+  own full-face-value coupon would pay.
+- **Verified live end-to-end**: opened the GSEC-07.10-2028 auction via
+  `?asOf=`, submitted two competing bids, closed the auction, and got back
+  the exact hand-computed ALLOTTED/PARTIALLY_ALLOTTED split; browsed the
+  secondary market and confirmed a bond re-priced to exactly its face
+  value reports YTM ≈ 7.0999999998% (its own 7.10% coupon rate, to
+  float-precision); built a 7-rung ladder spanning the FULL catalog
+  (₹7,00,000.00 across all 7 bonds) and confirmed the rungs come back
+  sorted nearest-to-farthest maturity (T-Bills first, GSEC-06.90-2036
+  last); and pulled the resulting coupon calendar and confirmed
+  GSEC-07.10-2028's entry lands on 2027-02-01 for exactly ₹35.50, matching
+  the hand-worked test.
+
+What's a placeholder in Fixed Income:
+- **NOT connected to any real RBI auction system.** There is no E-Kuber
+  (RBI's real primary-auction platform) integration anywhere in this repo
+  — the "auction" on the other end of every bid in
+  `internal/primarymarketbidding` is that package's own in-memory state.
+- **NOT connected to any real secondary bond market.** There is no
+  CCIL/NDS-OM (the real institutional G-Sec secondary market) or exchange
+  (NSE/BSE retail bond trading) integration — `internal/secondarymarketbonds`'s
+  "current price" is its own in-memory, entirely illustrative number.
+- The bond catalog is seven hardcoded, entirely fictitious instruments —
+  no AMFI/RBI feed, no real issue calendar beyond the five hand-picked
+  fixture dates in `SeedAuctionCalendar`.
+- Credit ratings are a static illustrative field, not a real ratings-agency
+  feed — see `internal/fixedincome`'s doc comment.
+- `internal/bondladderbuilder.BuildLadder` does NOT route through
+  `internal/primarymarketbidding` or `internal/secondarymarketbonds` at
+  all — a ladder purchase is recorded directly into the builder's own
+  holdings, instantly, at face value, as if executed at par; a real build
+  would route each rung through a real bid or trade and only record the
+  holding once that settles.
+- No cash-side integration anywhere in this section — same gap as §4's
+  mutual fund orders.
+- In-memory only, no auth, no persistence — same gaps as the rest of this
+  service.
+
+## Wealth & Product Breadth (§17 `[P4]` items) — four smaller, more explicitly illustrative packages
+
+FEATURES.md §17 lists several `[P4]` "wealth & product breadth" items.
+This service builds four of them as small, self-contained, honestly-
+caveated packages — genuinely regulated products (global brokerage,
+retirement tax wrappers, insurance) can't actually be built end-to-end in
+this repo, so each package draws its own honest line around what's real
+(the mechanics/rules engine) versus what's illustrative (the regulated
+substance).
+
+- **Global markets access (US/international stocks via GDR/ADR or partner
+  brokerage rails)** (`internal/globalmarketsaccess`, FEATURES.md §17): a
+  small catalog of five illustrative, entirely fictitious ADR-style
+  symbols; a REAL `PENDING → ROUTED → CONFIRMED` order state machine
+  (`Router`) — `RouteOrder` converts the investor's INR funding amount to
+  the symbol's quote currency at the CURRENT FX rate (struck at routing
+  time, standing in for "handed off to the partner brokerage rail"), and
+  `ConfirmOrder` allocates units at the symbol's CURRENT catalog price
+  (struck at confirmation, mirroring `amcrouting`'s "NAV struck at
+  confirmation, not placement" pattern). Currency conversion
+  (`CurrencyConverter`) reuses the CONCEPT of a multi-currency wallet — a
+  per-pair FX rate table — WITHOUT calling ledger's real
+  `internal/multicurrencywallet`; a real build would integrate with that
+  service directly. Hand-worked and tested: ₹8,300.00 (830000 minor units)
+  at the seeded 83.00 INR/USD rate converts to exactly $100.00 (10000
+  cents). LOUD CAVEAT: NO real GDR/ADR issuance or partner-brokerage
+  connectivity exists anywhere in this repo.
+- **Retirement account wrappers (NPS/IRA-equivalent, tax-advantaged
+  structures per jurisdiction)** (`internal/retirementaccounts`,
+  FEATURES.md §17): a real account-type classification
+  (`NPS_EQUIVALENT`/`IRA_EQUIVALENT`), each with its own illustrative,
+  hand-picked ANNUAL CONTRIBUTION LIMIT that is REALLY ENFORCED —
+  `Contribute` sums the calendar year's contributions so far and REJECTS
+  anything that would push the total past the limit (hand-worked and
+  tested at the EXACT boundary: the limit itself succeeds, one minor unit
+  more is rejected; the limit resets in a new calendar year) — and a real,
+  ENFORCED lock-in rule: `Withdraw` computes the holder's eligible
+  withdrawal date as `dateOfBirth.AddDate(minimumRetirementAge, 0, 0)`
+  (calendar-aware, same pattern `sipscheduler` uses for step-up
+  anniversaries) and REJECTS any withdrawal before that date, tested at
+  the exact day-before/day-of boundary. LOUD CAVEAT: the underlying TAX
+  ADVANTAGE is entirely illustrative — no real PFRDA/IRS integration, no
+  real tax benefit computed or claimed anywhere; what's real is the RULES
+  ENGINE (limits + lock-in), genuinely enforced over illustrative inputs.
+- **Structured products desk (capital-protected notes, market-linked
+  debentures)** (`internal/structuredproducts`, FEATURES.md §17): a real,
+  testable payoff-structure definition — "100% capital protection +
+  PARTICIPATION_RATE% participation in an underlying index's upside, capped
+  at CAP%" — computed by `CalculatePayoff`: a non-positive index return
+  returns the FULL protected principal (zero downside participation, by
+  construction); a positive return participates at the note's rate, capped
+  at the note's ceiling. A real `SUBSCRIBED → MATURED` state machine
+  (`Desk`) tracks subscriptions and computes the real payout at maturity.
+  Hand-worked and tested: ₹1,000.00 principal, 150% participation, 20%
+  cap, +10% index return → participated return 15% (under the cap) →
+  payout exactly ₹1,150.00; the SAME note at +20% index return →
+  participated return 30% (OVER the cap) → capped at 20% → payout exactly
+  ₹1,200.00, `wasCapped=true`; a -25% index return still returns the FULL
+  principal. LOUD CAVEAT: no real underlying index feed exists — the
+  index's return is a plain number the caller supplies at maturity time,
+  not fetched from any real market data source, and this is NOT connected
+  to any real structured-products issuance desk or investment bank.
+- **Insurance cross-sell (term/health)** (`internal/insurancecrosssell`,
+  FEATURES.md §17): a DELIBERATELY THIN integration stub — `PartnerClient`
+  is the boundary this platform calls OUT across to reach a separate,
+  independently regulated insurer; `MockInsurancePartnerClient` stands in
+  for that real partner's quote API with a simple, illustrative flat-rate
+  premium formula (`annualRatePercent = baseRate + ageLoading * age`),
+  hand-worked and tested: TERM_LIFE, age 30, ₹10,00,000.00 coverage →
+  0.10% + 0.01%×30 = 0.40% → premium exactly ₹4,000.00; HEALTH, age 40,
+  ₹5,00,000.00 coverage → 1.00% + 0.05%×40 = 3.00% → premium exactly
+  ₹15,000.00. `Service.RegisterInterest` records a lead against a
+  previously-quoted `quoteId` — the ENTIRE scope of what this platform
+  does; everything past that (application, underwriting, policy issuance)
+  is explicitly out of scope, real, and belongs to the separately
+  regulated partner insurer. LOUD CAVEAT: this is NOT an insurance
+  underwriting engine — there is no real actuarial rate table, no medical
+  underwriting, and no real insurer integration anywhere in this repo.
+- **Verified live end-to-end** for all four: placed and routed a global
+  order (₹8,300.00 → $100.00 exactly), confirmed it into 1.1876 units at
+  the catalog's $84.20 price; opened an NPS-equivalent retirement account,
+  contributed exactly its ₹15,00,000.00 illustrative annual limit
+  (succeeded), then one more minor unit (rejected), then confirmed
+  withdrawal is rejected before age 60 and succeeds at/after it; subscribed
+  to a capital-protected structured note and matured it at +20% index
+  return for the exact hand-computed capped payout of ₹1,200.00 on a
+  ₹1,000.00 principal; and requested a TERM_LIFE quote (exact ₹4,000.00
+  premium) and registered interest against it.
 
 What's a placeholder:
 - **`internal/amcrouting` never talks to any real AMC or RTA.** There is

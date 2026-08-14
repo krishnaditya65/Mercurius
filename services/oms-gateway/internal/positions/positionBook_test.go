@@ -61,3 +61,36 @@ func TestUnknownAccountHasNoPositions(t *testing.T) {
 		t.Fatalf("expected no positions, got %+v", positions)
 	}
 }
+
+func TestSetPositionDirectly_OverwritesExistingQuantity(t *testing.T) {
+	positionBookUnderTest := NewPositionBook()
+
+	positionBookUnderTest.ApplyFill("acct-001", "acct-002", "DEMO-EQ", 10)
+	positionBookUnderTest.SetPositionDirectly("acct-001", "DEMO-EQ", 20)
+
+	if got := positionBookUnderTest.PositionsForAccount("acct-001")["DEMO-EQ"]; got != 20 {
+		t.Fatalf("expected overwritten position 20, got %d", got)
+	}
+}
+
+func TestSetPositionDirectly_WorksOnBrandNewAccount(t *testing.T) {
+	positionBookUnderTest := NewPositionBook()
+
+	positionBookUnderTest.SetPositionDirectly("acct-new", "DEMO-EQ", 15)
+
+	if got := positionBookUnderTest.PositionsForAccount("acct-new")["DEMO-EQ"]; got != 15 {
+		t.Fatalf("expected position 15, got %d", got)
+	}
+}
+
+func TestSetPositionDirectly_DoesNotAffectOtherInstruments(t *testing.T) {
+	positionBookUnderTest := NewPositionBook()
+
+	positionBookUnderTest.ApplyFill("acct-001", "acct-002", "OTHER-EQ", 5)
+	positionBookUnderTest.SetPositionDirectly("acct-001", "DEMO-EQ", 20)
+
+	positions := positionBookUnderTest.PositionsForAccount("acct-001")
+	if positions["DEMO-EQ"] != 20 || positions["OTHER-EQ"] != 5 {
+		t.Fatalf("unexpected positions: %+v", positions)
+	}
+}

@@ -41,6 +41,7 @@ package marginfunding
 import (
 	"errors"
 	"sync"
+	"time"
 )
 
 var (
@@ -97,12 +98,62 @@ type FundingBook struct {
 	mutexGuardingFunding sync.Mutex
 
 	outstandingPrincipalByAccount map[string]int64
+
+	// disbursementStartTimeByAccount: FEATURES.md §21's live interest
+	// cost calculator (see costCalculator.go) needs a real "since when
+	// has this account owed interest" instant to compute days-elapsed
+	// from. Set via RecordDisbursementStartTime (called by the HTTP
+	// handler with the real wall clock right after a successful
+	// RequestFunding — this package itself never reads the wall clock
+	// internally, same discipline as internal/algolimits). Cleared
+	// automatically the moment RepayFunding brings an account's
+	// principal back to exactly zero, so a LATER fresh draw restarts the
+	// interest clock rather than inheriting a stale start time.
+	//
+	// KNOWN SIMPLIFICATION: if an account draws MORE funding while it
+	// already has outstanding principal, this start time is NOT reset —
+	// the whole (old + new) principal accrues from the ORIGINAL draw
+	// date. A real build would track each individual disbursement
+	// tranche's own start date and sum per-tranche interest; this
+	// package tracks one blended start time per account, the same
+	// "illustrative but real, hand-checkable" caliber as this package's
+	// other simplifications.
+	disbursementStartTimeByAccount map[string]time.Time
 }
 
 func NewFundingBook() *FundingBook {
 	return &FundingBook{
-		outstandingPrincipalByAccount: make(map[string]int64),
+		outstandingPrincipalByAccount:  make(map[string]int64),
+		disbursementStartTimeByAccount: make(map[string]time.Time),
 	}
+}
+
+// RecordDisbursementStartTime marks `now` as the real instant an
+// account's interest clock starts running — ONLY if it doesn't already
+// have one recorded (a second draw while principal is already
+// outstanding does not push the clock forward; see the struct field's
+// doc comment for the honest blended-principal simplification this
+// implies). Idempotent and safe to call on every successful funding
+// request.
+func (fundingBook *FundingBook) RecordDisbursementStartTime(clientAccountIdentifier string, now time.Time) {
+	fundingBook.mutexGuardingFunding.Lock()
+	defer fundingBook.mutexGuardingFunding.Unlock()
+
+	if _, alreadyRecorded := fundingBook.disbursementStartTimeByAccount[clientAccountIdentifier]; !alreadyRecorded {
+		fundingBook.disbursementStartTimeByAccount[clientAccountIdentifier] = now
+	}
+}
+
+// DisbursementStartTime returns the account's currently recorded
+// interest-clock start time, and whether one exists at all (false if the
+// account has never drawn funding, or fully repaid it and hasn't drawn
+// again since).
+func (fundingBook *FundingBook) DisbursementStartTime(clientAccountIdentifier string) (time.Time, bool) {
+	fundingBook.mutexGuardingFunding.Lock()
+	defer fundingBook.mutexGuardingFunding.Unlock()
+
+	startTime, exists := fundingBook.disbursementStartTimeByAccount[clientAccountIdentifier]
+	return startTime, exists
 }
 
 // RequestFunding reserves `requestedAmountInMinorUnits` of new principal
@@ -174,6 +225,13 @@ func (fundingBook *FundingBook) RepayFunding(clientAccountIdentifier string, amo
 
 	newOutstanding := currentOutstanding - amountInMinorUnits
 	fundingBook.outstandingPrincipalByAccount[clientAccountIdentifier] = newOutstanding
+	if newOutstanding == 0 {
+		// Fully repaid — clear the interest-clock start time so a future
+		// fresh draw restarts it instead of inheriting this repaid loan's
+		// stale start date. See disbursementStartTimeByAccount's doc
+		// comment.
+		delete(fundingBook.disbursementStartTimeByAccount, clientAccountIdentifier)
+	}
 	return newOutstanding, nil
 }
 

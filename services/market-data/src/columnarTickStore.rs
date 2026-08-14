@@ -39,6 +39,13 @@ struct SymbolColumns {
     timestampsEpochSeconds: Vec<u64>,
     pricesInMinorUnits: Vec<i64>,
     quantities: Vec<u64>,
+    /// Which side aggressed each tick — a fourth parallel column, added
+    /// additively (FEATURES.md §20 "Order-flow footprint charts") without
+    /// disturbing the existing three. Needed by
+    /// `orderFlowFootprintAggregator.rs` to split buy-vs-sell volume per
+    /// price level; `volumeProfileAggregator.rs` doesn't care about this
+    /// column at all (total volume is aggressor-agnostic).
+    isBuyAggressorFlags: Vec<bool>,
 }
 
 /// One tick as returned by a range query — a row-shaped VIEW reconstructed
@@ -50,6 +57,7 @@ pub struct TickRecord {
     pub executedAtEpochSeconds: u64,
     pub priceInMinorUnits: i64,
     pub quantity: u64,
+    pub isBuyAggressor: bool,
 }
 
 pub struct ColumnarTickStore {
@@ -67,6 +75,11 @@ impl ColumnarTickStore {
     /// (`main.rs`'s ingestion path) are expected to call this with
     /// non-decreasing `executedAtEpochSeconds` per symbol — see the
     /// struct doc for why that invariant matters to `rangeQuery`.
+    /// Not called from `main.rs` any more (the real ingestion path always
+    /// has an aggressor flag to pass, via `appendTickWithAggressorSide`) —
+    /// kept `pub` and exercised by this module's own pre-existing test
+    /// suite, same rationale as `CandleAggregator::recordTrade`.
+    #[allow(dead_code)]
     pub fn appendTick(
         &self,
         instrumentSymbol: &str,
@@ -74,17 +87,43 @@ impl ColumnarTickStore {
         priceInMinorUnits: i64,
         quantity: u64,
     ) {
+        self.appendTickWithAggressorSide(
+            instrumentSymbol,
+            executedAtEpochSeconds,
+            priceInMinorUnits,
+            quantity,
+            false,
+        );
+    }
+
+    /// Same as `appendTick`, but also records the real aggressor side
+    /// (FEATURES.md §20 "Order-flow footprint charts"). Kept as a separate
+    /// method for the same reason as `CandleAggregator::
+    /// recordTradeWithAggressorSide` — avoids touching every existing
+    /// `appendTick` call site in this module's own test suite for a field
+    /// most of them don't care about. `main.rs`'s real ingestion path
+    /// calls this one with the real flag from the wire.
+    pub fn appendTickWithAggressorSide(
+        &self,
+        instrumentSymbol: &str,
+        executedAtEpochSeconds: u64,
+        priceInMinorUnits: i64,
+        quantity: u64,
+        isBuyAggressor: bool,
+    ) {
         let mut columnsBySymbol = self.columnsBySymbol.lock().expect("columnar tick store mutex poisoned");
         let columns = columnsBySymbol.entry(instrumentSymbol.to_string()).or_default();
 
         columns.timestampsEpochSeconds.push(executedAtEpochSeconds);
         columns.pricesInMinorUnits.push(priceInMinorUnits);
         columns.quantities.push(quantity);
+        columns.isBuyAggressorFlags.push(isBuyAggressor);
 
         if columns.timestampsEpochSeconds.len() > MAX_RETAINED_TICKS_PER_INSTRUMENT {
             columns.timestampsEpochSeconds.remove(0);
             columns.pricesInMinorUnits.remove(0);
             columns.quantities.remove(0);
+            columns.isBuyAggressorFlags.remove(0);
         }
     }
 
@@ -118,6 +157,7 @@ impl ColumnarTickStore {
                 executedAtEpochSeconds: columns.timestampsEpochSeconds[index],
                 priceInMinorUnits: columns.pricesInMinorUnits[index],
                 quantity: columns.quantities[index],
+                isBuyAggressor: columns.isBuyAggressorFlags[index],
             })
             .collect()
     }

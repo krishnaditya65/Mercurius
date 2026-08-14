@@ -10,7 +10,10 @@
 // the rule stopped applying.
 package orders
 
-import "errors"
+import (
+	"errors"
+	"time"
+)
 
 // Order execution type constants — FEATURES.md §3's "Iceberg, FOK, IOC
 // for institutional flow". OrderExecutionType is an ADDITIONAL, more
@@ -191,6 +194,38 @@ type OrderSubmissionRequest struct {
 	// daily-notional limit is rejected before touching KYC/freeze/risk/
 	// matching-engine at all.
 	StrategyIdentifier string `json:"strategyIdentifier,omitempty"`
+
+	// ConfirmedLargeOrder: FEATURES.md §21's large-order friction — see
+	// internal/largeorderfriction's package doc. When a first submission
+	// is soft-rejected as unusually large (LARGE_ORDER_CONFIRMATION_REQUIRED),
+	// a client resubmits the EXACT SAME order with this set to true to
+	// proceed. Ignored (has no effect) on an order that was never
+	// flagged in the first place.
+	ConfirmedLargeOrder bool `json:"confirmedLargeOrder,omitempty"`
+
+	// MilliShareQuantity: FEATURES.md §17's fractional share investing.
+	// ADDITIVE, optional field (mirrors the OrderExecutionType precedent)
+	// layered alongside the pre-existing OrderQuantity (whole-share)
+	// field — see internal/fractionalshares' package doc for the full
+	// design rationale, the milli-share precision scheme (1000 = 1.000
+	// share), and the HONEST, LOUD scope boundary: a fractional order is
+	// only genuinely fillable via paper trading in this build
+	// (matching-engine has no milli-share-precision wire field), enforced
+	// by fractionalshares.ValidateMilliShareQuantity, called from
+	// buildSubmitOrderHandler before any gate runs — a client that omits
+	// this field entirely (every pre-existing client) is completely
+	// unaffected.
+	MilliShareQuantity *uint64 `json:"milliShareQuantity,omitempty"`
+}
+
+// FractionalTradeExecutionSummary mirrors TradeExecutionSummary but
+// carries a milli-share-precision ExecutedMilliShareQuantity instead of
+// a whole-share one — see internal/fractionalshares' package doc.
+type FractionalTradeExecutionSummary struct {
+	BuyingClientAccountId      string `json:"buyingClientAccountId"`
+	SellingClientAccountId     string `json:"sellingClientAccountId"`
+	ExecutedPriceInMinorUnits  int64  `json:"executedPriceInMinorUnits"`
+	ExecutedMilliShareQuantity uint64 `json:"executedMilliShareQuantity"`
 }
 
 // TradeExecutionSummary mirrors matchingengineclient.TradeExecutionWireEvent
@@ -255,6 +290,39 @@ type OrderAcknowledgementResponse struct {
 	// which never applies to a paper order (paper orders never reach
 	// matching-engine at all).
 	PaperOrderSimulationError string `json:"paperOrderSimulationError,omitempty"`
+
+	// OvertradingNudge: FEATURES.md §19's overtrading/revenge-trading
+	// pattern detection — see internal/overtradingdetection's package
+	// doc. Populated by cmd/server/main.go's buildSubmitOrderHandler
+	// (not processOrderSubmission itself) AFTER an order has already
+	// been fully processed, regardless of whether it was accepted or
+	// rejected — this is a NON-BLOCKING behavioral nudge, never a reason
+	// to change WasOrderAccepted. Nil/omitted on almost every request;
+	// only set when the detector's own pattern/cooldown logic actually
+	// fires.
+	OvertradingNudge *OvertradingNudge `json:"overtradingNudge,omitempty"`
+
+	// FractionalTradeExecutionEvents: FEATURES.md §17 fractional share
+	// investing — populated INSTEAD of TradeExecutionEvents when the
+	// request set MilliShareQuantity (a fractional paper order), since a
+	// milli-share-precision fill can't be represented by
+	// TradeExecutionSummary's whole-share ExecutedQuantity. Nil/omitted
+	// for every non-fractional order (the overwhelming majority) —
+	// fully backward compatible.
+	FractionalTradeExecutionEvents []FractionalTradeExecutionSummary `json:"fractionalTradeExecutionEvents,omitempty"`
+}
+
+// OvertradingNudge mirrors overtradingdetection.Nudge but is its own
+// type — the same "orders is the client-facing domain model, don't
+// couple it to one specific internal package's shape" reasoning
+// TradeExecutionSummary's doc comment already states for
+// matchingengineclient.TradeExecutionWireEvent.
+type OvertradingNudge struct {
+	PatternDetected                 string    `json:"patternDetected"`
+	HumanReadableMessage            string    `json:"humanReadableMessage"`
+	RecentOrderCount                int       `json:"recentOrderCount"`
+	BaselineOrderCountForSameWindow float64   `json:"baselineOrderCountForSameWindowLength"`
+	CooldownExpiresAtTime           time.Time `json:"cooldownExpiresAtTime"`
 }
 
 // CancelOrderRequest is the client-facing payload for POST /orders/cancel.

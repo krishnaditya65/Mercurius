@@ -25,6 +25,7 @@ import (
 	"time"
 
 	"mercurius/auth/internal/accountstore"
+	"mercurius/auth/internal/anomalouslogindetection"
 	"mercurius/auth/internal/httplogging"
 	"mercurius/auth/internal/jwtauth"
 	"mercurius/auth/internal/mfastate"
@@ -64,6 +65,7 @@ func main() {
 	mfa := mfastate.NewMfaState()
 	loginRateLimiter := ratelimiter.NewRateLimiter(maxLoginAttemptsPerAccountPerWindow, rateLimitWindowDuration)
 	registerRateLimiter := ratelimiter.NewRateLimiter(maxRegistrationAttemptsPerAddressPerWindow, rateLimitWindowDuration)
+	loginAnomalyDetector := anomalouslogindetection.NewDetector()
 
 	httpRequestMultiplexer := http.NewServeMux()
 	httpRequestMultiplexer.HandleFunc("/health", func(responseWriter http.ResponseWriter, _ *http.Request) {
@@ -71,13 +73,14 @@ func main() {
 		_, _ = responseWriter.Write([]byte(`{"status":"ok","service":"auth"}`))
 	})
 	httpRequestMultiplexer.HandleFunc("/auth/register", buildRegisterHandler(accounts, registerRateLimiter))
-	httpRequestMultiplexer.HandleFunc("/auth/login", buildLoginHandler(accounts, sessions, mfa, signingSecret, loginRateLimiter))
+	httpRequestMultiplexer.HandleFunc("/auth/login", buildLoginHandler(accounts, sessions, mfa, signingSecret, loginRateLimiter, loginAnomalyDetector))
 	httpRequestMultiplexer.HandleFunc("/auth/refresh", buildRefreshHandler(sessions, signingSecret))
 	httpRequestMultiplexer.HandleFunc("/auth/logout", buildLogoutHandler(sessions))
 	httpRequestMultiplexer.HandleFunc("/auth/mfa/enroll", buildMfaEnrollHandler(mfa, signingSecret))
 	httpRequestMultiplexer.HandleFunc("/auth/mfa/confirm-enrollment", buildMfaConfirmEnrollmentHandler(mfa, signingSecret))
 	httpRequestMultiplexer.HandleFunc("/auth/mfa/disable", buildMfaDisableHandler(mfa, signingSecret))
 	httpRequestMultiplexer.HandleFunc("/auth/verify", buildVerifyHandler(signingSecret))
+	httpRequestMultiplexer.HandleFunc("/auth/security/login-alerts", buildLoginAlertsHandler(loginAnomalyDetector))
 
 	listenAddress := ":8086"
 	if envListenAddress := os.Getenv("AUTH_LISTEN_ADDRESS"); envListenAddress != "" {
@@ -173,6 +176,19 @@ type loginWireRequest struct {
 	// MfaRequired: true and NO tokens — the client re-submits the same
 	// request with TotpCode filled in.
 	TotpCode string `json:"totpCode,omitempty"`
+
+	// The following fields feed internal/anomalouslogindetection — all
+	// optional/illustrative, exactly as that package's doc describes:
+	// DeviceFingerprint is an opaque caller-supplied string (no attempt
+	// is made here to generate or validate it), IpAddressPrefix is a
+	// similarly opaque caller-supplied network tag, and
+	// Latitude/Longitude are an illustrative geotag a real client would
+	// derive from IP geolocation or device location services — none of
+	// that derivation happens here, they're accepted as given.
+	DeviceFingerprint string   `json:"deviceFingerprint,omitempty"`
+	IpAddressPrefix   string   `json:"ipAddressPrefix,omitempty"`
+	Latitude          *float64 `json:"latitude,omitempty"`
+	Longitude         *float64 `json:"longitude,omitempty"`
 }
 
 type authTokenWireResponse struct {
@@ -186,6 +202,14 @@ type authTokenWireResponse struct {
 	// code rather than just showing "invalid email or password".
 	MfaRequired  bool   `json:"mfaRequired,omitempty"`
 	ErrorMessage string `json:"errorMessage,omitempty"`
+
+	// SecurityAlerts surfaces any internal/anomalouslogindetection alerts
+	// raised by THIS login attempt (empty on every attempt that raised
+	// none, which is most of them). Present on a successful login so a
+	// real client could show "we noticed this was a new device" —
+	// nothing here blocks the login itself; see that package's doc for
+	// why detection and response are deliberately kept separate.
+	SecurityAlerts []anomalouslogindetection.Alert `json:"securityAlerts,omitempty"`
 }
 
 func buildLoginHandler(
@@ -194,6 +218,7 @@ func buildLoginHandler(
 	mfa *mfastate.MfaState,
 	signingSecret []byte,
 	rateLimiter *ratelimiter.RateLimiter,
+	loginAnomalyDetector *anomalouslogindetection.Detector,
 ) http.HandlerFunc {
 	return func(responseWriter http.ResponseWriter, request *http.Request) {
 		if request.Method != http.MethodPost {
@@ -221,13 +246,26 @@ func buildLoginHandler(
 			return
 		}
 
+		now := time.Now()
+
+		// Anomaly detection keys on the normalized email throughout this
+		// handler, not accountIdentifier — deliberately: a wrong-
+		// password/unknown-email failure never learns a real
+		// accountIdentifier (that's the whole point of accountstore's
+		// timing-parity dummy-hash comparison, see its package doc), so
+		// keying on accountIdentifier would make failed and successful
+		// attempts for the SAME account untraceable to each other,
+		// silently breaking the rapid-repeated-failed-then-success
+		// detector. The normalized email is the one stable key present
+		// on every attempt, success or failure alike.
+		anomalyDetectionAccountKey := normalizeEmailForRateLimitKey(wireRequest.Email)
+
 		accountIdentifier, authError := accounts.AuthenticateWithPassword(wireRequest.Email, wireRequest.Password)
 		if authError != nil {
+			recordLoginAttemptForAnomalyDetection(loginAnomalyDetector, anomalyDetectionAccountKey, wireRequest, false, now)
 			respondWithJson(responseWriter, http.StatusUnauthorized, authTokenWireResponse{ErrorMessage: "invalid email or password"})
 			return
 		}
-
-		now := time.Now()
 
 		// MFA gate: password alone is not enough for an enrolled
 		// account. A missing/wrong code gets the SAME "not authenticated
@@ -247,6 +285,7 @@ func buildLoginHandler(
 				return
 			}
 			if !isCodeValid {
+				recordLoginAttemptForAnomalyDetection(loginAnomalyDetector, anomalyDetectionAccountKey, wireRequest, false, now)
 				respondWithJson(responseWriter, http.StatusUnauthorized, authTokenWireResponse{MfaRequired: true, ErrorMessage: "invalid MFA code"})
 				return
 			}
@@ -264,11 +303,76 @@ func buildLoginHandler(
 			return
 		}
 
+		securityAlerts := recordLoginAttemptForAnomalyDetection(loginAnomalyDetector, anomalyDetectionAccountKey, wireRequest, true, now)
+		if len(securityAlerts) > 0 {
+			log.Printf("SECURITY: %d anomalous-login alert(s) raised for %s on this login", len(securityAlerts), accountIdentifier)
+		}
+
 		respondWithJson(responseWriter, http.StatusOK, authTokenWireResponse{
 			AccountIdentifier: accountIdentifier,
 			AccessToken:       accessToken,
 			RefreshToken:      refreshToken,
 			ExpiresInSeconds:  int64(accessTokenLifetime.Seconds()),
+			SecurityAlerts:    securityAlerts,
+		})
+	}
+}
+
+// recordLoginAttemptForAnomalyDetection feeds one login attempt (success
+// or failure) into internal/anomalouslogindetection, translating the
+// wire request's optional device/network/location fields. A detector
+// error here (only possible for a missing accountIdentifier, which never
+// happens on this call path — accountKey is always non-empty) is logged
+// and swallowed: anomaly detection must never be able to break a login.
+func recordLoginAttemptForAnomalyDetection(
+	loginAnomalyDetector *anomalouslogindetection.Detector,
+	accountKey string,
+	wireRequest loginWireRequest,
+	wasSuccessful bool,
+	now time.Time,
+) []anomalouslogindetection.Alert {
+	attempt := anomalouslogindetection.LoginAttempt{
+		AccountIdentifier: accountKey,
+		DeviceFingerprint: wireRequest.DeviceFingerprint,
+		IpAddressPrefix:   wireRequest.IpAddressPrefix,
+		WasSuccessful:     wasSuccessful,
+		AttemptedAtTime:   now,
+	}
+	if wireRequest.Latitude != nil && wireRequest.Longitude != nil {
+		attempt.HasLocation = true
+		attempt.Latitude = *wireRequest.Latitude
+		attempt.Longitude = *wireRequest.Longitude
+	}
+
+	alerts, recordError := loginAnomalyDetector.RecordLoginAttempt(attempt)
+	if recordError != nil {
+		log.Printf("anomalous-login detection error for %s: %v", accountKey, recordError)
+		return nil
+	}
+	return alerts
+}
+
+type loginAlertsWireResponse struct {
+	AccountIdentifier string                          `json:"accountIdentifier"`
+	Alerts            []anomalouslogindetection.Alert `json:"alerts"`
+}
+
+// buildLoginAlertsHandler is a real, queryable read of every anomalous-
+// login alert raised for an account (or every alert ever raised, with no
+// accountId given) — GET /auth/security/login-alerts?accountId=...
+// TODO(real build): no auth on this endpoint — a real build would gate
+// it behind an admin/security-team role, the same gap FEATURES.md
+// already documents for backoffice's freeze endpoints.
+func buildLoginAlertsHandler(loginAnomalyDetector *anomalouslogindetection.Detector) http.HandlerFunc {
+	return func(responseWriter http.ResponseWriter, request *http.Request) {
+		accountIdentifier := request.URL.Query().Get("accountId")
+		if accountIdentifier == "" {
+			respondWithJson(responseWriter, http.StatusOK, loginAlertsWireResponse{Alerts: loginAnomalyDetector.AllAlerts()})
+			return
+		}
+		respondWithJson(responseWriter, http.StatusOK, loginAlertsWireResponse{
+			AccountIdentifier: accountIdentifier,
+			Alerts:            loginAnomalyDetector.AlertsForAccount(accountIdentifier),
 		})
 	}
 }

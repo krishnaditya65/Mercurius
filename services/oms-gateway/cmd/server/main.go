@@ -29,15 +29,19 @@ import (
 	"mercurius/omsgateway/internal/basketorders"
 	"mercurius/omsgateway/internal/chargescalculator"
 	"mercurius/omsgateway/internal/connectivitykillswitch"
+	"mercurius/omsgateway/internal/corporateactionexplainer"
 	"mercurius/omsgateway/internal/dmagateway"
 	"mercurius/omsgateway/internal/drip"
 	"mercurius/omsgateway/internal/executionalgos"
 	"mercurius/omsgateway/internal/exposurelimits"
+	"mercurius/omsgateway/internal/fractionalshares"
 	"mercurius/omsgateway/internal/httplogging"
 	"mercurius/omsgateway/internal/idempotency"
 	"mercurius/omsgateway/internal/impactcostestimator"
 	"mercurius/omsgateway/internal/kycclient"
+	"mercurius/omsgateway/internal/largeorderfriction"
 	"mercurius/omsgateway/internal/ledgerclient"
+	"mercurius/omsgateway/internal/liquiditybadge"
 	"mercurius/omsgateway/internal/loanagainstsecurities"
 	"mercurius/omsgateway/internal/marginengine"
 	"mercurius/omsgateway/internal/marginfunding"
@@ -49,10 +53,13 @@ import (
 	"mercurius/omsgateway/internal/multilegoptions"
 	"mercurius/omsgateway/internal/optionschain"
 	"mercurius/omsgateway/internal/orders"
+	"mercurius/omsgateway/internal/overtradingdetection"
 	"mercurius/omsgateway/internal/papertrading"
 	"mercurius/omsgateway/internal/payoffdiagram"
+	"mercurius/omsgateway/internal/portfoliostresstest"
 	"mercurius/omsgateway/internal/positions"
 	"mercurius/omsgateway/internal/quantengineclient"
+	"mercurius/omsgateway/internal/riskdisclosuregate"
 	"mercurius/omsgateway/internal/riskengine"
 	"mercurius/omsgateway/internal/securitieslendingborrowing"
 	"mercurius/omsgateway/internal/sequencing"
@@ -99,6 +106,12 @@ func main() {
 	// holdings — see internal/papertrading's package doc and
 	// processOrderSubmission's paper-trading branch below.
 	paperPositionBook := positions.NewPositionBook()
+	// milliSharePaperPositionBook: FEATURES.md §17 fractional share
+	// investing — see internal/fractionalshares' package doc. Real,
+	// milli-share-precision positions, fed exclusively by paper-trading
+	// fractional fills (matching-engine has no milli-share field, see
+	// that package's honest scope boundary).
+	milliSharePaperPositionBook := fractionalshares.NewMilliSharePositionBook()
 	pledgeBook := marginpledge.NewPledgeBook()
 	fundingBook := marginfunding.NewFundingBook()
 	// loanAgainstSecuritiesBook: FEATURES.md §17 LAS — see
@@ -145,10 +158,45 @@ func main() {
 	// genuine, already-existing integration point rather than a
 	// synthetic heartbeat.
 	connectivityKillSwitch := connectivitykillswitch.NewKillSwitch(3)
+	// overtradingDetector: FEATURES.md §19 overtrading/revenge-trading
+	// pattern detection with cool-down nudges — see
+	// internal/overtradingdetection's package doc for the real pattern
+	// logic and the honest scope boundary on what it can/can't detect
+	// without a realized-P&L feed.
+	overtradingDetector, overtradingDetectorError := overtradingdetection.NewDetector(overtradingdetection.DefaultThresholds())
+	if overtradingDetectorError != nil {
+		log.Fatalf("failed to construct overtrading detector: %v", overtradingDetectorError)
+	}
+	// riskDisclosureGate: FEATURES.md §19 mandatory F&O risk disclosure +
+	// cooling-off flow. 24 hours is an illustrative, configurable default
+	// — see internal/riskdisclosuregate's package doc.
+	riskDisclosureGate, riskDisclosureGateError := riskdisclosuregate.NewGate(24 * time.Hour)
+	if riskDisclosureGateError != nil {
+		log.Fatalf("failed to construct risk disclosure gate: %v", riskDisclosureGateError)
+	}
+	// largeOrderFrictionTracker: FEATURES.md §21 large-order friction —
+	// see internal/largeorderfriction's package doc.
+	largeOrderFrictionTracker, largeOrderFrictionTrackerError := largeorderfriction.NewTracker(largeorderfriction.DefaultConfig())
+	if largeOrderFrictionTrackerError != nil {
+		log.Fatalf("failed to construct large-order friction tracker: %v", largeOrderFrictionTrackerError)
+	}
 	idempotencyStore := idempotency.NewIdempotencyStore()
 	marketSession := marketsession.NewMarketSessionState()
+	// squareOffCutoffConfig / squareOffReminderTracker: FEATURES.md §21
+	// intraday auto square-off countdown timer + reminders — see
+	// internal/marketsession/squareOffCountdown.go's package doc.
+	squareOffCutoffConfig := marketsession.DefaultSquareOffCutoffConfig()
+	squareOffReminderTracker, squareOffReminderTrackerError := marketsession.NewSquareOffReminderTracker(marketsession.DefaultSquareOffReminderThresholds)
+	if squareOffReminderTrackerError != nil {
+		log.Fatalf("failed to construct square-off reminder tracker: %v", squareOffReminderTrackerError)
+	}
 	afterMarketOrderQueue := amoqueue.NewAfterMarketOrderQueue()
 	auditTrail := audittrail.NewAuditTrail()
+	// corporateActionExplainerLog: FEATURES.md §21 corporate-action
+	// explainer — see internal/corporateactionexplainer's package doc
+	// for the honest "this is the explainer surface only, not real
+	// corporate-actions processing (§14)" scope boundary.
+	corporateActionExplainerLog := corporateactionexplainer.NewLog()
 	metricsRegistry := metrics.NewRegistry()
 
 	preTradeRiskEngine := riskengine.NewPreTradeRiskEngineWithSeedBalances(map[string]int64{})
@@ -178,6 +226,9 @@ func main() {
 		exposureLimitsRegistry:        exposureLimitsRegistry,
 		connectivityKillSwitch:        connectivityKillSwitch,
 		marketSession:                 marketSession,
+		riskDisclosureGate:            riskDisclosureGate,
+		largeOrderFrictionTracker:     largeOrderFrictionTracker,
+		milliSharePaperPositionBook:   milliSharePaperPositionBook,
 	}
 
 	// FEATURES.md §12 auto-liquidation — the reducing-order submission
@@ -207,9 +258,15 @@ func main() {
 
 	httpRequestMultiplexer := http.NewServeMux()
 	httpRequestMultiplexer.HandleFunc("/health", healthCheckHandler)
-	httpRequestMultiplexer.HandleFunc("/orders/submit", buildSubmitOrderHandler(orderSubmissionDeps, idempotencyStore, marketSession, afterMarketOrderQueue))
+	httpRequestMultiplexer.HandleFunc("/orders/submit", buildSubmitOrderHandler(orderSubmissionDeps, idempotencyStore, marketSession, afterMarketOrderQueue, overtradingDetector))
+	httpRequestMultiplexer.HandleFunc("/overtrading-detection/status", buildOvertradingStatusHandler(overtradingDetector))
+	httpRequestMultiplexer.HandleFunc("/risk-disclosure/acknowledge", buildAcknowledgeRiskDisclosureHandler(riskDisclosureGate))
+	httpRequestMultiplexer.HandleFunc("/risk-disclosure/status", buildRiskDisclosureStatusHandler(riskDisclosureGate))
+	httpRequestMultiplexer.HandleFunc("/market-session/square-off/countdown", buildSquareOffCountdownHandler(squareOffCutoffConfig))
+	httpRequestMultiplexer.HandleFunc("/market-session/square-off/reminders", buildSquareOffRemindersHandler(squareOffCutoffConfig, squareOffReminderTracker))
 	httpRequestMultiplexer.HandleFunc("/positions", buildPositionsHandler(positionBook))
 	httpRequestMultiplexer.HandleFunc("/paper-positions", buildPositionsHandler(paperPositionBook))
+	httpRequestMultiplexer.HandleFunc("/paper-positions/fractional", buildFractionalPaperPositionsHandler(milliSharePaperPositionBook))
 	httpRequestMultiplexer.HandleFunc("/orders/cancel", buildCancelOrderHandler(matchingEngineClient, auditTrail))
 	httpRequestMultiplexer.HandleFunc("/orders/cover-submit", buildCoverOrderHandler(orderSubmissionDeps))
 	httpRequestMultiplexer.HandleFunc("/orders/status", buildOrderStatusHandler(matchingEngineClient))
@@ -218,6 +275,9 @@ func main() {
 	httpRequestMultiplexer.HandleFunc("/market-session/close", buildMarketSessionCloseHandler(marketSession, auditTrail))
 	httpRequestMultiplexer.HandleFunc("/market-session/set-phase", buildSetSessionPhaseHandler(marketSession))
 	httpRequestMultiplexer.HandleFunc("/audit-trail", buildAuditTrailHandler(auditTrail))
+	httpRequestMultiplexer.HandleFunc("/orders/reconcile", buildOrderReconcileHandler(idempotencyStore))
+	httpRequestMultiplexer.HandleFunc("/positions/corporate-action-adjustments/apply", buildApplyCorporateActionAdjustmentHandler(positionBook, corporateActionExplainerLog))
+	httpRequestMultiplexer.HandleFunc("/positions/corporate-action-adjustments", buildCorporateActionAdjustmentsHandler(corporateActionExplainerLog))
 	httpRequestMultiplexer.HandleFunc("/orders/estimate-charges", buildEstimateChargesHandler())
 	httpRequestMultiplexer.HandleFunc("/metrics", metrics.BuildMetricsHandler(metricsRegistry))
 	httpRequestMultiplexer.HandleFunc("/margin-pledge/pledge", buildPledgeHoldingHandler(pledgeBook, positionBook, preTradeRiskEngine))
@@ -228,6 +288,7 @@ func main() {
 	httpRequestMultiplexer.HandleFunc("/margin/calculate-portfolio-margin", buildCalculatePortfolioMarginHandler())
 	httpRequestMultiplexer.HandleFunc("/margin-funding/request", buildMarginFundingRequestHandler(fundingBook, pledgeBook, ledgerClient, preTradeRiskEngine))
 	httpRequestMultiplexer.HandleFunc("/margin-funding", buildMarginFundingStatusHandler(fundingBook, pledgeBook))
+	httpRequestMultiplexer.HandleFunc("/margin-funding/interest-cost", buildMarginFundingInterestCostHandler(fundingBook))
 	httpRequestMultiplexer.HandleFunc("/loan-against-securities/request", buildLoanAgainstSecuritiesRequestHandler(loanAgainstSecuritiesBook, pledgeBook, ledgerClient, preTradeRiskEngine))
 	httpRequestMultiplexer.HandleFunc("/loan-against-securities/repay", buildLoanAgainstSecuritiesRepayHandler(loanAgainstSecuritiesBook, ledgerClient, preTradeRiskEngine))
 	httpRequestMultiplexer.HandleFunc("/loan-against-securities", buildLoanAgainstSecuritiesStatusHandler(loanAgainstSecuritiesBook, pledgeBook))
@@ -259,6 +320,8 @@ func main() {
 	httpRequestMultiplexer.HandleFunc("/multileg-options/execute", buildExecuteMultiLegOptionsHandler(orderSubmissionDeps))
 	httpRequestMultiplexer.HandleFunc("/basket-orders/execute", buildExecuteBasketOrderHandler(orderSubmissionDeps))
 	httpRequestMultiplexer.HandleFunc("/impact-cost/estimate", buildEstimateImpactCostHandler())
+	httpRequestMultiplexer.HandleFunc("/liquidity-badge/compute", buildLiquidityBadgeHandler())
+	httpRequestMultiplexer.HandleFunc("/portfolio-stress-test/compute", buildPortfolioStressTestHandler(positionBook))
 	httpRequestMultiplexer.HandleFunc("/securities-lending/lend", buildLendSecurityHandler(securitiesLendingBorrowingDesk, positionBook))
 	httpRequestMultiplexer.HandleFunc("/securities-lending/recall", buildRecallLendingHandler(securitiesLendingBorrowingDesk))
 	httpRequestMultiplexer.HandleFunc("/securities-lending/borrow", buildBorrowSecurityHandler(securitiesLendingBorrowingDesk))
@@ -412,6 +475,15 @@ type orderSubmissionDependencies struct {
 	// support — see internal/marketsession's sessionPhaseRules.go for the
 	// real, distinct order-acceptance rules enforced below.
 	marketSession *marketsession.MarketSessionState
+	// riskDisclosureGate: FEATURES.md §19 mandatory F&O risk disclosure +
+	// cooling-off gate — see internal/riskdisclosuregate's package doc.
+	riskDisclosureGate *riskdisclosuregate.Gate
+	// largeOrderFrictionTracker: FEATURES.md §21 large-order friction —
+	// see internal/largeorderfriction's package doc.
+	largeOrderFrictionTracker *largeorderfriction.Tracker
+	// milliSharePaperPositionBook: FEATURES.md §17 fractional share
+	// investing — see internal/fractionalshares' package doc.
+	milliSharePaperPositionBook *fractionalshares.MilliSharePositionBook
 }
 
 func buildSubmitOrderHandler(
@@ -419,6 +491,7 @@ func buildSubmitOrderHandler(
 	idempotencyStore *idempotency.IdempotencyStore,
 	marketSession *marketsession.MarketSessionState,
 	afterMarketOrderQueue *amoqueue.AfterMarketOrderQueue,
+	overtradingDetector *overtradingdetection.Detector,
 ) http.HandlerFunc {
 	return func(responseWriter http.ResponseWriter, request *http.Request) {
 		if request.Method != http.MethodPost {
@@ -438,6 +511,17 @@ func buildSubmitOrderHandler(
 		// matching-engine support this build doesn't have).
 		if executionTypeError := orders.ValidateOrderExecutionType(incomingOrderSubmissionRequest); executionTypeError != nil {
 			http.Error(responseWriter, executionTypeError.Error(), http.StatusBadRequest)
+			return
+		}
+
+		// FEATURES.md §17 fractional share investing: validated here,
+		// before any gate runs — see
+		// fractionalshares.ValidateMilliShareQuantity's doc comment for
+		// the honest "paper trading only" scope boundary this enforces.
+		if milliShareError := fractionalshares.ValidateMilliShareQuantity(
+			incomingOrderSubmissionRequest.MilliShareQuantity, incomingOrderSubmissionRequest.IsPaperTradingOrder,
+		); milliShareError != nil {
+			http.Error(responseWriter, milliShareError.Error(), http.StatusBadRequest)
 			return
 		}
 		if incomingOrderSubmissionRequest.OrderExecutionType == orders.OrderExecutionTypeIceberg ||
@@ -502,8 +586,167 @@ func buildSubmitOrderHandler(
 		}
 
 		acknowledgement := processOrderSubmission(dependencies, incomingOrderSubmissionRequest)
+
+		// FEATURES.md §19 overtrading/revenge-trading pattern detection —
+		// deliberately evaluated AFTER the order is fully processed and
+		// deliberately NEVER changes WasOrderAccepted: this is a
+		// non-blocking behavioral nudge, not a risk gate. Recorded/
+		// evaluated for every real submission attempt (accepted or
+		// rejected), keyed by the account, using the real wall clock —
+		// the only appropriate place for that in this handler, mirroring
+		// how internal/algolimits' own real wall-clock read is confined
+		// to this same file.
+		if overtradingDetector != nil && incomingOrderSubmissionRequest.ClientAccountIdentifier != "" {
+			now := time.Now()
+			overtradingDetector.RecordSubmission(incomingOrderSubmissionRequest.ClientAccountIdentifier, now)
+			if nudge, _ := overtradingDetector.Evaluate(incomingOrderSubmissionRequest.ClientAccountIdentifier, now); nudge != nil {
+				acknowledgement.OvertradingNudge = &orders.OvertradingNudge{
+					PatternDetected:                 nudge.PatternDetected,
+					HumanReadableMessage:            nudge.HumanReadableMessage,
+					RecentOrderCount:                nudge.RecentOrderCount,
+					BaselineOrderCountForSameWindow: nudge.BaselineOrderCountForSameWindow,
+					CooldownExpiresAtTime:           nudge.CooldownExpiresAtTime,
+				}
+			}
+		}
+
 		idempotencyStore.CompleteClaimedKey(incomingOrderSubmissionRequest.IdempotencyKey, acknowledgement)
 		respondWithJson(responseWriter, http.StatusOK, acknowledgement)
+	}
+}
+
+// buildOvertradingStatusHandler serves GET /overtrading-detection/status?
+// accountId=... — a pure read of an account's current cooldown state and
+// recent order count, never mutating anything (see
+// overtradingdetection.Detector.Status's own doc comment).
+func buildOvertradingStatusHandler(overtradingDetector *overtradingdetection.Detector) http.HandlerFunc {
+	return func(responseWriter http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodGet {
+			http.Error(responseWriter, "only GET is supported", http.StatusMethodNotAllowed)
+			return
+		}
+		accountIdentifier := request.URL.Query().Get("accountId")
+		if accountIdentifier == "" {
+			http.Error(responseWriter, "accountId query parameter is required", http.StatusBadRequest)
+			return
+		}
+		status := overtradingDetector.Status(accountIdentifier, time.Now())
+		respondWithJson(responseWriter, http.StatusOK, status)
+	}
+}
+
+// acknowledgeRiskDisclosureRequest is the payload for POST
+// /risk-disclosure/acknowledge.
+type acknowledgeRiskDisclosureRequest struct {
+	ClientAccountIdentifier string `json:"clientAccountIdentifier"`
+}
+
+// buildAcknowledgeRiskDisclosureHandler serves POST
+// /risk-disclosure/acknowledge — FEATURES.md §19's mandatory F&O risk
+// disclosure. Records real acknowledgement state; does not itself place
+// or validate any order.
+func buildAcknowledgeRiskDisclosureHandler(gate *riskdisclosuregate.Gate) http.HandlerFunc {
+	return func(responseWriter http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodPost {
+			http.Error(responseWriter, "only POST is supported", http.StatusMethodNotAllowed)
+			return
+		}
+		var incomingRequest acknowledgeRiskDisclosureRequest
+		if decodeError := json.NewDecoder(request.Body).Decode(&incomingRequest); decodeError != nil {
+			http.Error(responseWriter, "malformed risk disclosure acknowledgement payload", http.StatusBadRequest)
+			return
+		}
+		if incomingRequest.ClientAccountIdentifier == "" {
+			http.Error(responseWriter, "clientAccountIdentifier is required", http.StatusBadRequest)
+			return
+		}
+		gate.Acknowledge(incomingRequest.ClientAccountIdentifier, time.Now())
+		respondWithJson(responseWriter, http.StatusOK, gate.Status(incomingRequest.ClientAccountIdentifier))
+	}
+}
+
+// buildRiskDisclosureStatusHandler serves GET /risk-disclosure/status?
+// accountId=... — a pure read of an account's current F&O disclosure
+// acknowledgement state.
+func buildRiskDisclosureStatusHandler(gate *riskdisclosuregate.Gate) http.HandlerFunc {
+	return func(responseWriter http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodGet {
+			http.Error(responseWriter, "only GET is supported", http.StatusMethodNotAllowed)
+			return
+		}
+		accountIdentifier := request.URL.Query().Get("accountId")
+		if accountIdentifier == "" {
+			http.Error(responseWriter, "accountId query parameter is required", http.StatusBadRequest)
+			return
+		}
+		respondWithJson(responseWriter, http.StatusOK, gate.Status(accountIdentifier))
+	}
+}
+
+// parseOptionalNowQueryParam parses an optional `now` RFC3339 query
+// parameter, defaulting to the real wall clock if absent/unparseable —
+// lets a live client always ask "what's the countdown right now" while
+// still letting a test/demo caller pin an exact instant, the same
+// pattern internal/executionalgos' HTTP layer already uses for `now`.
+func parseOptionalNowQueryParam(request *http.Request) time.Time {
+	nowParam := request.URL.Query().Get("now")
+	if nowParam == "" {
+		return time.Now()
+	}
+	parsed, parseError := time.Parse(time.RFC3339, nowParam)
+	if parseError != nil {
+		return time.Now()
+	}
+	return parsed
+}
+
+// buildSquareOffCountdownHandler serves GET
+// /market-session/square-off/countdown[?now=RFC3339] — FEATURES.md §21's
+// real countdown-to-forced-closure timer. See
+// internal/marketsession/squareOffCountdown.go's package doc for the
+// honest scope boundary (this computes the countdown signal only; it
+// never itself forces a closure).
+func buildSquareOffCountdownHandler(cutoffConfig marketsession.SquareOffCutoffConfig) http.HandlerFunc {
+	return func(responseWriter http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodGet {
+			http.Error(responseWriter, "only GET is supported", http.StatusMethodNotAllowed)
+			return
+		}
+		now := parseOptionalNowQueryParam(request)
+		cutoffTime := cutoffConfig.CutoffForDate(now)
+		respondWithJson(responseWriter, http.StatusOK, marketsession.ComputeSquareOffCountdown(cutoffTime, now))
+	}
+}
+
+// buildSquareOffRemindersHandler serves GET
+// /market-session/square-off/reminders?accountId=...[&now=RFC3339] — the
+// real, dedup'd reminder-eligibility check a frontend push notification
+// would poll and consume. Each configured threshold (30/15/5 minutes by
+// default) fires at most once per account per trading day's cutoff — see
+// SquareOffReminderTracker.DueReminders' doc comment.
+func buildSquareOffRemindersHandler(cutoffConfig marketsession.SquareOffCutoffConfig, tracker *marketsession.SquareOffReminderTracker) http.HandlerFunc {
+	return func(responseWriter http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodGet {
+			http.Error(responseWriter, "only GET is supported", http.StatusMethodNotAllowed)
+			return
+		}
+		accountIdentifier := request.URL.Query().Get("accountId")
+		if accountIdentifier == "" {
+			http.Error(responseWriter, "accountId query parameter is required", http.StatusBadRequest)
+			return
+		}
+		now := parseOptionalNowQueryParam(request)
+		cutoffTime := cutoffConfig.CutoffForDate(now)
+		dueReminders := tracker.DueReminders(accountIdentifier, cutoffTime, now)
+		dueReminderSecondsBeforeCutoff := make([]float64, len(dueReminders))
+		for i, threshold := range dueReminders {
+			dueReminderSecondsBeforeCutoff[i] = threshold.Seconds()
+		}
+		respondWithJson(responseWriter, http.StatusOK, map[string]any{
+			"cutoffTime":                     cutoffTime,
+			"dueReminderSecondsBeforeCutoff": dueReminderSecondsBeforeCutoff,
+			"countdown":                      marketsession.ComputeSquareOffCountdown(cutoffTime, now),
+		})
 	}
 }
 
@@ -644,6 +887,39 @@ func processOrderSubmission(
 		}
 	}
 
+	// FEATURES.md §21 large-order friction — checked right after
+	// exposure limits, before KYC: a brief confirm-with-context step for
+	// an order unusually large relative to the account's OWN historical
+	// average order size. Soft-rejected (never a permanent block) on the
+	// first submission; a resubmission with confirmedLargeOrder:true
+	// proceeds. See internal/largeorderfriction's package doc.
+	if dependencies.largeOrderFrictionTracker != nil {
+		orderNotionalForFrictionCheck := incomingOrderSubmissionRequest.LimitPriceInMinorUnits * int64(incomingOrderSubmissionRequest.OrderQuantity)
+		frictionResult := dependencies.largeOrderFrictionTracker.EvaluateOrder(
+			incomingOrderSubmissionRequest.ClientAccountIdentifier, orderNotionalForFrictionCheck, 0,
+		)
+		if frictionResult.RequiresConfirmation && !incomingOrderSubmissionRequest.ConfirmedLargeOrder {
+			dependencies.auditTrail.Append(audittrail.Entry{
+				EventType:               audittrail.EventOrderRejected,
+				ClientAccountIdentifier: incomingOrderSubmissionRequest.ClientAccountIdentifier,
+				InstrumentSymbol:        incomingOrderSubmissionRequest.InstrumentSymbol,
+				DetailMessage:           fmt.Sprintf("LARGE_ORDER_CONFIRMATION_REQUIRED: %s", frictionResult.Reason),
+			})
+			return orders.OrderAcknowledgementResponse{
+				WasOrderAccepted: false,
+				HumanReadableRejectionReason: fmt.Sprintf(
+					"%s. If you're sure, resubmit this exact order with confirmedLargeOrder:true.",
+					frictionResult.Reason,
+				),
+				MachineReadableRejectionReason: "LARGE_ORDER_CONFIRMATION_REQUIRED",
+			}
+		}
+		// Record every order that actually proceeds past this gate
+		// (confirmed-large or never-flagged) into the real baseline —
+		// see Tracker.RecordOrderNotional's doc comment.
+		dependencies.largeOrderFrictionTracker.RecordOrderNotional(incomingOrderSubmissionRequest.ClientAccountIdentifier, orderNotionalForFrictionCheck)
+	}
+
 	// KYC gate comes before the risk check — an unonboarded account
 	// shouldn't even have its margin evaluated, per FEATURES.md §1.
 	//
@@ -728,6 +1004,34 @@ func processOrderSubmission(
 		}
 	}
 
+	// FEATURES.md §19 mandatory F&O risk disclosure + cooling-off gate —
+	// checked right after the pledged-holding gate, before the pre-trade
+	// risk/margin check: an account that hasn't acknowledged the F&O
+	// risk disclosure (or hasn't waited out the cooling-off period since
+	// acknowledging) shouldn't have its margin evaluated for an F&O
+	// order it's not yet allowed to place at all. A no-op for every
+	// equity order and for every F&O order from an account that already
+	// placed its first F&O order — see internal/riskdisclosuregate's
+	// package doc.
+	if dependencies.riskDisclosureGate != nil {
+		isFnoInstrument := exposurelimits.ClassifySegment(incomingOrderSubmissionRequest.InstrumentSymbol) == exposurelimits.SegmentFuturesAndOptions
+		if disclosureError := dependencies.riskDisclosureGate.CheckFirstFnoOrderGate(
+			incomingOrderSubmissionRequest.ClientAccountIdentifier, isFnoInstrument, time.Now(),
+		); disclosureError != nil {
+			dependencies.auditTrail.Append(audittrail.Entry{
+				EventType:               audittrail.EventOrderRejected,
+				ClientAccountIdentifier: incomingOrderSubmissionRequest.ClientAccountIdentifier,
+				InstrumentSymbol:        incomingOrderSubmissionRequest.InstrumentSymbol,
+				DetailMessage:           fmt.Sprintf("FNO_RISK_DISCLOSURE_REQUIRED: %v", disclosureError),
+			})
+			return orders.OrderAcknowledgementResponse{
+				WasOrderAccepted:               false,
+				HumanReadableRejectionReason:   fmt.Sprintf("This account cannot place its first F&O order yet: %v", disclosureError),
+				MachineReadableRejectionReason: "FNO_RISK_DISCLOSURE_REQUIRED",
+			}
+		}
+	}
+
 	// KNOWN GAP, not yet fixed: for a market order OR a
 	// StopLossMarket order, LimitPriceInMinorUnits is 0 (ignored by
 	// the matching engine), so this notional is always 0 and the
@@ -740,6 +1044,18 @@ func processOrderSubmission(
 	// orders before risk-checking them — this skeleton doesn't have a
 	// "last price" feed wired into oms-gateway yet to do that with.
 	orderNotionalValueInMinorUnits := incomingOrderSubmissionRequest.LimitPriceInMinorUnits * int64(incomingOrderSubmissionRequest.OrderQuantity)
+	// FEATURES.md §17 fractional share investing: when MilliShareQuantity
+	// is set, it — not the whole-share OrderQuantity — is the
+	// authoritative order size, so the risk check's notional must be
+	// computed with milli-share-aware integer math
+	// (fractionalshares.NotionalInMinorUnits), not the whole-share
+	// formula above. See that function's doc comment for the exact
+	// round-half-up integer arithmetic (no float).
+	if incomingOrderSubmissionRequest.MilliShareQuantity != nil {
+		orderNotionalValueInMinorUnits = fractionalshares.NotionalInMinorUnits(
+			incomingOrderSubmissionRequest.LimitPriceInMinorUnits, *incomingOrderSubmissionRequest.MilliShareQuantity,
+		)
+	}
 
 	riskCheckOutcome := dependencies.preTradeRiskEngine.EvaluateOrderAgainstAvailableMargin(
 		incomingOrderSubmissionRequest.ClientAccountIdentifier,
@@ -775,6 +1091,19 @@ func processOrderSubmission(
 		IsPaperTradingOrder:          incomingOrderSubmissionRequest.IsPaperTradingOrder,
 	}
 
+	// The order has now genuinely passed every gate (including the F&O
+	// risk-disclosure gate above) and been sequenced — record this as
+	// the account's first F&O order if it is one, permanently exempting
+	// it from the gate going forward. Deliberately recorded here (once
+	// risk-approved), not earlier in CheckFirstFnoOrderGate itself, so a
+	// check that later turns out to be for an order that fails
+	// downstream (e.g. matching-engine hand-off) still correctly counts
+	// — this order WAS accepted by the OMS, which is what "first F&O
+	// order" means for this gate's purpose.
+	if dependencies.riskDisclosureGate != nil && exposurelimits.ClassifySegment(incomingOrderSubmissionRequest.InstrumentSymbol) == exposurelimits.SegmentFuturesAndOptions {
+		dependencies.riskDisclosureGate.RecordFirstFnoOrderPlaced(incomingOrderSubmissionRequest.ClientAccountIdentifier, time.Now())
+	}
+
 	// FEATURES.md §7 paper trading mode: everything ABOVE this point —
 	// KYC, freeze, pledged-holding, and pre-trade risk gates, plus
 	// sequence assignment and the ORDER_SUBMITTED audit entry — is
@@ -785,6 +1114,53 @@ func processOrderSubmission(
 	// — a completely separate positions.PositionBook instance — instead
 	// of the real one, so paper P&L can never contaminate real holdings.
 	if incomingOrderSubmissionRequest.IsPaperTradingOrder {
+		// FEATURES.md §17 fractional share investing: a fractional paper
+		// order (MilliShareQuantity set — already validated as
+		// paper-only by fractionalshares.ValidateMilliShareQuantity in
+		// buildSubmitOrderHandler) takes a COMPLETELY SEPARATE simulated-
+		// fill path and updates dependencies.milliSharePaperPositionBook
+		// instead of the whole-share paperPositionBook, so a fractional
+		// position can never silently corrupt whole-share position
+		// tracking.
+		if incomingOrderSubmissionRequest.MilliShareQuantity != nil {
+			fractionalFill, fractionalSimulationError := papertrading.SimulateFractionalFill(incomingOrderSubmissionRequest)
+			if fractionalSimulationError != nil {
+				acknowledgement.PaperOrderSimulationError = fractionalSimulationError.Error()
+				dependencies.auditTrail.Append(audittrail.Entry{
+					EventType:               audittrail.EventPaperOrderSimulationFailed,
+					ClientAccountIdentifier: incomingOrderSubmissionRequest.ClientAccountIdentifier,
+					InstrumentSymbol:        incomingOrderSubmissionRequest.InstrumentSymbol,
+					DetailMessage:           fractionalSimulationError.Error(),
+				})
+				return acknowledgement
+			}
+
+			buyingAccountId, sellingAccountId := incomingOrderSubmissionRequest.ClientAccountIdentifier, papertrading.SyntheticCounterpartyAccountIdentifier
+			if !incomingOrderSubmissionRequest.OrderSideIsBuyNotSell {
+				buyingAccountId, sellingAccountId = sellingAccountId, buyingAccountId
+			}
+
+			dependencies.milliSharePaperPositionBook.ApplyFractionalFill(
+				buyingAccountId, sellingAccountId, incomingOrderSubmissionRequest.InstrumentSymbol, fractionalFill.ExecutedMilliShareQuantity,
+			)
+			acknowledgement.FractionalTradeExecutionEvents = append(acknowledgement.FractionalTradeExecutionEvents, orders.FractionalTradeExecutionSummary{
+				BuyingClientAccountId:      buyingAccountId,
+				SellingClientAccountId:     sellingAccountId,
+				ExecutedPriceInMinorUnits:  fractionalFill.ExecutedPriceInMinorUnits,
+				ExecutedMilliShareQuantity: fractionalFill.ExecutedMilliShareQuantity,
+			})
+			dependencies.auditTrail.Append(audittrail.Entry{
+				EventType:               audittrail.EventPaperOrderFilled,
+				ClientAccountIdentifier: incomingOrderSubmissionRequest.ClientAccountIdentifier,
+				InstrumentSymbol:        incomingOrderSubmissionRequest.InstrumentSymbol,
+				DetailMessage: fmt.Sprintf(
+					"SIMULATED FRACTIONAL fill %d milli-share-units @ %d (NOT a real matching-engine trade, NOT settled to ledger)",
+					fractionalFill.ExecutedMilliShareQuantity, fractionalFill.ExecutedPriceInMinorUnits,
+				),
+			})
+			return acknowledgement
+		}
+
 		simulatedFill, simulationError := papertrading.SimulateFill(incomingOrderSubmissionRequest)
 		if simulationError != nil {
 			acknowledgement.PaperOrderSimulationError = simulationError.Error()
@@ -980,6 +1356,93 @@ func buildPositionsHandler(positionBook *positions.PositionBook) http.HandlerFun
 		respondWithJson(responseWriter, http.StatusOK, map[string]any{
 			"accountIdentifier":             accountIdentifier,
 			"netQuantityByInstrumentSymbol": positionBook.PositionsForAccount(accountIdentifier),
+		})
+	}
+}
+
+// buildApplyCorporateActionAdjustmentHandler serves POST
+// /positions/corporate-action-adjustments/apply — FEATURES.md §21's
+// corporate-action explainer. See
+// internal/corporateactionexplainer's package doc for the honest scope
+// boundary: this applies a caller-supplied (today always
+// manual/synthetic — no real corporate-actions feed exists, that's §14)
+// quantity/average-price adjustment to the account's REAL position
+// (via positions.PositionBook.SetPositionDirectly) and returns a real,
+// accurate one-line explanation of what changed and why.
+func buildApplyCorporateActionAdjustmentHandler(
+	positionBook *positions.PositionBook,
+	corporateActionExplainerLog *corporateactionexplainer.Log,
+) http.HandlerFunc {
+	return func(responseWriter http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodPost {
+			http.Error(responseWriter, "only POST is supported", http.StatusMethodNotAllowed)
+			return
+		}
+		var event corporateactionexplainer.AdjustmentEvent
+		if decodeError := json.NewDecoder(request.Body).Decode(&event); decodeError != nil {
+			http.Error(responseWriter, "malformed corporate action adjustment payload", http.StatusBadRequest)
+			return
+		}
+
+		logged, explainError := corporateActionExplainerLog.RecordAdjustment(event)
+		if explainError != nil {
+			http.Error(responseWriter, explainError.Error(), http.StatusBadRequest)
+			return
+		}
+
+		// Only mutate the real position once the event is validated and
+		// explained -- an invalid event never touches positionBook at all.
+		positionBook.SetPositionDirectly(event.ClientAccountIdentifier, event.InstrumentSymbol, event.QuantityAfter)
+
+		respondWithJson(responseWriter, http.StatusOK, logged)
+	}
+}
+
+// buildCorporateActionAdjustmentsHandler serves GET
+// /positions/corporate-action-adjustments[?accountId=...] — a pure read
+// of the real, append-only corporate-action explainer log.
+func buildCorporateActionAdjustmentsHandler(corporateActionExplainerLog *corporateactionexplainer.Log) http.HandlerFunc {
+	return func(responseWriter http.ResponseWriter, request *http.Request) {
+		accountIdentifier := request.URL.Query().Get("accountId")
+		if accountIdentifier != "" {
+			respondWithJson(responseWriter, http.StatusOK, corporateActionExplainerLog.EntriesForAccount(accountIdentifier))
+			return
+		}
+		respondWithJson(responseWriter, http.StatusOK, corporateActionExplainerLog.AllEntries())
+	}
+}
+
+// buildFractionalPaperPositionsHandler serves GET
+// /paper-positions/fractional?accountId=... — FEATURES.md §17's
+// fractional share investing. Mirrors buildPositionsHandler but reads
+// the milli-share-precision paper position book — see
+// internal/fractionalshares' package doc. Also reports each
+// instrument's whole-share/remaining-milli-unit breakdown for a
+// friendlier client display (e.g. "3 shares + 250 milli-units" reads as
+// "3.250 shares").
+func buildFractionalPaperPositionsHandler(milliSharePaperPositionBook *fractionalshares.MilliSharePositionBook) http.HandlerFunc {
+	return func(responseWriter http.ResponseWriter, request *http.Request) {
+		accountIdentifier := request.URL.Query().Get("accountId")
+		if accountIdentifier == "" {
+			http.Error(responseWriter, "missing accountId query parameter", http.StatusBadRequest)
+			return
+		}
+
+		milliSharePositions := milliSharePaperPositionBook.PositionsForAccount(accountIdentifier)
+		formattedPositions := make(map[string]map[string]int64, len(milliSharePositions))
+		for instrumentSymbol, netMilliShareQuantity := range milliSharePositions {
+			wholeShares, remainingMilliUnits := fractionalshares.FormatWholeAndMilliParts(netMilliShareQuantity)
+			formattedPositions[instrumentSymbol] = map[string]int64{
+				"netMilliShareQuantity": netMilliShareQuantity,
+				"wholeShares":           wholeShares,
+				"remainingMilliUnits":   remainingMilliUnits,
+			}
+		}
+
+		respondWithJson(responseWriter, http.StatusOK, map[string]any{
+			"accountIdentifier":            accountIdentifier,
+			"milliShareUnitsPerWholeShare": fractionalshares.MilliShareUnitsPerWholeShare,
+			"positionsByInstrumentSymbol":  formattedPositions,
 		})
 	}
 }
@@ -1317,6 +1780,31 @@ func buildAuditTrailHandler(auditTrail *audittrail.AuditTrail) http.HandlerFunc 
 			return
 		}
 		respondWithJson(responseWriter, http.StatusOK, auditTrail.AllEntries())
+	}
+}
+
+// buildOrderReconcileHandler serves GET /orders/reconcile?idempotencyKey=...
+// — FEATURES.md §21's "idempotent order status with WebSocket-reconnect
+// reconciliation": a client that dropped its connection mid-submission
+// (or just wants to double-check after a reconnect) can ask "what
+// happened to the order I submitted with this idempotency key" WITHOUT
+// resubmitting the order body — a pure, non-blocking read over
+// internal/idempotency's real claim/complete state. See
+// idempotency.IdempotencyStore.Reconcile's doc comment: repeated calls
+// always return the identical answer once COMPLETED, the same
+// idempotency guarantee a full resubmission would have provided.
+func buildOrderReconcileHandler(idempotencyStore *idempotency.IdempotencyStore) http.HandlerFunc {
+	return func(responseWriter http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodGet {
+			http.Error(responseWriter, "only GET is supported", http.StatusMethodNotAllowed)
+			return
+		}
+		idempotencyKey := request.URL.Query().Get("idempotencyKey")
+		if idempotencyKey == "" {
+			http.Error(responseWriter, "idempotencyKey query parameter is required", http.StatusBadRequest)
+			return
+		}
+		respondWithJson(responseWriter, http.StatusOK, idempotencyStore.Reconcile(idempotencyKey))
 	}
 }
 
@@ -1690,12 +2178,64 @@ func buildMarginFundingRequestHandler(
 		preTradeRiskEngine.AdjustAvailableMarginInMinorUnits(wireRequest.ClientAccountIdentifier, wireRequest.RequestedAmountInMinorUnits)
 		availableMarginAfter, _ := preTradeRiskEngine.AvailableMarginInMinorUnits(wireRequest.ClientAccountIdentifier)
 
+		// FEATURES.md §21 live interest cost calculator — records the
+		// real wall-clock instant this account's interest clock starts
+		// (a no-op if it already has one, e.g. a second draw on top of
+		// an existing outstanding loan — see FundingBook's doc comment
+		// on that honest simplification).
+		fundingBook.RecordDisbursementStartTime(wireRequest.ClientAccountIdentifier, time.Now())
+
 		respondWithJson(responseWriter, http.StatusOK, marginFundingRequestWireResponse{
 			WasFundingApproved:                           true,
 			DisbursedAmountInMinorUnits:                  wireRequest.RequestedAmountInMinorUnits,
 			OutstandingPrincipalInMinorUnits:             newOutstanding,
 			AvailableMarginAfterDisbursementInMinorUnits: availableMarginAfter,
 		})
+	}
+}
+
+// buildMarginFundingInterestCostHandler serves GET
+// /margin-funding/interest-cost?accountId=...[&now=RFC3339]
+// [&projectDays=N] — FEATURES.md §21's live interest cost calculator:
+// real "cost so far" AND "projected cost if held N more days" figures,
+// using the exact same illustrative simple-interest formula
+// CalculateIllustrativeAccruedInterest already had. An account with no
+// outstanding principal (or no recorded disbursement start time) gets an
+// explicit all-zero snapshot rather than an error — there's simply
+// nothing accruing.
+func buildMarginFundingInterestCostHandler(fundingBook *marginfunding.FundingBook) http.HandlerFunc {
+	return func(responseWriter http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodGet {
+			http.Error(responseWriter, "only GET is supported", http.StatusMethodNotAllowed)
+			return
+		}
+		accountIdentifier := request.URL.Query().Get("accountId")
+		if accountIdentifier == "" {
+			http.Error(responseWriter, "accountId query parameter is required", http.StatusBadRequest)
+			return
+		}
+		now := parseOptionalNowQueryParam(request)
+
+		projectDays := int64(30)
+		if projectDaysParam := request.URL.Query().Get("projectDays"); projectDaysParam != "" {
+			if parsed, parseError := strconv.ParseInt(projectDaysParam, 10, 64); parseError == nil {
+				projectDays = parsed
+			}
+		}
+
+		principal := fundingBook.OutstandingPrincipalInMinorUnits(accountIdentifier)
+		disbursedAtTime, hasDisbursement := fundingBook.DisbursementStartTime(accountIdentifier)
+		if !hasDisbursement || principal <= 0 {
+			respondWithJson(responseWriter, http.StatusOK, marginfunding.LiveInterestCostSnapshot{
+				OutstandingPrincipalInMinorUnits: principal,
+				AsOfTime:                         now,
+				AdditionalDaysProjected:          projectDays,
+			})
+			return
+		}
+
+		snapshot := marginfunding.BuildLiveInterestCostSnapshot(principal, disbursedAtTime, now, projectDays)
+		respondWithJson(responseWriter, http.StatusOK, snapshot)
 	}
 }
 
@@ -2521,6 +3061,126 @@ func buildEstimateImpactCostHandler() http.HandlerFunc {
 		}
 
 		respondWithJson(responseWriter, http.StatusOK, estimate)
+	}
+}
+
+// portfolioStressTestWireRequest is the payload for POST
+// /portfolio-stress-test/compute. Equity positions are looked up
+// SERVER-SIDE from internal/positions for accountId (never
+// client-asserted quantities) — the caller only supplies each held
+// equity instrument's CURRENT PRICE (oms-gateway has no live price feed,
+// same documented gap as every other package that needs one) via
+// EquityCurrentPricesInMinorUnits. Option positions have no server-side
+// book at all in this build, so they're supplied directly by the caller
+// — the same "the real computation exists, the live/held-state feed to
+// source its input doesn't" pattern internal/impactcostestimator and
+// internal/executionalgos' VWAP/POV already established.
+type portfolioStressTestWireRequest struct {
+	ClientAccountIdentifier         string                                        `json:"clientAccountIdentifier"`
+	ShockPercent                    float64                                       `json:"shockPercent"`
+	EquityCurrentPricesInMinorUnits map[string]int64                              `json:"equityCurrentPricesInMinorUnits"`
+	OptionPositions                 []portfoliostresstest.StressTestPositionInput `json:"optionPositions"`
+}
+
+// buildPortfolioStressTestHandler serves POST
+// /portfolio-stress-test/compute — FEATURES.md §21's "if Nifty drops 10%
+// tomorrow, your portfolio loses ~₹X". See
+// internal/portfoliostresstest's package doc for the honest
+// exact-for-equity / first-order-delta-approximation-for-options scope
+// boundary.
+func buildPortfolioStressTestHandler(positionBook *positions.PositionBook) http.HandlerFunc {
+	return func(responseWriter http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodPost {
+			http.Error(responseWriter, "only POST is supported", http.StatusMethodNotAllowed)
+			return
+		}
+		var wireRequest portfolioStressTestWireRequest
+		if decodeError := json.NewDecoder(request.Body).Decode(&wireRequest); decodeError != nil {
+			http.Error(responseWriter, "malformed portfolio stress test request", http.StatusBadRequest)
+			return
+		}
+		if wireRequest.ClientAccountIdentifier == "" {
+			http.Error(responseWriter, "clientAccountIdentifier is required", http.StatusBadRequest)
+			return
+		}
+
+		var allPositions []portfoliostresstest.StressTestPositionInput
+		var skippedEquityPositionsMissingPrice []string
+		for instrumentSymbol, netQuantity := range positionBook.PositionsForAccount(wireRequest.ClientAccountIdentifier) {
+			currentPrice, hasPrice := wireRequest.EquityCurrentPricesInMinorUnits[instrumentSymbol]
+			if !hasPrice {
+				skippedEquityPositionsMissingPrice = append(skippedEquityPositionsMissingPrice, instrumentSymbol)
+				continue
+			}
+			allPositions = append(allPositions, portfoliostresstest.StressTestPositionInput{
+				InstrumentSymbol:         instrumentSymbol,
+				PositionType:             portfoliostresstest.PositionTypeEquity,
+				NetQuantity:              netQuantity,
+				CurrentPriceInMinorUnits: currentPrice,
+			})
+		}
+		allPositions = append(allPositions, wireRequest.OptionPositions...)
+
+		if len(allPositions) == 0 {
+			respondWithJson(responseWriter, http.StatusOK, map[string]any{
+				"shockPercent":                        wireRequest.ShockPercent,
+				"totalEstimatedPnLImpactInMinorUnits": 0,
+				"perPositionImpacts":                  []portfoliostresstest.PositionImpact{},
+				"skippedEquityPositionsMissingPrice":  skippedEquityPositionsMissingPrice,
+			})
+			return
+		}
+
+		result, stressTestError := portfoliostresstest.ComputeStressTest(allPositions, wireRequest.ShockPercent)
+		if stressTestError != nil {
+			http.Error(responseWriter, stressTestError.Error(), http.StatusBadRequest)
+			return
+		}
+
+		respondWithJson(responseWriter, http.StatusOK, map[string]any{
+			"shockPercent":                        result.ShockPercent,
+			"totalEstimatedPnLImpactInMinorUnits": result.TotalEstimatedPnLImpactInMinorUnits,
+			"perPositionImpacts":                  result.PerPositionImpacts,
+			"skippedEquityPositionsMissingPrice":  skippedEquityPositionsMissingPrice,
+		})
+	}
+}
+
+// ---------------------------------------------------------------------
+// Liquidity / fill-probability badge — FEATURES.md §21. See
+// internal/liquiditybadge's package doc: reuses
+// impactcostestimator.OrderBookDepthSnapshot verbatim, and is honest
+// that the expected-time-to-fill figure is illustrative, not ML-fitted.
+// ---------------------------------------------------------------------
+
+type liquidityBadgeWireRequest struct {
+	Snapshot             impactcostestimator.OrderBookDepthSnapshot `json:"snapshot"`
+	IsBuyNotSell         bool                                       `json:"isBuyNotSell"`
+	HypotheticalQuantity uint64                                     `json:"hypotheticalQuantity"`
+}
+
+// buildLiquidityBadgeHandler is POST /liquidity-badge/compute.
+func buildLiquidityBadgeHandler() http.HandlerFunc {
+	return func(responseWriter http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodPost {
+			http.Error(responseWriter, "only POST is supported", http.StatusMethodNotAllowed)
+			return
+		}
+		var wireRequest liquidityBadgeWireRequest
+		if decodeError := json.NewDecoder(request.Body).Decode(&wireRequest); decodeError != nil {
+			http.Error(responseWriter, "malformed liquidity badge request", http.StatusBadRequest)
+			return
+		}
+
+		badge, badgeError := liquiditybadge.ComputeLiquidityBadge(
+			wireRequest.Snapshot, wireRequest.IsBuyNotSell, wireRequest.HypotheticalQuantity, liquiditybadge.DefaultThresholds(),
+		)
+		if badgeError != nil {
+			http.Error(responseWriter, badgeError.Error(), http.StatusBadRequest)
+			return
+		}
+
+		respondWithJson(responseWriter, http.StatusOK, badge)
 	}
 }
 

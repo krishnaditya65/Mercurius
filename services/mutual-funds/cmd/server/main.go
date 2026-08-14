@@ -27,10 +27,18 @@ import (
 
 	"mercurius/mutualFunds/internal/amcrouting"
 	"mercurius/mutualFunds/internal/basketrebalancing"
+	"mercurius/mutualFunds/internal/bondladderbuilder"
+	"mercurius/mutualFunds/internal/fixedincome"
 	"mercurius/mutualFunds/internal/fundcatalog"
+	"mercurius/mutualFunds/internal/globalmarketsaccess"
 	"mercurius/mutualFunds/internal/goalinvesting"
+	"mercurius/mutualFunds/internal/insurancecrosssell"
+	"mercurius/mutualFunds/internal/primarymarketbidding"
+	"mercurius/mutualFunds/internal/retirementaccounts"
 	"mercurius/mutualFunds/internal/roboadvisory"
+	"mercurius/mutualFunds/internal/secondarymarketbonds"
 	"mercurius/mutualFunds/internal/sipscheduler"
+	"mercurius/mutualFunds/internal/structuredproducts"
 )
 
 func main() {
@@ -49,6 +57,22 @@ func main() {
 	sipScheduler := sipscheduler.NewSipScheduler(fundCatalog, amcOrderRouter)
 	basketRebalancer := basketrebalancing.NewBasketRebalancer(fundCatalog, amcOrderRouter)
 	goalTracker := goalinvesting.NewGoalTracker(fundCatalog, amcOrderRouter)
+
+	bondCatalog := fixedincome.NewBondCatalog()
+	primaryAuctionEngine := primarymarketbidding.NewPrimaryAuctionEngine(bondCatalog)
+	secondaryBondMarket := secondarymarketbonds.NewSecondaryMarket(bondCatalog)
+	bondLadderBuilder := bondladderbuilder.NewBuilder(bondCatalog)
+
+	globalMarketsCatalog := globalmarketsaccess.NewCatalog()
+	globalCurrencyConverter := globalmarketsaccess.NewCurrencyConverter()
+	globalOrderRouter := globalmarketsaccess.NewRouter(globalMarketsCatalog, globalCurrencyConverter)
+
+	retirementAccountsEngine := retirementaccounts.NewRulesEngine()
+
+	structuredProductsCatalog := structuredproducts.NewCatalog()
+	structuredProductsDesk := structuredproducts.NewDesk(structuredProductsCatalog)
+
+	insuranceCrossSellService := insurancecrosssell.NewService(insurancecrosssell.NewMockInsurancePartnerClient())
 
 	quantEngineBaseUrl := os.Getenv("QUANT_ENGINE_BASE_URL")
 	if quantEngineBaseUrl == "" {
@@ -88,6 +112,40 @@ func main() {
 	httpRequestMultiplexer.HandleFunc("/goals/create", buildCreateGoalHandler(goalTracker))
 	httpRequestMultiplexer.HandleFunc("/goals/progress", buildGoalProgressHandler(goalTracker))
 	httpRequestMultiplexer.HandleFunc("/goals", buildListGoalsHandler(goalTracker))
+
+	httpRequestMultiplexer.HandleFunc("/fixed-income/bonds", buildListBondsHandler(bondCatalog))
+	httpRequestMultiplexer.HandleFunc("/fixed-income/auctions", buildListAuctionsHandler(primaryAuctionEngine))
+	httpRequestMultiplexer.HandleFunc("/fixed-income/auctions/open-due", buildOpenDueAuctionsHandler(primaryAuctionEngine))
+	httpRequestMultiplexer.HandleFunc("/fixed-income/auctions/submit-bid", buildSubmitBidHandler(primaryAuctionEngine))
+	httpRequestMultiplexer.HandleFunc("/fixed-income/auctions/close", buildCloseAuctionHandler(primaryAuctionEngine))
+	httpRequestMultiplexer.HandleFunc("/fixed-income/bids", buildListBidsForBidderHandler(primaryAuctionEngine))
+
+	httpRequestMultiplexer.HandleFunc("/fixed-income/secondary-market/listings", buildListSecondaryMarketListingsHandler(secondaryBondMarket))
+	httpRequestMultiplexer.HandleFunc("/fixed-income/secondary-market/update-price", buildUpdateSecondaryMarketPriceHandler(secondaryBondMarket))
+
+	httpRequestMultiplexer.HandleFunc("/fixed-income/ladders/build", buildBuildLadderHandler(bondLadderBuilder))
+	httpRequestMultiplexer.HandleFunc("/fixed-income/ladders", buildListLaddersHandler(bondLadderBuilder))
+	httpRequestMultiplexer.HandleFunc("/fixed-income/coupon-calendar", buildCouponCalendarHandler(bondCatalog, bondLadderBuilder))
+
+	httpRequestMultiplexer.HandleFunc("/global-markets/symbols", buildListGlobalSymbolsHandler(globalMarketsCatalog))
+	httpRequestMultiplexer.HandleFunc("/global-markets/orders/place", buildPlaceGlobalOrderHandler(globalOrderRouter))
+	httpRequestMultiplexer.HandleFunc("/global-markets/orders/route", buildRouteGlobalOrderHandler(globalOrderRouter))
+	httpRequestMultiplexer.HandleFunc("/global-markets/orders/confirm", buildConfirmGlobalOrderHandler(globalOrderRouter))
+	httpRequestMultiplexer.HandleFunc("/global-markets/orders", buildListGlobalOrdersHandler(globalOrderRouter))
+
+	httpRequestMultiplexer.HandleFunc("/retirement-accounts/open", buildOpenRetirementAccountHandler(retirementAccountsEngine))
+	httpRequestMultiplexer.HandleFunc("/retirement-accounts/contribute", buildContributeRetirementAccountHandler(retirementAccountsEngine))
+	httpRequestMultiplexer.HandleFunc("/retirement-accounts/withdraw", buildWithdrawRetirementAccountHandler(retirementAccountsEngine))
+	httpRequestMultiplexer.HandleFunc("/retirement-accounts", buildListRetirementAccountsHandler(retirementAccountsEngine))
+
+	httpRequestMultiplexer.HandleFunc("/structured-products/notes", buildListStructuredNotesHandler(structuredProductsCatalog))
+	httpRequestMultiplexer.HandleFunc("/structured-products/subscribe", buildSubscribeStructuredNoteHandler(structuredProductsDesk))
+	httpRequestMultiplexer.HandleFunc("/structured-products/mature", buildMatureStructuredNoteHandler(structuredProductsDesk))
+	httpRequestMultiplexer.HandleFunc("/structured-products/subscriptions", buildListStructuredSubscriptionsHandler(structuredProductsDesk))
+
+	httpRequestMultiplexer.HandleFunc("/insurance-cross-sell/quote", buildRequestInsuranceQuoteHandler(insuranceCrossSellService))
+	httpRequestMultiplexer.HandleFunc("/insurance-cross-sell/register-interest", buildRegisterInsuranceInterestHandler(insuranceCrossSellService))
+	httpRequestMultiplexer.HandleFunc("/insurance-cross-sell/leads", buildListInsuranceLeadsHandler(insuranceCrossSellService))
 
 	listenAddress := ":8087"
 	log.Printf("mutual-funds listening on %s (order confirmation delay: %s)\n", listenAddress, confirmationDelay)
@@ -936,5 +994,1008 @@ func buildGoalProgressHandler(goalTracker *goalinvesting.GoalTracker) http.Handl
 			ProjectedSurplusOrShortfallInMinorUnits: progress.ProjectedSurplusOrShortfallInMinorUnits,
 			RequiredMonthlyContributionInMinorUnits: progress.RequiredMonthlyContributionInMinorUnits,
 		})
+	}
+}
+
+// --- internal/fixedincome & internal/primarymarketbidding wire handlers ---
+
+type bondWireFormat struct {
+	BondId                string  `json:"bondId"`
+	IssueName             string  `json:"issueName"`
+	BondType              string  `json:"bondType"`
+	IssueDate             string  `json:"issueDate"`
+	MaturityDate          string  `json:"maturityDate"`
+	CouponRatePercent     float64 `json:"couponRatePercent"`
+	PaymentsPerYear       int     `json:"paymentsPerYear"`
+	FaceValueInMinorUnits int64   `json:"faceValueInMinorUnits"`
+	CreditRating          string  `json:"creditRating"`
+}
+
+func toBondWireFormat(bond fixedincome.Bond) bondWireFormat {
+	return bondWireFormat{
+		BondId:                bond.BondId,
+		IssueName:             bond.IssueName,
+		BondType:              string(bond.BondType),
+		IssueDate:             bond.IssueDate.Format(time.RFC3339),
+		MaturityDate:          bond.MaturityDate.Format(time.RFC3339),
+		CouponRatePercent:     bond.CouponRatePercent,
+		PaymentsPerYear:       bond.PaymentsPerYear,
+		FaceValueInMinorUnits: bond.FaceValueInMinorUnits,
+		CreditRating:          string(bond.CreditRating),
+	}
+}
+
+func buildListBondsHandler(bondCatalog *fixedincome.BondCatalog) http.HandlerFunc {
+	return func(responseWriter http.ResponseWriter, _ *http.Request) {
+		bonds := bondCatalog.ListAll()
+		wireBonds := make([]bondWireFormat, 0, len(bonds))
+		for _, bond := range bonds {
+			wireBonds = append(wireBonds, toBondWireFormat(bond))
+		}
+		respondWithJson(responseWriter, http.StatusOK, wireBonds)
+	}
+}
+
+type auctionWireFormat struct {
+	AuctionId                  string `json:"auctionId"`
+	BondId                     string `json:"bondId"`
+	ScheduledAuctionDate       string `json:"scheduledAuctionDate"`
+	NotifiedAmountInMinorUnits int64  `json:"notifiedAmountInMinorUnits"`
+	Status                     string `json:"status"`
+	ClosedAt                   string `json:"closedAt,omitempty"`
+	ErrorMessage               string `json:"errorMessage,omitempty"`
+}
+
+func toAuctionWireFormat(auction *primarymarketbidding.Auction) auctionWireFormat {
+	wireFormat := auctionWireFormat{
+		AuctionId:                  auction.AuctionId,
+		BondId:                     auction.BondId,
+		ScheduledAuctionDate:       auction.ScheduledAuctionDate.Format(time.RFC3339),
+		NotifiedAmountInMinorUnits: auction.NotifiedAmountInMinorUnits,
+		Status:                     string(auction.Status),
+	}
+	if !auction.ClosedAt.IsZero() {
+		wireFormat.ClosedAt = auction.ClosedAt.Format(time.RFC3339)
+	}
+	return wireFormat
+}
+
+func buildListAuctionsHandler(engine *primarymarketbidding.Engine) http.HandlerFunc {
+	return func(responseWriter http.ResponseWriter, _ *http.Request) {
+		auctions := engine.ListAuctions()
+		wireAuctions := make([]auctionWireFormat, 0, len(auctions))
+		for _, auction := range auctions {
+			wireAuctions = append(wireAuctions, toAuctionWireFormat(auction))
+		}
+		respondWithJson(responseWriter, http.StatusOK, wireAuctions)
+	}
+}
+
+func buildOpenDueAuctionsHandler(engine *primarymarketbidding.Engine) http.HandlerFunc {
+	return func(responseWriter http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodPost {
+			http.Error(responseWriter, "only POST is supported", http.StatusMethodNotAllowed)
+			return
+		}
+
+		now, nowError := resolveNow(request)
+		if nowError != nil {
+			http.Error(responseWriter, "malformed asOf query parameter, expected RFC3339", http.StatusBadRequest)
+			return
+		}
+
+		opened := engine.OpenDueAuctions(now)
+		wireAuctions := make([]auctionWireFormat, 0, len(opened))
+		for _, auction := range opened {
+			wireAuctions = append(wireAuctions, toAuctionWireFormat(auction))
+		}
+		respondWithJson(responseWriter, http.StatusOK, wireAuctions)
+	}
+}
+
+type bidWireFormat struct {
+	BidId                        string  `json:"bidId"`
+	AuctionId                    string  `json:"auctionId"`
+	BidderAccountIdentifier      string  `json:"bidderAccountIdentifier"`
+	QuantityInMinorUnits         int64   `json:"quantityInMinorUnits"`
+	YieldPercent                 float64 `json:"yieldPercent"`
+	SubmittedAt                  string  `json:"submittedAt"`
+	Status                       string  `json:"status"`
+	AllottedQuantityInMinorUnits int64   `json:"allottedQuantityInMinorUnits,omitempty"`
+	ErrorMessage                 string  `json:"errorMessage,omitempty"`
+}
+
+func toBidWireFormat(bid *primarymarketbidding.Bid) bidWireFormat {
+	return bidWireFormat{
+		BidId:                        bid.BidId,
+		AuctionId:                    bid.AuctionId,
+		BidderAccountIdentifier:      bid.BidderAccountIdentifier,
+		QuantityInMinorUnits:         bid.QuantityInMinorUnits,
+		YieldPercent:                 bid.YieldPercent,
+		SubmittedAt:                  bid.SubmittedAt.Format(time.RFC3339),
+		Status:                       string(bid.Status),
+		AllottedQuantityInMinorUnits: bid.AllottedQuantityInMinorUnits,
+	}
+}
+
+type submitBidWireRequest struct {
+	AuctionId               string  `json:"auctionId"`
+	BidderAccountIdentifier string  `json:"bidderAccountIdentifier"`
+	QuantityInMinorUnits    int64   `json:"quantityInMinorUnits"`
+	YieldPercent            float64 `json:"yieldPercent"`
+}
+
+func buildSubmitBidHandler(engine *primarymarketbidding.Engine) http.HandlerFunc {
+	return func(responseWriter http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodPost {
+			http.Error(responseWriter, "only POST is supported", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var wireRequest submitBidWireRequest
+		if decodeError := json.NewDecoder(request.Body).Decode(&wireRequest); decodeError != nil {
+			http.Error(responseWriter, "malformed bid submission payload", http.StatusBadRequest)
+			return
+		}
+
+		now, nowError := resolveNow(request)
+		if nowError != nil {
+			http.Error(responseWriter, "malformed asOf query parameter, expected RFC3339", http.StatusBadRequest)
+			return
+		}
+
+		bid, submitError := engine.SubmitBid(wireRequest.AuctionId, wireRequest.BidderAccountIdentifier, wireRequest.QuantityInMinorUnits, wireRequest.YieldPercent, now)
+		if submitError != nil {
+			respondWithJson(responseWriter, http.StatusBadRequest, bidWireFormat{ErrorMessage: submitError.Error()})
+			return
+		}
+
+		respondWithJson(responseWriter, http.StatusOK, toBidWireFormat(bid))
+	}
+}
+
+type closeAuctionWireRequest struct {
+	AuctionId string `json:"auctionId"`
+}
+
+func buildCloseAuctionHandler(engine *primarymarketbidding.Engine) http.HandlerFunc {
+	return func(responseWriter http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodPost {
+			http.Error(responseWriter, "only POST is supported", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var wireRequest closeAuctionWireRequest
+		if decodeError := json.NewDecoder(request.Body).Decode(&wireRequest); decodeError != nil {
+			http.Error(responseWriter, "malformed close-auction payload", http.StatusBadRequest)
+			return
+		}
+
+		now, nowError := resolveNow(request)
+		if nowError != nil {
+			http.Error(responseWriter, "malformed asOf query parameter, expected RFC3339", http.StatusBadRequest)
+			return
+		}
+
+		bids, closeError := engine.CloseAuction(wireRequest.AuctionId, now)
+		if closeError != nil {
+			respondWithJson(responseWriter, http.StatusBadRequest, []bidWireFormat{{ErrorMessage: closeError.Error()}})
+			return
+		}
+
+		wireBids := make([]bidWireFormat, 0, len(bids))
+		for _, bid := range bids {
+			wireBids = append(wireBids, toBidWireFormat(bid))
+		}
+		respondWithJson(responseWriter, http.StatusOK, wireBids)
+	}
+}
+
+func buildListBidsForBidderHandler(engine *primarymarketbidding.Engine) http.HandlerFunc {
+	return func(responseWriter http.ResponseWriter, request *http.Request) {
+		bidderAccountIdentifier := request.URL.Query().Get("accountId")
+		if bidderAccountIdentifier == "" {
+			http.Error(responseWriter, "missing accountId query parameter", http.StatusBadRequest)
+			return
+		}
+
+		bids := engine.BidsForBidder(bidderAccountIdentifier)
+		wireBids := make([]bidWireFormat, 0, len(bids))
+		for _, bid := range bids {
+			wireBids = append(wireBids, toBidWireFormat(bid))
+		}
+		respondWithJson(responseWriter, http.StatusOK, wireBids)
+	}
+}
+
+// --- internal/secondarymarketbonds wire handlers ---
+
+type secondaryMarketListingWireFormat struct {
+	Bond                     bondWireFormat `json:"bond"`
+	CurrentPriceInMinorUnits int64          `json:"currentPriceInMinorUnits"`
+	YieldToMaturityPercent   float64        `json:"yieldToMaturityPercent,omitempty"`
+	PeriodsRemaining         int            `json:"periodsRemaining,omitempty"`
+	YtmError                 string         `json:"ytmError,omitempty"`
+}
+
+func buildListSecondaryMarketListingsHandler(market *secondarymarketbonds.SecondaryMarket) http.HandlerFunc {
+	return func(responseWriter http.ResponseWriter, request *http.Request) {
+		now, nowError := resolveNow(request)
+		if nowError != nil {
+			http.Error(responseWriter, "malformed asOf query parameter, expected RFC3339", http.StatusBadRequest)
+			return
+		}
+
+		listings := market.ListListings(now)
+		wireListings := make([]secondaryMarketListingWireFormat, 0, len(listings))
+		for _, listing := range listings {
+			wireListings = append(wireListings, secondaryMarketListingWireFormat{
+				Bond:                     toBondWireFormat(listing.Bond),
+				CurrentPriceInMinorUnits: listing.CurrentPriceInMinorUnits,
+				YieldToMaturityPercent:   listing.YieldToMaturityPercent,
+				PeriodsRemaining:         listing.PeriodsRemaining,
+				YtmError:                 listing.YtmError,
+			})
+		}
+		respondWithJson(responseWriter, http.StatusOK, wireListings)
+	}
+}
+
+type updateSecondaryMarketPriceWireRequest struct {
+	BondId               string `json:"bondId"`
+	NewPriceInMinorUnits int64  `json:"newPriceInMinorUnits"`
+}
+
+func buildUpdateSecondaryMarketPriceHandler(market *secondarymarketbonds.SecondaryMarket) http.HandlerFunc {
+	return func(responseWriter http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodPost {
+			http.Error(responseWriter, "only POST is supported", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var wireRequest updateSecondaryMarketPriceWireRequest
+		if decodeError := json.NewDecoder(request.Body).Decode(&wireRequest); decodeError != nil {
+			http.Error(responseWriter, "malformed update-price payload", http.StatusBadRequest)
+			return
+		}
+
+		if updateError := market.UpdatePrice(wireRequest.BondId, wireRequest.NewPriceInMinorUnits); updateError != nil {
+			http.Error(responseWriter, updateError.Error(), http.StatusBadRequest)
+			return
+		}
+
+		price, _ := market.CurrentPrice(wireRequest.BondId)
+		respondWithJson(responseWriter, http.StatusOK, map[string]any{"bondId": wireRequest.BondId, "currentPriceInMinorUnits": price})
+	}
+}
+
+// --- internal/bondladderbuilder wire handlers ---
+
+type ladderRungWireFormat struct {
+	BondId                      string `json:"bondId"`
+	IssueName                   string `json:"issueName"`
+	MaturityDate                string `json:"maturityDate"`
+	CreditRating                string `json:"creditRating"`
+	AllocatedAmountInMinorUnits int64  `json:"allocatedAmountInMinorUnits"`
+}
+
+type ladderWireFormat struct {
+	LadderId          string                 `json:"ladderId,omitempty"`
+	AccountIdentifier string                 `json:"accountIdentifier,omitempty"`
+	Rungs             []ladderRungWireFormat `json:"rungs,omitempty"`
+	BuiltAt           string                 `json:"builtAt,omitempty"`
+	ErrorMessage      string                 `json:"errorMessage,omitempty"`
+}
+
+func toLadderWireFormat(ladder *bondladderbuilder.Ladder) ladderWireFormat {
+	wireRungs := make([]ladderRungWireFormat, 0, len(ladder.Rungs))
+	for _, rung := range ladder.Rungs {
+		wireRungs = append(wireRungs, ladderRungWireFormat{
+			BondId:                      rung.BondId,
+			IssueName:                   rung.IssueName,
+			MaturityDate:                rung.MaturityDate.Format(time.RFC3339),
+			CreditRating:                string(rung.CreditRating),
+			AllocatedAmountInMinorUnits: rung.AllocatedAmountInMinorUnits,
+		})
+	}
+	return ladderWireFormat{
+		LadderId:          ladder.LadderId,
+		AccountIdentifier: ladder.AccountIdentifier,
+		Rungs:             wireRungs,
+		BuiltAt:           ladder.BuiltAt.Format(time.RFC3339),
+	}
+}
+
+type buildLadderWireRequest struct {
+	AccountIdentifier           string `json:"accountIdentifier"`
+	TotalInvestmentInMinorUnits int64  `json:"totalInvestmentInMinorUnits"`
+	NumberOfRungs               int    `json:"numberOfRungs"`
+}
+
+func buildBuildLadderHandler(builder *bondladderbuilder.Builder) http.HandlerFunc {
+	return func(responseWriter http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodPost {
+			http.Error(responseWriter, "only POST is supported", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var wireRequest buildLadderWireRequest
+		if decodeError := json.NewDecoder(request.Body).Decode(&wireRequest); decodeError != nil {
+			http.Error(responseWriter, "malformed build-ladder payload", http.StatusBadRequest)
+			return
+		}
+
+		now, nowError := resolveNow(request)
+		if nowError != nil {
+			http.Error(responseWriter, "malformed asOf query parameter, expected RFC3339", http.StatusBadRequest)
+			return
+		}
+
+		ladder, buildError := builder.BuildLadder(wireRequest.AccountIdentifier, wireRequest.TotalInvestmentInMinorUnits, wireRequest.NumberOfRungs, now)
+		if buildError != nil {
+			respondWithJson(responseWriter, http.StatusBadRequest, ladderWireFormat{ErrorMessage: buildError.Error()})
+			return
+		}
+
+		respondWithJson(responseWriter, http.StatusOK, toLadderWireFormat(ladder))
+	}
+}
+
+func buildListLaddersHandler(builder *bondladderbuilder.Builder) http.HandlerFunc {
+	return func(responseWriter http.ResponseWriter, request *http.Request) {
+		accountIdentifier := request.URL.Query().Get("accountId")
+		if accountIdentifier == "" {
+			http.Error(responseWriter, "missing accountId query parameter", http.StatusBadRequest)
+			return
+		}
+
+		ladders := builder.LaddersForAccount(accountIdentifier)
+		wireLadders := make([]ladderWireFormat, 0, len(ladders))
+		for _, ladder := range ladders {
+			wireLadders = append(wireLadders, toLadderWireFormat(ladder))
+		}
+		respondWithJson(responseWriter, http.StatusOK, wireLadders)
+	}
+}
+
+type couponReminderWireFormat struct {
+	BondId             string `json:"bondId"`
+	IssueName          string `json:"issueName"`
+	CouponDate         string `json:"couponDate"`
+	AmountInMinorUnits int64  `json:"amountInMinorUnits"`
+}
+
+func buildCouponCalendarHandler(bondCatalog *fixedincome.BondCatalog, builder *bondladderbuilder.Builder) http.HandlerFunc {
+	return func(responseWriter http.ResponseWriter, request *http.Request) {
+		accountIdentifier := request.URL.Query().Get("accountId")
+		if accountIdentifier == "" {
+			http.Error(responseWriter, "missing accountId query parameter", http.StatusBadRequest)
+			return
+		}
+
+		now, nowError := resolveNow(request)
+		if nowError != nil {
+			http.Error(responseWriter, "malformed asOf query parameter, expected RFC3339", http.StatusBadRequest)
+			return
+		}
+
+		reminders := builder.UpcomingCoupons(bondCatalog, accountIdentifier, now)
+		wireReminders := make([]couponReminderWireFormat, 0, len(reminders))
+		for _, reminder := range reminders {
+			wireReminders = append(wireReminders, couponReminderWireFormat{
+				BondId:             reminder.BondId,
+				IssueName:          reminder.IssueName,
+				CouponDate:         reminder.CouponDate.Format(time.RFC3339),
+				AmountInMinorUnits: reminder.AmountInMinorUnits,
+			})
+		}
+		respondWithJson(responseWriter, http.StatusOK, wireReminders)
+	}
+}
+
+// --- internal/globalmarketsaccess wire handlers ---
+
+type globalSymbolWireFormat struct {
+	SymbolId                 string `json:"symbolId"`
+	CompanyName              string `json:"companyName"`
+	HomeExchangeCountry      string `json:"homeExchangeCountry"`
+	QuoteCurrency            string `json:"quoteCurrency"`
+	CurrentPriceInMinorUnits int64  `json:"currentPriceInMinorUnits"`
+}
+
+func buildListGlobalSymbolsHandler(catalog *globalmarketsaccess.Catalog) http.HandlerFunc {
+	return func(responseWriter http.ResponseWriter, _ *http.Request) {
+		symbols := catalog.ListAll()
+		wireSymbols := make([]globalSymbolWireFormat, 0, len(symbols))
+		for _, symbol := range symbols {
+			wireSymbols = append(wireSymbols, globalSymbolWireFormat{
+				SymbolId:                 symbol.SymbolId,
+				CompanyName:              symbol.CompanyName,
+				HomeExchangeCountry:      symbol.HomeExchangeCountry,
+				QuoteCurrency:            symbol.QuoteCurrency,
+				CurrentPriceInMinorUnits: symbol.CurrentPriceInMinorUnits,
+			})
+		}
+		respondWithJson(responseWriter, http.StatusOK, wireSymbols)
+	}
+}
+
+type globalOrderWireFormat struct {
+	OrderId                            string  `json:"orderId"`
+	AccountIdentifier                  string  `json:"accountIdentifier"`
+	SymbolId                           string  `json:"symbolId"`
+	AmountInInvestorCurrencyMinorUnits int64   `json:"amountInInvestorCurrencyMinorUnits"`
+	InvestorCurrency                   string  `json:"investorCurrency"`
+	AmountInQuoteCurrencyMinorUnits    int64   `json:"amountInQuoteCurrencyMinorUnits,omitempty"`
+	QuoteCurrency                      string  `json:"quoteCurrency"`
+	FxRateAppliedAtRouting             float64 `json:"fxRateAppliedAtRouting,omitempty"`
+	UnitsAllocated                     float64 `json:"unitsAllocated,omitempty"`
+	PriceAtConfirmationInMinorUnits    int64   `json:"priceAtConfirmationInMinorUnits,omitempty"`
+	Status                             string  `json:"status"`
+	ErrorMessage                       string  `json:"errorMessage,omitempty"`
+}
+
+func toGlobalOrderWireFormat(order *globalmarketsaccess.Order) globalOrderWireFormat {
+	return globalOrderWireFormat{
+		OrderId:                            order.OrderId,
+		AccountIdentifier:                  order.AccountIdentifier,
+		SymbolId:                           order.SymbolId,
+		AmountInInvestorCurrencyMinorUnits: order.AmountInInvestorCurrencyMinorUnits,
+		InvestorCurrency:                   order.InvestorCurrency,
+		AmountInQuoteCurrencyMinorUnits:    order.AmountInQuoteCurrencyMinorUnits,
+		QuoteCurrency:                      order.QuoteCurrency,
+		FxRateAppliedAtRouting:             order.FxRateAppliedAtRouting,
+		UnitsAllocated:                     order.UnitsAllocated,
+		PriceAtConfirmationInMinorUnits:    order.PriceAtConfirmationInMinorUnits,
+		Status:                             string(order.Status),
+	}
+}
+
+type placeGlobalOrderWireRequest struct {
+	AccountIdentifier                  string `json:"accountIdentifier"`
+	SymbolId                           string `json:"symbolId"`
+	AmountInInvestorCurrencyMinorUnits int64  `json:"amountInInvestorCurrencyMinorUnits"`
+	InvestorCurrency                   string `json:"investorCurrency"`
+}
+
+func buildPlaceGlobalOrderHandler(router *globalmarketsaccess.Router) http.HandlerFunc {
+	return func(responseWriter http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodPost {
+			http.Error(responseWriter, "only POST is supported", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var wireRequest placeGlobalOrderWireRequest
+		if decodeError := json.NewDecoder(request.Body).Decode(&wireRequest); decodeError != nil {
+			http.Error(responseWriter, "malformed global order placement payload", http.StatusBadRequest)
+			return
+		}
+
+		now, nowError := resolveNow(request)
+		if nowError != nil {
+			http.Error(responseWriter, "malformed asOf query parameter, expected RFC3339", http.StatusBadRequest)
+			return
+		}
+
+		investorCurrency := wireRequest.InvestorCurrency
+		if investorCurrency == "" {
+			investorCurrency = "INR"
+		}
+
+		order, placeError := router.PlaceOrder(wireRequest.AccountIdentifier, wireRequest.SymbolId, wireRequest.AmountInInvestorCurrencyMinorUnits, investorCurrency, now)
+		if placeError != nil {
+			respondWithJson(responseWriter, http.StatusBadRequest, globalOrderWireFormat{ErrorMessage: placeError.Error()})
+			return
+		}
+
+		respondWithJson(responseWriter, http.StatusOK, toGlobalOrderWireFormat(order))
+	}
+}
+
+type globalOrderIdWireRequest struct {
+	OrderId string `json:"orderId"`
+}
+
+func buildRouteGlobalOrderHandler(router *globalmarketsaccess.Router) http.HandlerFunc {
+	return func(responseWriter http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodPost {
+			http.Error(responseWriter, "only POST is supported", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var wireRequest globalOrderIdWireRequest
+		if decodeError := json.NewDecoder(request.Body).Decode(&wireRequest); decodeError != nil {
+			http.Error(responseWriter, "malformed payload, expected {\"orderId\": \"...\"}", http.StatusBadRequest)
+			return
+		}
+
+		now, nowError := resolveNow(request)
+		if nowError != nil {
+			http.Error(responseWriter, "malformed asOf query parameter, expected RFC3339", http.StatusBadRequest)
+			return
+		}
+
+		order, routeError := router.RouteOrder(wireRequest.OrderId, now)
+		if routeError != nil {
+			respondWithJson(responseWriter, http.StatusBadRequest, globalOrderWireFormat{ErrorMessage: routeError.Error()})
+			return
+		}
+
+		respondWithJson(responseWriter, http.StatusOK, toGlobalOrderWireFormat(order))
+	}
+}
+
+func buildConfirmGlobalOrderHandler(router *globalmarketsaccess.Router) http.HandlerFunc {
+	return func(responseWriter http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodPost {
+			http.Error(responseWriter, "only POST is supported", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var wireRequest globalOrderIdWireRequest
+		if decodeError := json.NewDecoder(request.Body).Decode(&wireRequest); decodeError != nil {
+			http.Error(responseWriter, "malformed payload, expected {\"orderId\": \"...\"}", http.StatusBadRequest)
+			return
+		}
+
+		now, nowError := resolveNow(request)
+		if nowError != nil {
+			http.Error(responseWriter, "malformed asOf query parameter, expected RFC3339", http.StatusBadRequest)
+			return
+		}
+
+		order, confirmError := router.ConfirmOrder(wireRequest.OrderId, now)
+		if confirmError != nil {
+			respondWithJson(responseWriter, http.StatusBadRequest, globalOrderWireFormat{ErrorMessage: confirmError.Error()})
+			return
+		}
+
+		respondWithJson(responseWriter, http.StatusOK, toGlobalOrderWireFormat(order))
+	}
+}
+
+func buildListGlobalOrdersHandler(router *globalmarketsaccess.Router) http.HandlerFunc {
+	return func(responseWriter http.ResponseWriter, request *http.Request) {
+		accountIdentifier := request.URL.Query().Get("accountId")
+		if accountIdentifier == "" {
+			http.Error(responseWriter, "missing accountId query parameter", http.StatusBadRequest)
+			return
+		}
+
+		orders := router.OrdersForAccount(accountIdentifier)
+		wireOrders := make([]globalOrderWireFormat, 0, len(orders))
+		for _, order := range orders {
+			wireOrders = append(wireOrders, toGlobalOrderWireFormat(order))
+		}
+		respondWithJson(responseWriter, http.StatusOK, wireOrders)
+	}
+}
+
+// --- internal/retirementaccounts wire handlers ---
+
+type retirementAccountWireFormat struct {
+	AccountId           string `json:"accountId,omitempty"`
+	AccountIdentifier   string `json:"accountIdentifier,omitempty"`
+	AccountType         string `json:"accountType,omitempty"`
+	DateOfBirth         string `json:"dateOfBirth,omitempty"`
+	BalanceInMinorUnits int64  `json:"balanceInMinorUnits"`
+	OpenedAt            string `json:"openedAt,omitempty"`
+	ErrorMessage        string `json:"errorMessage,omitempty"`
+}
+
+func toRetirementAccountWireFormat(account *retirementaccounts.Account) retirementAccountWireFormat {
+	return retirementAccountWireFormat{
+		AccountId:           account.AccountId,
+		AccountIdentifier:   account.AccountIdentifier,
+		AccountType:         string(account.AccountType),
+		DateOfBirth:         account.DateOfBirth.Format(time.RFC3339),
+		BalanceInMinorUnits: account.BalanceInMinorUnits,
+		OpenedAt:            account.OpenedAt.Format(time.RFC3339),
+	}
+}
+
+type openRetirementAccountWireRequest struct {
+	AccountIdentifier string `json:"accountIdentifier"`
+	AccountType       string `json:"accountType"`
+	DateOfBirth       string `json:"dateOfBirth"`
+}
+
+func buildOpenRetirementAccountHandler(engine *retirementaccounts.RulesEngine) http.HandlerFunc {
+	return func(responseWriter http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodPost {
+			http.Error(responseWriter, "only POST is supported", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var wireRequest openRetirementAccountWireRequest
+		if decodeError := json.NewDecoder(request.Body).Decode(&wireRequest); decodeError != nil {
+			http.Error(responseWriter, "malformed open-account payload", http.StatusBadRequest)
+			return
+		}
+
+		dateOfBirth, parseError := time.Parse(time.RFC3339, wireRequest.DateOfBirth)
+		if parseError != nil {
+			respondWithJson(responseWriter, http.StatusBadRequest, retirementAccountWireFormat{ErrorMessage: "dateOfBirth must be RFC3339"})
+			return
+		}
+
+		now, nowError := resolveNow(request)
+		if nowError != nil {
+			http.Error(responseWriter, "malformed asOf query parameter, expected RFC3339", http.StatusBadRequest)
+			return
+		}
+
+		account, openError := engine.OpenAccount(wireRequest.AccountIdentifier, retirementaccounts.AccountType(wireRequest.AccountType), dateOfBirth, now)
+		if openError != nil {
+			respondWithJson(responseWriter, http.StatusBadRequest, retirementAccountWireFormat{ErrorMessage: openError.Error()})
+			return
+		}
+
+		respondWithJson(responseWriter, http.StatusOK, toRetirementAccountWireFormat(account))
+	}
+}
+
+type retirementContributionWireRequest struct {
+	AccountId          string `json:"accountId"`
+	AmountInMinorUnits int64  `json:"amountInMinorUnits"`
+}
+
+func buildContributeRetirementAccountHandler(engine *retirementaccounts.RulesEngine) http.HandlerFunc {
+	return func(responseWriter http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodPost {
+			http.Error(responseWriter, "only POST is supported", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var wireRequest retirementContributionWireRequest
+		if decodeError := json.NewDecoder(request.Body).Decode(&wireRequest); decodeError != nil {
+			http.Error(responseWriter, "malformed contribution payload", http.StatusBadRequest)
+			return
+		}
+
+		now, nowError := resolveNow(request)
+		if nowError != nil {
+			http.Error(responseWriter, "malformed asOf query parameter, expected RFC3339", http.StatusBadRequest)
+			return
+		}
+
+		account, contributeError := engine.Contribute(wireRequest.AccountId, wireRequest.AmountInMinorUnits, now)
+		if contributeError != nil {
+			respondWithJson(responseWriter, http.StatusBadRequest, retirementAccountWireFormat{ErrorMessage: contributeError.Error()})
+			return
+		}
+
+		respondWithJson(responseWriter, http.StatusOK, toRetirementAccountWireFormat(account))
+	}
+}
+
+func buildWithdrawRetirementAccountHandler(engine *retirementaccounts.RulesEngine) http.HandlerFunc {
+	return func(responseWriter http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodPost {
+			http.Error(responseWriter, "only POST is supported", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var wireRequest retirementContributionWireRequest
+		if decodeError := json.NewDecoder(request.Body).Decode(&wireRequest); decodeError != nil {
+			http.Error(responseWriter, "malformed withdrawal payload", http.StatusBadRequest)
+			return
+		}
+
+		now, nowError := resolveNow(request)
+		if nowError != nil {
+			http.Error(responseWriter, "malformed asOf query parameter, expected RFC3339", http.StatusBadRequest)
+			return
+		}
+
+		account, withdrawError := engine.Withdraw(wireRequest.AccountId, wireRequest.AmountInMinorUnits, now)
+		if withdrawError != nil {
+			respondWithJson(responseWriter, http.StatusBadRequest, retirementAccountWireFormat{ErrorMessage: withdrawError.Error()})
+			return
+		}
+
+		respondWithJson(responseWriter, http.StatusOK, toRetirementAccountWireFormat(account))
+	}
+}
+
+func buildListRetirementAccountsHandler(engine *retirementaccounts.RulesEngine) http.HandlerFunc {
+	return func(responseWriter http.ResponseWriter, request *http.Request) {
+		accountIdentifier := request.URL.Query().Get("accountId")
+		if accountIdentifier == "" {
+			http.Error(responseWriter, "missing accountId query parameter", http.StatusBadRequest)
+			return
+		}
+
+		accounts := engine.AccountsForHolder(accountIdentifier)
+		wireAccounts := make([]retirementAccountWireFormat, 0, len(accounts))
+		for _, account := range accounts {
+			wireAccounts = append(wireAccounts, toRetirementAccountWireFormat(account))
+		}
+		respondWithJson(responseWriter, http.StatusOK, wireAccounts)
+	}
+}
+
+// --- internal/structuredproducts wire handlers ---
+
+type structuredNoteWireFormat struct {
+	NoteId                     string  `json:"noteId"`
+	Name                       string  `json:"name"`
+	UnderlyingIndexName        string  `json:"underlyingIndexName"`
+	PrincipalProtectionPercent float64 `json:"principalProtectionPercent"`
+	ParticipationRatePercent   float64 `json:"participationRatePercent"`
+	CapPercent                 float64 `json:"capPercent"`
+	TenorMonths                int     `json:"tenorMonths"`
+}
+
+func toStructuredNoteWireFormat(note structuredproducts.Note) structuredNoteWireFormat {
+	return structuredNoteWireFormat{
+		NoteId:                     note.NoteId,
+		Name:                       note.Name,
+		UnderlyingIndexName:        note.UnderlyingIndexName,
+		PrincipalProtectionPercent: note.PrincipalProtectionPercent,
+		ParticipationRatePercent:   note.ParticipationRatePercent,
+		CapPercent:                 note.CapPercent,
+		TenorMonths:                note.TenorMonths,
+	}
+}
+
+func buildListStructuredNotesHandler(catalog *structuredproducts.Catalog) http.HandlerFunc {
+	return func(responseWriter http.ResponseWriter, _ *http.Request) {
+		notes := catalog.ListAll()
+		wireNotes := make([]structuredNoteWireFormat, 0, len(notes))
+		for _, note := range notes {
+			wireNotes = append(wireNotes, toStructuredNoteWireFormat(note))
+		}
+		respondWithJson(responseWriter, http.StatusOK, wireNotes)
+	}
+}
+
+type structuredSubscriptionWireFormat struct {
+	SubscriptionId               string  `json:"subscriptionId"`
+	AccountIdentifier            string  `json:"accountIdentifier"`
+	NoteId                       string  `json:"noteId"`
+	PrincipalInMinorUnits        int64   `json:"principalInMinorUnits"`
+	SubscribedAt                 string  `json:"subscribedAt"`
+	Status                       string  `json:"status"`
+	MaturedAt                    string  `json:"maturedAt,omitempty"`
+	UnderlyingIndexReturnPercent float64 `json:"underlyingIndexReturnPercent,omitempty"`
+	EffectiveReturnPercent       float64 `json:"effectiveReturnPercent,omitempty"`
+	WasCapped                    bool    `json:"wasCapped,omitempty"`
+	PayoutInMinorUnits           int64   `json:"payoutInMinorUnits,omitempty"`
+	ErrorMessage                 string  `json:"errorMessage,omitempty"`
+}
+
+func toStructuredSubscriptionWireFormat(subscription *structuredproducts.Subscription) structuredSubscriptionWireFormat {
+	wireFormat := structuredSubscriptionWireFormat{
+		SubscriptionId:               subscription.SubscriptionId,
+		AccountIdentifier:            subscription.AccountIdentifier,
+		NoteId:                       subscription.NoteId,
+		PrincipalInMinorUnits:        subscription.PrincipalInMinorUnits,
+		SubscribedAt:                 subscription.SubscribedAt.Format(time.RFC3339),
+		Status:                       string(subscription.Status),
+		UnderlyingIndexReturnPercent: subscription.UnderlyingIndexReturnPercent,
+		EffectiveReturnPercent:       subscription.EffectiveReturnPercent,
+		WasCapped:                    subscription.WasCapped,
+		PayoutInMinorUnits:           subscription.PayoutInMinorUnits,
+	}
+	if !subscription.MaturedAt.IsZero() {
+		wireFormat.MaturedAt = subscription.MaturedAt.Format(time.RFC3339)
+	}
+	return wireFormat
+}
+
+type subscribeStructuredNoteWireRequest struct {
+	AccountIdentifier     string `json:"accountIdentifier"`
+	NoteId                string `json:"noteId"`
+	PrincipalInMinorUnits int64  `json:"principalInMinorUnits"`
+}
+
+func buildSubscribeStructuredNoteHandler(desk *structuredproducts.Desk) http.HandlerFunc {
+	return func(responseWriter http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodPost {
+			http.Error(responseWriter, "only POST is supported", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var wireRequest subscribeStructuredNoteWireRequest
+		if decodeError := json.NewDecoder(request.Body).Decode(&wireRequest); decodeError != nil {
+			http.Error(responseWriter, "malformed subscription payload", http.StatusBadRequest)
+			return
+		}
+
+		now, nowError := resolveNow(request)
+		if nowError != nil {
+			http.Error(responseWriter, "malformed asOf query parameter, expected RFC3339", http.StatusBadRequest)
+			return
+		}
+
+		subscription, subscribeError := desk.Subscribe(wireRequest.AccountIdentifier, wireRequest.NoteId, wireRequest.PrincipalInMinorUnits, now)
+		if subscribeError != nil {
+			respondWithJson(responseWriter, http.StatusBadRequest, structuredSubscriptionWireFormat{ErrorMessage: subscribeError.Error()})
+			return
+		}
+
+		respondWithJson(responseWriter, http.StatusOK, toStructuredSubscriptionWireFormat(subscription))
+	}
+}
+
+type matureStructuredNoteWireRequest struct {
+	SubscriptionId               string  `json:"subscriptionId"`
+	UnderlyingIndexReturnPercent float64 `json:"underlyingIndexReturnPercent"`
+}
+
+func buildMatureStructuredNoteHandler(desk *structuredproducts.Desk) http.HandlerFunc {
+	return func(responseWriter http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodPost {
+			http.Error(responseWriter, "only POST is supported", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var wireRequest matureStructuredNoteWireRequest
+		if decodeError := json.NewDecoder(request.Body).Decode(&wireRequest); decodeError != nil {
+			http.Error(responseWriter, "malformed maturity payload", http.StatusBadRequest)
+			return
+		}
+
+		now, nowError := resolveNow(request)
+		if nowError != nil {
+			http.Error(responseWriter, "malformed asOf query parameter, expected RFC3339", http.StatusBadRequest)
+			return
+		}
+
+		subscription, matureError := desk.MatureSubscription(wireRequest.SubscriptionId, wireRequest.UnderlyingIndexReturnPercent, now)
+		if matureError != nil {
+			respondWithJson(responseWriter, http.StatusBadRequest, structuredSubscriptionWireFormat{ErrorMessage: matureError.Error()})
+			return
+		}
+
+		respondWithJson(responseWriter, http.StatusOK, toStructuredSubscriptionWireFormat(subscription))
+	}
+}
+
+func buildListStructuredSubscriptionsHandler(desk *structuredproducts.Desk) http.HandlerFunc {
+	return func(responseWriter http.ResponseWriter, request *http.Request) {
+		accountIdentifier := request.URL.Query().Get("accountId")
+		if accountIdentifier == "" {
+			http.Error(responseWriter, "missing accountId query parameter", http.StatusBadRequest)
+			return
+		}
+
+		subscriptions := desk.SubscriptionsForAccount(accountIdentifier)
+		wireSubscriptions := make([]structuredSubscriptionWireFormat, 0, len(subscriptions))
+		for _, subscription := range subscriptions {
+			wireSubscriptions = append(wireSubscriptions, toStructuredSubscriptionWireFormat(subscription))
+		}
+		respondWithJson(responseWriter, http.StatusOK, wireSubscriptions)
+	}
+}
+
+// --- internal/insurancecrosssell wire handlers ---
+
+type insuranceQuoteWireFormat struct {
+	QuoteId                               string `json:"quoteId"`
+	ProductType                           string `json:"productType"`
+	ApplicantAge                          int    `json:"applicantAge"`
+	CoverageAmountInMinorUnits            int64  `json:"coverageAmountInMinorUnits"`
+	IllustrativeAnnualPremiumInMinorUnits int64  `json:"illustrativeAnnualPremiumInMinorUnits"`
+	PartnerName                           string `json:"partnerName"`
+	QuotedAt                              string `json:"quotedAt"`
+	ErrorMessage                          string `json:"errorMessage,omitempty"`
+}
+
+func toInsuranceQuoteWireFormat(quote insurancecrosssell.Quote) insuranceQuoteWireFormat {
+	return insuranceQuoteWireFormat{
+		QuoteId:                               quote.QuoteId,
+		ProductType:                           string(quote.ProductType),
+		ApplicantAge:                          quote.ApplicantAge,
+		CoverageAmountInMinorUnits:            quote.CoverageAmountInMinorUnits,
+		IllustrativeAnnualPremiumInMinorUnits: quote.IllustrativeAnnualPremiumInMinorUnits,
+		PartnerName:                           quote.PartnerName,
+		QuotedAt:                              quote.QuotedAt.Format(time.RFC3339),
+	}
+}
+
+type requestInsuranceQuoteWireRequest struct {
+	ProductType                string `json:"productType"`
+	ApplicantAge               int    `json:"applicantAge"`
+	CoverageAmountInMinorUnits int64  `json:"coverageAmountInMinorUnits"`
+}
+
+func buildRequestInsuranceQuoteHandler(service *insurancecrosssell.Service) http.HandlerFunc {
+	return func(responseWriter http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodPost {
+			http.Error(responseWriter, "only POST is supported", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var wireRequest requestInsuranceQuoteWireRequest
+		if decodeError := json.NewDecoder(request.Body).Decode(&wireRequest); decodeError != nil {
+			http.Error(responseWriter, "malformed quote request payload", http.StatusBadRequest)
+			return
+		}
+
+		now, nowError := resolveNow(request)
+		if nowError != nil {
+			http.Error(responseWriter, "malformed asOf query parameter, expected RFC3339", http.StatusBadRequest)
+			return
+		}
+
+		quote, quoteError := service.RequestQuote(insurancecrosssell.ProductType(wireRequest.ProductType), wireRequest.ApplicantAge, wireRequest.CoverageAmountInMinorUnits, now)
+		if quoteError != nil {
+			respondWithJson(responseWriter, http.StatusBadRequest, insuranceQuoteWireFormat{ErrorMessage: quoteError.Error()})
+			return
+		}
+
+		respondWithJson(responseWriter, http.StatusOK, toInsuranceQuoteWireFormat(quote))
+	}
+}
+
+type insuranceLeadWireFormat struct {
+	LeadId            string `json:"leadId,omitempty"`
+	AccountIdentifier string `json:"accountIdentifier,omitempty"`
+	QuoteId           string `json:"quoteId,omitempty"`
+	Status            string `json:"status,omitempty"`
+	RegisteredAt      string `json:"registeredAt,omitempty"`
+	ErrorMessage      string `json:"errorMessage,omitempty"`
+}
+
+func toInsuranceLeadWireFormat(lead *insurancecrosssell.Lead) insuranceLeadWireFormat {
+	return insuranceLeadWireFormat{
+		LeadId:            lead.LeadId,
+		AccountIdentifier: lead.AccountIdentifier,
+		QuoteId:           lead.QuoteId,
+		Status:            string(lead.Status),
+		RegisteredAt:      lead.RegisteredAt.Format(time.RFC3339),
+	}
+}
+
+type registerInsuranceInterestWireRequest struct {
+	AccountIdentifier string `json:"accountIdentifier"`
+	QuoteId           string `json:"quoteId"`
+}
+
+func buildRegisterInsuranceInterestHandler(service *insurancecrosssell.Service) http.HandlerFunc {
+	return func(responseWriter http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodPost {
+			http.Error(responseWriter, "only POST is supported", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var wireRequest registerInsuranceInterestWireRequest
+		if decodeError := json.NewDecoder(request.Body).Decode(&wireRequest); decodeError != nil {
+			http.Error(responseWriter, "malformed register-interest payload", http.StatusBadRequest)
+			return
+		}
+
+		now, nowError := resolveNow(request)
+		if nowError != nil {
+			http.Error(responseWriter, "malformed asOf query parameter, expected RFC3339", http.StatusBadRequest)
+			return
+		}
+
+		lead, registerError := service.RegisterInterest(wireRequest.AccountIdentifier, wireRequest.QuoteId, now)
+		if registerError != nil {
+			respondWithJson(responseWriter, http.StatusBadRequest, insuranceLeadWireFormat{ErrorMessage: registerError.Error()})
+			return
+		}
+
+		respondWithJson(responseWriter, http.StatusOK, toInsuranceLeadWireFormat(lead))
+	}
+}
+
+func buildListInsuranceLeadsHandler(service *insurancecrosssell.Service) http.HandlerFunc {
+	return func(responseWriter http.ResponseWriter, request *http.Request) {
+		accountIdentifier := request.URL.Query().Get("accountId")
+		if accountIdentifier == "" {
+			http.Error(responseWriter, "missing accountId query parameter", http.StatusBadRequest)
+			return
+		}
+
+		leads := service.LeadsForAccount(accountIdentifier)
+		wireLeads := make([]insuranceLeadWireFormat, 0, len(leads))
+		for _, lead := range leads {
+			wireLeads = append(wireLeads, toInsuranceLeadWireFormat(lead))
+		}
+		respondWithJson(responseWriter, http.StatusOK, wireLeads)
 	}
 }

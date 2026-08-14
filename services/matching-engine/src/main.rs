@@ -23,6 +23,7 @@
 #![allow(dead_code)]
 
 mod deterministicReplayHarness;
+mod domReplayHttpServer;
 mod lockFreeSpscRingBuffer;
 mod orderBookCore;
 mod orderTypes;
@@ -56,6 +57,12 @@ const TRADED_INSTRUMENT_SYMBOL: &str = "DEMO-EQ";
 /// drill that exercises this.
 const DEFAULT_MATCHING_ENGINE_TCP_LISTEN_ADDRESS: &str = "127.0.0.1:9101";
 const MARKET_DATA_TCP_ADDRESS: &str = "127.0.0.1:9102";
+/// Default listen address for the DOM (Depth Of Market) replay HTTP server
+/// (FEATURES.md §20 `[P4]`, `domReplayHttpServer.rs`) — overridable via
+/// `MATCHING_ENGINE_DOM_REPLAY_HTTP_LISTEN_ADDRESS` for the same
+/// side-by-side-instance reason as the other overridable addresses above.
+/// `9106` is the next port after market-data's `9101`-`9105` range.
+const DEFAULT_DOM_REPLAY_HTTP_LISTEN_ADDRESS: &str = "127.0.0.1:9106";
 /// Default WAL file path, relative to the process's working directory.
 /// Overridable via the `MATCHING_ENGINE_WAL_FILE_PATH` env var (used by
 /// the live-verification run so it doesn't clobber this default file, and
@@ -130,6 +137,24 @@ fn main() {
     .expect(
         "failed to open/recover the write-ahead log — see writeAheadLog.rs/walBackedOrderBook.rs",
     );
+
+    // The DOM replay HTTP server (FEATURES.md §20 `[P4]`) — a read-only
+    // consumer of the SAME WAL file `orderBookForInstrument` is durably
+    // appending to, on its own thread, re-reading the file fresh off disk
+    // for every request rather than sharing any in-memory state with the
+    // matching-core thread. See `domReplayHttpServer.rs`'s module docs for
+    // why this lives here rather than in market-data.
+    let domReplayHttpListenAddress =
+        std::env::var("MATCHING_ENGINE_DOM_REPLAY_HTTP_LISTEN_ADDRESS")
+            .unwrap_or_else(|_| DEFAULT_DOM_REPLAY_HTTP_LISTEN_ADDRESS.to_string());
+    let domReplayWalFilePath = orderBookForInstrument.walFilePath().to_path_buf();
+    thread::spawn(move || {
+        domReplayHttpServer::runDomReplayHttpServer(
+            &domReplayHttpListenAddress,
+            domReplayWalFilePath,
+            TRADED_INSTRUMENT_SYMBOL,
+        );
+    });
 
     // FEATURES.md §9 "Lock-free ring buffer ingress/egress": two SPSC
     // ring buffers (`lockFreeSpscRingBuffer.rs`) replace what used to be a

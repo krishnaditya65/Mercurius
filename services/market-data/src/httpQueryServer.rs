@@ -19,8 +19,22 @@ use serde::Deserialize;
 
 use crate::candleAggregator::CandleAggregator;
 use crate::columnarTickStore::ColumnarTickStore;
+use crate::orderFlowFootprintAggregator::computeOrderFlowFootprint;
 use crate::pricealerts::PriceAlertStore;
+use crate::volumeProfileAggregator::{computeTpoProfile, computeVolumeProfile};
 use crate::watchlist::WatchlistStore;
+
+/// Default price-bucket width (minor units) for `GET /volumeProfile` and
+/// `GET /orderFlowFootprint` when the caller doesn't specify one — a
+/// round, demo-friendly number, not tuned to any particular instrument's
+/// tick size.
+const DEFAULT_PRICE_BUCKET_SIZE_IN_MINOR_UNITS: i64 = 100;
+/// Default Value Area volume fraction (70%) — the standard Market Profile
+/// convention (FEATURES.md §20).
+const DEFAULT_VALUE_AREA_VOLUME_FRACTION: f64 = 0.70;
+/// Default TPO letter width (seconds) for `GET /volumeProfile`'s
+/// `tpoIntervalSeconds` query param.
+const DEFAULT_TPO_INTERVAL_SECONDS: u64 = 60;
 
 const DEFAULT_QUERY_LIMIT: usize = 100;
 
@@ -58,7 +72,8 @@ pub fn runHttpQueryServer(listenAddress: &str, sharedState: Arc<SharedMarketData
     };
     println!(
         "market-data HTTP query server listening on {listenAddress} (GET /trades, GET /candles, \
-         GET /ticks/range, GET/POST /watchlist, POST /alerts/create, GET /alerts)"
+         GET /ticks/range, GET /volumeProfile, GET /orderFlowFootprint, GET/POST /watchlist, \
+         POST /alerts/create, GET /alerts)"
     );
 
     for incomingConnection in tcpListener.incoming() {
@@ -205,6 +220,84 @@ fn handleOneHttpRequest(
             (
                 "HTTP/1.1 200 OK".to_string(),
                 serde_json::to_string(&ticks).unwrap_or_else(|_| "[]".to_string()),
+            )
+        }
+
+        ("GET", "/volumeProfile") => {
+            if instrumentSymbol.is_empty() {
+                return (
+                    "HTTP/1.1 400 Bad Request".to_string(),
+                    r#"{"errorMessage":"instrumentSymbol query parameter is required"}"#.to_string(),
+                );
+            }
+            let startEpochSeconds = queryParams
+                .get("startEpochSeconds")
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(u64::MIN);
+            let endEpochSeconds = queryParams
+                .get("endEpochSeconds")
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(u64::MAX);
+            let priceBucketSizeInMinorUnits = queryParams
+                .get("priceBucketSizeInMinorUnits")
+                .and_then(|value| value.parse::<i64>().ok())
+                .unwrap_or(DEFAULT_PRICE_BUCKET_SIZE_IN_MINOR_UNITS);
+            let valueAreaVolumeFraction = queryParams
+                .get("valueAreaVolumeFraction")
+                .and_then(|value| value.parse::<f64>().ok())
+                .unwrap_or(DEFAULT_VALUE_AREA_VOLUME_FRACTION);
+            let tpoIntervalSeconds = queryParams
+                .get("tpoIntervalSeconds")
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(DEFAULT_TPO_INTERVAL_SECONDS);
+
+            let ticks = sharedState
+                .columnarTickStore
+                .rangeQuery(&instrumentSymbol, startEpochSeconds, endEpochSeconds);
+            let volumeProfile = computeVolumeProfile(&ticks, priceBucketSizeInMinorUnits, valueAreaVolumeFraction);
+            let tpoProfile = computeTpoProfile(&ticks, priceBucketSizeInMinorUnits, tpoIntervalSeconds);
+
+            let bodyJson = serde_json::json!({
+                "instrumentSymbol": instrumentSymbol,
+                "tickCount": ticks.len(),
+                "volumeProfile": volumeProfile,
+                "tpoProfile": tpoProfile,
+            });
+            ("HTTP/1.1 200 OK".to_string(), bodyJson.to_string())
+        }
+
+        ("GET", "/orderFlowFootprint") => {
+            if instrumentSymbol.is_empty() {
+                return (
+                    "HTTP/1.1 400 Bad Request".to_string(),
+                    r#"{"errorMessage":"instrumentSymbol query parameter is required"}"#.to_string(),
+                );
+            }
+            let startEpochSeconds = queryParams
+                .get("startEpochSeconds")
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(u64::MIN);
+            let endEpochSeconds = queryParams
+                .get("endEpochSeconds")
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(u64::MAX);
+            let priceBucketSizeInMinorUnits = queryParams
+                .get("priceBucketSizeInMinorUnits")
+                .and_then(|value| value.parse::<i64>().ok())
+                .unwrap_or(DEFAULT_PRICE_BUCKET_SIZE_IN_MINOR_UNITS);
+            let candleIntervalSeconds = queryParams
+                .get("candleIntervalSeconds")
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(crate::candleAggregator::CANDLE_INTERVAL_SECONDS);
+
+            let ticks = sharedState
+                .columnarTickStore
+                .rangeQuery(&instrumentSymbol, startEpochSeconds, endEpochSeconds);
+            let footprint = computeOrderFlowFootprint(&ticks, priceBucketSizeInMinorUnits, candleIntervalSeconds);
+
+            (
+                "HTTP/1.1 200 OK".to_string(),
+                serde_json::to_string(&footprint).unwrap_or_else(|_| "[]".to_string()),
             )
         }
 
@@ -364,6 +457,68 @@ mod tests {
             handleOneHttpRequest("GET /alerts?accountIdentifier=acct-001 HTTP/1.1", "", &sharedState);
         assert_eq!(getStatus, "HTTP/1.1 200 OK");
         assert!(getBody.contains("\"isTriggered\":false"));
+    }
+
+    #[test]
+    fn volumeProfileRouteWithoutInstrumentSymbolReturns400() {
+        let sharedState = Arc::new(SharedMarketDataState::newEmptyState());
+        let (statusLine, _) = handleOneHttpRequest("GET /volumeProfile HTTP/1.1", "", &sharedState);
+        assert_eq!(statusLine, "HTTP/1.1 400 Bad Request");
+    }
+
+    #[test]
+    fn volumeProfileRouteReturnsARealComputedProfileWithPocAndValueArea() {
+        let sharedState = Arc::new(SharedMarketDataState::newEmptyState());
+        // Same hand-worked fixture as volumeProfileAggregator.rs's own
+        // tests: bucket 100 gets 10, bucket 110 gets 10 -> POC=100 (tie
+        // broken low), value area [100,110] at the default 70% fraction.
+        sharedState.columnarTickStore.appendTick("DEMO-EQ", 1_000, 100, 5);
+        sharedState.columnarTickStore.appendTick("DEMO-EQ", 1_010, 100, 5);
+        sharedState.columnarTickStore.appendTick("DEMO-EQ", 1_020, 110, 3);
+        sharedState.columnarTickStore.appendTick("DEMO-EQ", 1_030, 110, 3);
+        sharedState.columnarTickStore.appendTick("DEMO-EQ", 1_040, 110, 4);
+        sharedState.columnarTickStore.appendTick("DEMO-EQ", 1_050, 120, 2);
+
+        let (statusLine, bodyJson) = handleOneHttpRequest(
+            "GET /volumeProfile?instrumentSymbol=DEMO-EQ&priceBucketSizeInMinorUnits=10 HTTP/1.1",
+            "",
+            &sharedState,
+        );
+
+        assert_eq!(statusLine, "HTTP/1.1 200 OK");
+        assert!(bodyJson.contains("\"pointOfControlPriceBucketStart\":100"));
+        assert!(bodyJson.contains("\"valueAreaLowPriceBucketStart\":100"));
+        assert!(bodyJson.contains("\"valueAreaHighPriceBucketStart\":110"));
+        assert!(bodyJson.contains("\"tpoProfile\""));
+        assert!(bodyJson.contains("\"tickCount\":6"));
+    }
+
+    #[test]
+    fn orderFlowFootprintRouteWithoutInstrumentSymbolReturns400() {
+        let sharedState = Arc::new(SharedMarketDataState::newEmptyState());
+        let (statusLine, _) = handleOneHttpRequest("GET /orderFlowFootprint HTTP/1.1", "", &sharedState);
+        assert_eq!(statusLine, "HTTP/1.1 400 Bad Request");
+    }
+
+    #[test]
+    fn orderFlowFootprintRouteReturnsRealBuySellSplitPerPriceLevel() {
+        let sharedState = Arc::new(SharedMarketDataState::newEmptyState());
+        sharedState
+            .columnarTickStore
+            .appendTickWithAggressorSide("DEMO-EQ", 1_000, 100, 5, true);
+        sharedState
+            .columnarTickStore
+            .appendTickWithAggressorSide("DEMO-EQ", 1_005, 100, 3, false);
+
+        let (statusLine, bodyJson) = handleOneHttpRequest(
+            "GET /orderFlowFootprint?instrumentSymbol=DEMO-EQ&priceBucketSizeInMinorUnits=10&candleIntervalSeconds=60 HTTP/1.1",
+            "",
+            &sharedState,
+        );
+
+        assert_eq!(statusLine, "HTTP/1.1 200 OK");
+        assert!(bodyJson.contains("\"buyVolume\":5"));
+        assert!(bodyJson.contains("\"sellVolume\":3"));
     }
 
     #[test]

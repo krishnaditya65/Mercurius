@@ -101,6 +101,16 @@ pub struct TradeExecutionEvent {
     pub sellingClientAccountId: String,
     pub executedPriceInMinorUnits: i64,
     pub executedQuantity: u64,
+    /// `true` when the BUY side was the incoming/aggressing order (it
+    /// crossed the spread against a resting sell), `false` when the SELL
+    /// side was the aggressor. This is a real, additive extension (FEATURES.md
+    /// §20 "Order-flow footprint charts") needed to render buy-vs-sell
+    /// volume per price level — it's known for free at the exact call site
+    /// each `TradeExecutionEvent` is constructed (`OrderBookCore::
+    /// matchIncomingBuyOrderAgainstRestingSellOrders` vs. `::
+    /// matchIncomingSellOrderAgainstRestingBuyOrders`), never inferred or
+    /// guessed after the fact.
+    pub isBuyAggressor: bool,
 }
 
 /// What `OrderBookCore::submitIncomingOrder` returns: every trade produced

@@ -193,6 +193,23 @@ accepting the next connection) — real and lock-free, but pipelining
 isn't exploited yet; no supervision if the matching-core thread panics;
 blocking push/pop use a plain spin loop, not spin-then-park.
 
+### `isBuyAggressor` + `domReplayHttpServer.rs` — new this build
+
+FEATURES.md §20: "Order-flow footprint charts" and "Historical DOM
+replay" (`docs/BUILD_LOG.md` entry 69). A real, additive
+`isBuyAggressor: bool` was threaded through `TradeExecutionEvent` from
+both real trade-matching call sites, through the wire protocol and WAL
+records, into market-data's ingestion path — zero existing tests broken.
+`domReplayHttpServer.rs` (new, port 9106) exposes `GET /domReplay`,
+genuinely reusing the existing WAL + deterministic replay capability to
+return a real, correctly time-windowed sequence of depth snapshots — 21
+new tests (16 WAL, 5 server), 69/69 total for the crate (up from 52).
+
+**Verified live:** a windowed replay query correctly excluded
+out-of-window snapshots while preserving full pre-window book state.
+
+**Known limitation:** O(WAL size) per request, no checkpointing yet.
+
 ---
 
 ## services/market-data (Rust) — Tier 1 skeleton
@@ -380,6 +397,26 @@ symbol list/drift/volatility are hardcoded, not fully configurable;
 columnar tick store duplicates trade-tick storage alongside the
 existing candle aggregator's shorter trade tape (different retention
 purposes, real duplication nonetheless); everything in-memory only.
+
+### `volumeProfileAggregator.rs`, `orderFlowFootprintAggregator.rs` — new this build
+
+FEATURES.md §20 (`docs/BUILD_LOG.md` entry 69). Real Volume Profile
+computation over the columnar tick store — real Point of Control and
+real Value Area (configurable %, default 70%) — plus a real TPO
+(Time Price Opportunity) letter-based profile. Real per-price-level
+buy-vs-sell footprint per candle, powered by the new `isBuyAggressor`
+field threaded from matching-engine (see its section above). New
+routes `GET /volumeProfile`, `GET /orderFlowFootprint`. 37 new tests,
+115 total (up from 83).
+
+**Verified live:** hand-worked fixture matched exactly over HTTP — POC
+at the lower of two tied price levels, Value Area correctly extending
+to cover the 70% target; a footprint split of buy=5/sell=3 at one price
+level and buy=2/sell=7 at another reproduced exactly.
+
+**Known limitations:** inherits the columnar store's 50k-tick retention
+cap (older data silently drops); TPO's "letter A" starts at the
+earliest tick in a query result, not a real session-open time.
 
 ---
 
@@ -816,25 +853,63 @@ POST_MARKET phases (real LIMIT-only enforcement, 13 tests). Every item
 live-verified against a real running server, several matching
 hand-worked numbers exactly.
 
-**§17 "Wealth & Product Breadth" — DRIP and LAS built, fractional
-shares explicitly deferred:** `drip` (real dividend-credit +
-toggleable auto-reinvestment through the live order path, plus new
-`ledgerclient` journal-entry tests, 12 tests); `loanagainstsecurities`
-(a distinct, stricter-LTV, longer-tenure loan product against pledged
-securities, real disbursement/repayment via ledger, 21 tests + 3
-`ledgerclient` tests). **Fractional share investing was explicitly NOT
-attempted** — its blast radius (`orders.OrderQuantity uint64` and every
-consumer) was judged too structurally invasive to build safely within
-this pass's time budget without risking existing integer-quantity
-tests; the README documents a recommended additive approach (a parallel
-`MilliShareQuantity` field, mirroring the `OrderExecutionType`
-precedent) for a future pass.
+**§17 "Wealth & Product Breadth" — DRIP and LAS built at the time:**
+`drip` (real dividend-credit + toggleable auto-reinvestment through the
+live order path, plus new `ledgerclient` journal-entry tests, 12
+tests); `loanagainstsecurities` (a distinct, stricter-LTV, longer-tenure
+loan product against pledged securities, real disbursement/repayment
+via ledger, 21 tests + 3 `ledgerclient` tests). Fractional share
+investing was deferred at the time (see below — it was subsequently
+built in a later pass).
 
 **Concurrent-edit note:** this round's changes to `cmd/server/main.go`
 landed alongside a separate lane's chaos-testing/FIX-conformance
 additions to the same file — the orchestrating session independently
 re-verified (not just trusted the agents) that all changes coexist
 correctly with zero lost work (`docs/BUILD_LOG.md` entry 65).
+
+### `internal/fractionalshares` + 9 more §19/§21 packages — new this build
+
+FEATURES.md §17 (the previously-deferred fractional shares, now built),
+§19, §21 (`docs/BUILD_LOG.md` entry 67) — all 10 items completed.
+
+**Fractional share investing**, finally tackled after being explicitly
+deferred twice: a milli-share integer precision scheme (1000 = 1.000
+share, not float), added as an ADDITIVE `MilliShareQuantity` field
+alongside the existing whole-share quantity. Live (non-paper) fractional
+orders are correctly rejected (matching-engine has no fractional wire
+field yet); paper trading fills fractionally for real via a new, fully
+separate `MilliSharePositionBook`. 30 tests, zero existing
+integer-quantity tests broken.
+
+**§19:** `overtradingdetection` (real rapid-fire/elevated-velocity
+pattern detection, a non-blocking nudge with a real cooldown, 15 tests);
+`riskdisclosuregate` (real per-account F&O acknowledgement + a real
+24-hour cooling-off before the first F&O order, deterministically
+tested via an explicit `now`, 14 tests).
+
+**§21 (8 items):** real square-off countdown + deduplicated threshold
+reminders (extends `marketsession`, 16 tests); a live interest cost
+calculator extending `marginfunding` (cost-so-far + projected, 18
+tests, live-verified with real ledger money movement); a portfolio
+stress test (exact equity scaling + a documented first-order delta
+approximation for options, 13 tests); large-order friction (soft-reject
+against an account's own historical average, resubmit-to-confirm, 15
+tests); a liquidity badge (real HIGH/MEDIUM/LOW from real order-book
+depth + an explicitly-illustrative time-to-fill estimate, 13 tests); an
+extended `idempotency` reconciliation function answering "what happened
+while I was disconnected" (12 new tests); and a corporate-action
+explainer generating a real one-line explanation from real before/after
+position numbers (explicitly scoped as ONLY the explainer surface —
+real corporate-actions detection itself, §14, remains unbuilt).
+
+**Verified live** across every item against real running services.
+
+**Known gaps:** fractional-aware charges/margin calculators not yet
+built; liquidity badge and stress test are explicitly illustrative/
+first-order, not ML-fitted or full repricing. §21's capital-gains
+statement export and cross-device watchlist/P&L widget were NOT part of
+this round and remain unbuilt.
 
 ---
 
@@ -1206,6 +1281,42 @@ is illustrative, not a forecast, and doesn't vary by the goal's actual
 linked-scheme risk mix; no cross-referencing between goals/baskets and
 actual SIP records — a caller supplies linked scheme IDs by hand.
 
+### `internal/fixedincome` and 7 more §5/§17 packages — new this build
+
+FEATURES.md §5 "Fixed Income" (all 3 items) and §17's P4 remainder
+(all 4 items) — `docs/BUILD_LOG.md` entry 66.
+
+**§5:** `fixedincome` + `primarymarketbidding` (an illustrative G-Sec/
+T-Bill/SGB catalog with a real price-priority auction-allotment engine
+— NOT connected to any real RBI/E-Kuber system, 22 tests; live: a
+7.05% bid fully allotted, a 7.20% bid partially allotted exactly the
+remainder); `secondarymarketbonds` (a real iterative YTM solver — a
+bond re-priced to its own face value correctly returns YTM equal to its
+own coupon rate, a genuine correctness proof, 17 tests);
+`bondladderbuilder` (real staggered-maturity ladder construction + a
+real coupon calendar computed from each bond's actual schedule — a
+truncation-vs-rounding bug was caught and fixed here, 18 tests).
+
+**§17 P4 remainder:** `globalmarketsaccess` (illustrative ADR/GDR-style
+routing state machine, real currency conversion math), `retirementaccounts`
+(real contribution-limit + lock-in rules engine, exact-boundary tested),
+`structuredproducts` (real capital-protected-note payoff calculator —
+150% participation + 20% index return → capped payout exactly 120000),
+`insurancecrosssell` (an honest, thin illustrative insurance-partner-
+quote stub — explicitly NOT an underwriting engine). 81 tests across
+the four.
+
+**Verified live** for every item; full sweep: 224 tests total (136 new
++ 88 pre-existing), all green. All 7 items completed, none deferred.
+
+**Known limitations:** every catalog (bonds, global-market symbols,
+structured notes) is static/fictitious; no real RBI, CCIL/NDS-OM,
+GDR/ADR/partner-brokerage, PFRDA, or insurer integration anywhere;
+`globalmarketsaccess` doesn't call `ledger`'s real
+`multicurrencywallet` yet (self-contained, documented as the real
+integration point for a future pass); none of the seven new packages
+have cash-side/ledger integration.
+
 ---
 
 ## services/api-gateway (Go) — new this build: rate-limited reverse proxy, API keys, webhooks, TCA, SLO alerting
@@ -1423,6 +1534,31 @@ freeze any account), no audit trail of who froze what and when, in-memory
 only. Every other FEATURES.md §14 feature (KYC review queue, manual order
 intervention, corporate actions, support tickets) is still just a TODO.
 
+### `internal/strategyleaderboard`, `internal/familyaccountaccess`, `internal/nomineesuccession` — new this build
+
+FEATURES.md §19's copy-trading leaderboard and §21's family/joint
+account views + nominee succession (`docs/BUILD_LOG.md` entry 70).
+
+`strategyleaderboard` reads real data from `oms-gateway`'s
+`internal/strategyfollowing` and `internal/algolimits` via a new
+read-only `internal/omsgatewayclient` — explicitly NOT self-reported,
+though honestly scoped down to a real activity-turnover proxy rather
+than true audited P&L (oms-gateway's audit trail doesn't yet tag fills
+with a strategy identifier). `familyaccountaccess` provides real
+account-linking with a genuinely enforced VIEW_ONLY boundary — proven
+by a reflection-based test asserting the exposed capability set
+contains no order-submission-shaped method. `nomineesuccession` is a
+real, auditable SUBMITTED→UNDER_REVIEW→APPROVED→TRANSFERRED (or
+REJECTED) state machine modeled on the existing account-freeze
+pattern, with a real immutable transition log — explicitly a
+workflow/paperwork state machine, not identity verification (document
+references are opaque, never verified). 62 total tests for the
+service.
+
+**Verified live:** a linked viewer got real owner positions, an
+unlinked stranger got a real 403; a full nominee-succession state walk
+completed on a running server, a premature approval correctly rejected.
+
 ---
 
 ## services/auth (Go) — new service: real register/login, JWT, refresh-token rotation with reuse detection
@@ -1602,6 +1738,25 @@ phone auth, no email verification, no password-strength policy, no rate
 limiting on login/register. In-memory only. HS256 means every verifying
 service needs the shared secret (a real build would prefer RS256/ES256).
 
+### `internal/anomalouslogindetection` — new this build
+
+FEATURES.md §19's anomalous-login detection (`docs/BUILD_LOG.md` entry
+70) — explicitly re-scoped honestly: real RULE-BASED detection, NOT a
+trained ML model (no labeled account-takeover dataset exists anywhere
+in this repo to train one, despite the FEATURES.md item's "ML-based"
+framing). Real new-device/new-fingerprint flagging, a real impossible-
+travel heuristic (distance/time-implied-speed math over illustrative
+location tags), and rapid-failed-then-success pattern detection. 18
+tests. **A subtle bug was caught during design, before it ever
+shipped**: the login handler would have keyed anomaly detection
+inconsistently between success (account identifier) and failure
+(normalized email, since a failed auth never reveals a real account
+identifier) — fixed to key consistently on normalized email throughout,
+preserving the rapid-failure-then-success correlation.
+
+**Verified live:** a real NYC→Tokyo-in-5-minutes login pair correctly
+flagged both new-device and impossible-travel together.
+
 ---
 
 ## services/quant-engine (Python) — Black-Scholes module AND a real HTTP service
@@ -1772,6 +1927,65 @@ Sustainalytics, ISS ESG, Refinitiv/Bloomberg ESG). The scoring math and
 screening logic are real and correctly implemented; the underlying data
 is not.
 
+### FEATURES.md §22 "Deep Quant & Algorithmic Trading Internals" — all 16 items, new this build
+
+`docs/BUILD_LOG.md` entries 68 (10 items) and continuation (6 items).
+471 tests total (up from 216), across two passes, zero regressions at
+any step.
+
+**Pass 1 (10 modules):** `portfolioGreeksAggregator.py` (net delta/
+gamma/theta/vega across all positions); `ivRankCalculator.py` (real
+IV Rank/Percentile against a historical series); `impliedVsRealizedVolatility.py`
+(real annualized log-return realized-vol formula); `syntheticPositionBuilder.py`
+(named synthetic structures with combined Greeks); `deltaHedgingMonitor.py`
+(real hedge-quantity computation from net delta vs. a threshold);
+`kellyCriterionSizer.py` (real f*=(bp-q)/b plus a documented half-Kelly
+option); `strategyCorrelationMatrix.py` (the existing Pearson engine
+applied at strategy-return-series level); `cointegrationTester.py` (a
+genuine Engle-Granger two-step test with a real hand-rolled Augmented
+Dickey-Fuller t-statistic — not a faked p-value); `realisticBacktestCostModel.py`
+(sqrt-impact market-impact function + real partial-fill simulation);
+`monteCarloEngine.py` (a seeded GBM path simulator whose European
+option price was validated to converge toward closed-form Black-Scholes
+within 4 standard errors at 50,000 paths — a real, meaningful
+correctness test).
+
+**Pass 2 (6 modules):** `walkForwardOptimizer.py` (real rolling in-
+sample/out-of-sample windows + a documented overfitting-ratio and
+observations-per-parameter heuristic); `factorRiskModel.py` (real
+weighted factor-exposure aggregation and return attribution over
+illustrative factor data); `latencyBenchmarkDashboard.py` (capable of
+REAL HTTP round-trip timing — demonstrated live against quant-engine's
+own `/health`; a check against oms-gateway found it unreachable in that
+run and reported that honestly rather than fabricating a number);
+`crossAssetMacroDashboard.py` (real cross-correlation math, reusing
+`correlationMatrixEngine.py`, over illustrative fixture macro series);
+`optionsCorporateActionHandler.py` (the real split-adjustment formula —
+strike/ratio, quantity×ratio, notional-invariant — and the real
+textbook early-exercise-risk condition for American calls near an
+ex-dividend date); `regimeDetectionHmm.py` (a genuine hand-rolled 2-3-
+state Gaussian Hidden Markov Model with real forward-backward/Viterbi
+inference — explicitly not a threshold rule dressed up as an HMM, and
+no ML dependency added, per this repo's stdlib-preferring convention).
+**A real bug was found and fixed**: the HMM's Viterbi step crashed when
+a converged, very-tight-variance state's Gaussian emission density
+underflowed to exactly `0.0` for a distant observation — fixed with a
+genuine log-space density helper instead of composing `log(exp(...))`.
+
+**Verified live over HTTP:** factor risk, latency benchmark, and both
+corporate-action endpoints all matched hand-worked values exactly.
+Walk-forward, the macro dashboard, and the HMM itself are pytest-
+verified only (explicit, documented choice) — the HMM's own
+forward-probabilities were verified separately: α̂₁=[0.9999975,
+0.0000025], logLikelihood ≈ -3.55266183.
+
+**Known limitations:** factor exposures and macro-dashboard data are
+illustrative fixtures, not real market data; walk-forward's overfitting
+thresholds are real literature conventions, not empirically
+recalibrated; the HMM uses single-restart quantile initialization (a
+real local-optimum risk); the early-exercise check omits transaction
+costs/tax weighting and American put early-exercise.
+
 ---
 
 ## apps/web (Next.js) — one page, now covering most of oms-gateway's surface plus a live price chart
@@ -1845,6 +2059,18 @@ driven backend trigger (oms-gateway's margin state isn't event-driven)
 margin call. `apps/web` has no test runner (no Jest/Vitest/Playwright in
 `package.json`) — `tsc --noEmit`/`lint`/`build` all clean, live
 verification substitutes for automated frontend tests.
+
+### `app/volumeProfile/`, `app/orderFlowFootprint/`, `app/domReplay/` — new this build
+
+FEATURES.md §20 (`docs/BUILD_LOG.md` entry 69). Three new pages
+consuming market-data's real Volume Profile/TPO endpoint, real
+order-flow footprint endpoint, and matching-engine's real historical
+DOM replay endpoint (port 9106) respectively — a real horizontal
+volume-by-price view with POC/Value Area highlighted, a real per-candle
+buy/sell-by-price-level grid, and a real playback control stepping
+through genuinely replayed depth snapshots. `tsc --noEmit`/`lint`/
+`build` all clean; still no automated test runner, same honest note as
+the rest of this section.
 
 ## apps/terminal — not yet scaffolded
 
@@ -2197,6 +2423,27 @@ real. What's consistently *not* real yet, across all of them:
   fundamentally bounded by missing real-world infrastructure (real
   cloud IAM, a real DR region, real FIX certification, a real Account
   Aggregator network) says so explicitly rather than being faked.
+- **§5/§17/§19/§20/§21/§22 completion round** (`docs/BUILD_LOG.md`
+  entries 66–71): fixed income (real auction allotment + a genuine
+  iterative YTM solver) and the last four §17 P4 items in
+  `mutual-funds`; fractional share investing (finally built, having
+  been deferred twice) plus overtrading detection, F&O cooling-off, and
+  eight §21 customer-pain-point items in `oms-gateway`; all 16 §22 deep-
+  quant items in `quant-engine` — including a genuine Engle-Granger/ADF
+  cointegration test and a real hand-rolled Hidden Markov Model with
+  forward-backward/Viterbi inference, not a threshold rule in
+  disguise; Volume Profile, order-flow footprint, and historical DOM
+  replay across `market-data`/`matching-engine`/`apps/web`; and
+  anomalous-login detection, a copy-trading leaderboard, family account
+  access, and nominee succession across `auth`/`backoffice`. Five
+  lanes, each isolated to non-overlapping services, ~600 new tests, real
+  live verification throughout. Four more real bugs caught and fixed (a
+  coupon-calendar rounding bug, an HMM log-space underflow, plus two
+  caught during design before they ever ran: an inconsistent anomaly-
+  detection keying scheme and a wallet-aliasing inconsistency from an
+  earlier round). The two items explicitly NOT covered this round —
+  one-click capital gains statement export and cross-device watchlist/
+  P&L sync — are left unmarked in FEATURES.md rather than claimed.
 - No service is backed by the real infrastructure in
   `infra/docker/docker-compose.yml` (Postgres, Redpanda, ClickHouse) —
   they all run fully in-memory today. (Not for lack of trying this round:

@@ -23,7 +23,13 @@ What's real:
   (`OutgoingTradeTickWireEvent` in `wireProtocol.rs`) — whatever trades
   the just-processed order produced (possibly none), so market-data can
   build a trade tape and OHLCV candles. See that service's README and
-  `docs/BUILD_LOG.md` entry 26.
+  `docs/BUILD_LOG.md` entry 26. Each trade tick now also carries a real
+  `isBuyAggressor` flag (FEATURES.md §20) — see "Write-ahead log" below.
+- **A real Historical DOM replay HTTP endpoint** (`GET /domReplay`,
+  `src/domReplayHttpServer.rs`, FEATURES.md §20 `[P4]`) on
+  `127.0.0.1:9106` — given a time window, genuinely replays the real WAL
+  and returns a real, deterministic sequence of order-book depth
+  snapshots. See "Historical DOM replay" below.
 - **Market orders** (`OrderType::Market`, alongside `Limit`) — crosses
   regardless of resting price, never rests an unfilled remainder
   (IOC-like). See `docs/BUILD_LOG.md` entry 17. Known gap: oms-gateway's
@@ -113,9 +119,12 @@ What's a placeholder (see inline `TODO(real build)` markers):
 
 ```bash
 cargo run      # starts the TCP server on 127.0.0.1:9101, WAL at
-               # ./matchingEngineWriteAheadLog.jsonl (or $MATCHING_ENGINE_WAL_FILE_PATH)
+               # ./matchingEngineWriteAheadLog.jsonl (or $MATCHING_ENGINE_WAL_FILE_PATH),
+               # and the DOM replay HTTP server on 127.0.0.1:9106 (or
+               # $MATCHING_ENGINE_DOM_REPLAY_HTTP_LISTEN_ADDRESS) — see
+               # "Historical DOM replay" below
 cargo run -- --replay <walFilePath>   # offline: replay a WAL file and print the reconstructed book
-cargo test     # runs the full test suite (52 tests)
+cargo test     # runs the full test suite (69 tests)
 ```
 
 ## Write-ahead log (WAL) — FEATURES.md §9
@@ -132,13 +141,29 @@ Three record shapes, defined in `src/writeAheadLog.rs`:
 
 ```jsonc
 // A new order was accepted by the book.
-{"eventType":"OrderAccepted","assignedOrderSequenceNumber":1,"clientAccountId":"acct-seller","orderSide":"Sell","orderType":"Limit","limitPriceInMinorUnits":100,"stopTriggerPriceInMinorUnits":null,"orderQuantity":10}
+{"eventType":"OrderAccepted","assignedOrderSequenceNumber":1,"clientAccountId":"acct-seller","orderSide":"Sell","orderType":"Limit","limitPriceInMinorUnits":100,"stopTriggerPriceInMinorUnits":null,"orderQuantity":10,"epochMillis":1731000000123}
 // A cancellation was requested.
-{"eventType":"OrderCancelled","orderSequenceNumberToCancel":2,"wasOrderCancelled":true}
+{"eventType":"OrderCancelled","orderSequenceNumberToCancel":2,"wasOrderCancelled":true,"epochMillis":1731000000456}
 // One executed trade — a byproduct of the most recently logged
 // OrderAccepted, purely for audit; never itself replayed (see below).
-{"eventType":"TradeExecuted","buyingClientAccountId":"acct-buyer-cross","sellingClientAccountId":"acct-seller","executedPriceInMinorUnits":100,"executedQuantity":4}
+{"eventType":"TradeExecuted","buyingClientAccountId":"acct-buyer-cross","sellingClientAccountId":"acct-seller","executedPriceInMinorUnits":100,"executedQuantity":4,"isBuyAggressor":true,"epochMillis":1731000000789}
 ```
+
+FEATURES.md §20 additions: `epochMillis` (on all three record shapes) and
+`isBuyAggressor` (on `TradeExecuted`) are real, additive fields —
+`#[serde(default)]`'d so a WAL file written before either existed still
+reads back cleanly (as `0`/`false`, the documented "unknown" sentinels)
+instead of a hard parse failure. `epochMillis` is stamped by
+`WalBackedOrderBook` (`src/walBackedOrderBook.rs`'s `currentEpochMillis`)
+right before each durable append; `isBuyAggressor` is known for free at
+the exact call site each `TradeExecutionEvent` is constructed in
+`orderBookCore.rs` (`true` from
+`matchIncomingBuyOrderAgainstRestingSellOrders`, `false` from
+`matchIncomingSellOrderAgainstRestingBuyOrders`) and flows straight
+through to `TradeExecuted`, to `wireProtocol.rs`'s
+`TradeExecutionWireEvent`/`OutgoingTradeTickWireEvent` (both also gained
+the field), and on into market-data's trade ticks — see that service's
+README for the order-flow footprint chart built on top of it.
 
 Every `appendEvent` call does a `write_all` of the JSON line, `flush()`,
 then `File::sync_all()` — a real fsync of both the new bytes AND the
@@ -227,6 +252,90 @@ the two crossing fills of 4 and 2).
   identical state (verified extensively by tests) but means the WAL
   alone cannot answer "which specific resting order absorbed this fill"
   after the fact without re-deriving it via replay.
+
+## Historical DOM replay — FEATURES.md §20 `[P4]`
+
+A real HTTP endpoint, `GET /domReplay?instrumentSymbol=...&startEpochMillis=...&endEpochMillis=...`,
+on its own server (`src/domReplayHttpServer.rs`) at `127.0.0.1:9106` by
+default (override with `MATCHING_ENGINE_DOM_REPLAY_HTTP_LISTEN_ADDRESS`).
+Given a time window, it returns a real, deterministic sequence of
+order-book depth (DOM) snapshots reconstructing what the book looked like
+over that window.
+
+**Why this lives here, not in market-data**: the WAL and the deterministic
+replay machinery this endpoint needs both already live in this service,
+right next to `OrderBookCore` — matching-engine is the only process with
+a real `OrderBookCore` to replay commands against; market-data only ever
+sees post-hoc depth-delta *publishes*, never the underlying order/cancel
+command stream a WAL replay needs. Building the endpoint here genuinely
+**reuses** the existing WAL + replay code (`domReplayHttpServer.rs` adds
+zero new replay logic, only HTTP plumbing around
+`writeAheadLog::replayWalEventRecordsCollectingDepthSnapshotsInWindow`)
+instead of duplicating `OrderBookCore` + the WAL format into a second
+service.
+
+**How it works**: every request re-reads the WAL file fresh off disk
+(`readAllEventRecordsFromWalFile`) and replays it from the very
+beginning — book state depends on the FULL history, not just the
+requested window, so a resting order placed before the window still
+correctly shows up in an in-window snapshot. After every mutating event
+(`OrderAccepted`/`OrderCancelled`) whose `epochMillis` falls within
+`[startEpochMillis, endEpochMillis]` (inclusive both ends; both default
+to the full history if omitted), it captures a
+`currentBookDepthSnapshot()` — bids sorted best (highest) first, asks
+sorted best (lowest) first — and appends it to the result.
+`TradeExecuted` events never produce their own snapshot (they're a
+byproduct of the `OrderAccepted` that caused them, not a book mutation of
+their own). This is read-only and never touches the live
+`WalBackedOrderBook` the matching-core thread owns — no locking, no risk
+of a diagnostic query ever blocking or racing the hot order path — at the
+cost of being O(total WAL size) per request (documented `TODO(real
+build)`: a real build would checkpoint periodically and only replay the
+tail).
+
+`instrumentSymbol` is validated against the one instrument this skeleton
+trades (`DEMO-EQ`) — a mismatch is a `400`, same posture as the main
+order-submission wire protocol.
+
+```bash
+# whole WAL history
+curl "http://127.0.0.1:9106/domReplay?instrumentSymbol=DEMO-EQ"
+# a specific window (epoch millis)
+curl "http://127.0.0.1:9106/domReplay?instrumentSymbol=DEMO-EQ&startEpochMillis=1731000000000&endEpochMillis=1731000060000"
+```
+
+12 unit tests in `writeAheadLog.rs` (hand-worked window-boundary/full-
+history-replay/cancel/tie-break cases) plus 5 in
+`domReplayHttpServer.rs` (HTTP routing + one real end-to-end test that
+opens a real `WalBackedOrderBook`, submits a real order, and asserts the
+resulting HTTP response contains the real resulting depth).
+
+**Live-verified**: ran the real server, submitted 5 real orders across
+multiple price levels and two real crossing trades (one buy-aggressor,
+one sell-aggressor) directly over TCP, then queried `GET /domReplay` and
+confirmed the returned snapshot sequence exactly tracked each real
+mutation — an ask level appearing then shrinking as a buy order crossed
+it, a bid level appearing then shrinking as a sell order crossed it —
+and that passing `startEpochMillis` set to an in-sequence snapshot's own
+timestamp correctly excluded every snapshot before it while still
+reflecting the full pre-window book state (not a truncated replay). See
+`docs/BUILD_LOG.md` for the full transcript if recorded there, or the
+"Historical DOM replay" section of this build's live-verification notes.
+
+### Known gaps
+
+- O(total WAL size) replay per request — no checkpointing (see above).
+- `walEventIndex` in the response is the snapshot's position in the FULL
+  WAL, not the window — deliberate (it's a stable tie-breaker for
+  same-millisecond events), but a client wanting "the Nth event in the
+  window" has to compute that itself.
+- No pagination/streaming — a very large window on a very long-lived WAL
+  returns one large JSON array, not a stream.
+- `epochMillis` is wall-clock time on the machine running matching-engine
+  at the moment of the durable append, not true exchange/matching
+  timestamp discipline (no NTP synchronization set up in this skeleton,
+  same caveat as market-data's trade-tick timestamps) — good enough for a
+  demo replay, not exchange-grade.
 
 ## Lock-free ring buffer ingress/egress — FEATURES.md §9
 

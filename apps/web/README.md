@@ -3,14 +3,14 @@
 Skeleton — see `FEATURES.md` §11 in the repo root for the full retail app
 scope (watchlists, MF/SIP flows, options chain, alerts, etc.).
 
-## Status: dashboard page + three FEATURES.md §11 pages
+## Status: dashboard page + three FEATURES.md §11 pages + three FEATURES.md §20 pages
 
 `app/page.tsx` is a working order ticket that POSTs directly to
 `oms-gateway`'s `/orders/submit` and renders its
 `humanReadableRejectionReason` on failure — this proves the FEATURES.md
 §21 plain-language-rejection differentiator end-to-end from a real
 browser client, not just from `curl`. It now also embeds the
-Notifications section (item 2 below) and links to the two new pages.
+Notifications section (item 2 below) and links to all five other pages.
 
 Everything else (auth dashboard reconciliation, portfolio, MF investing,
 SIPs, watchlists UI) does not exist yet.
@@ -144,16 +144,73 @@ accountId=acct-001` returned `["algo-1"]`, confirmed following an
 unverified `strategyIdentifier` was rejected with a real `400`, and
 confirmed `unfollow` then correctly emptied `acct-001`'s following list.
 
+### 4. Volume Profile / Market Profile (TPO) — `app/volumeProfile/page.tsx`
+
+FEATURES.md §20 `[P3]`. Calls market-data's real `GET /volumeProfile`
+(`services/market-data/src/volumeProfileAggregator.rs`) — real horizontal
+volume-by-price bars, with the real Point of Control (amber) and real
+Value Area (blue) highlighted, plus a real TPO letter table below it.
+Symbol, price-bucket size, Value Area fraction, and an optional time
+window are all editable form fields; nothing here is a static mock — bar
+widths, the POC price, and the Value Area bounds all come straight from
+market-data's JSON response.
+
+**Verified live**: ran the real `matching-engine` + `market-data`
+processes, submitted real crossing orders producing real trades at
+10000/10100/10200 (minor units), then fetched `GET /volumeProfile?
+instrumentSymbol=DEMO-EQ&priceBucketSizeInMinorUnits=100` from this page
+and confirmed the rendered bars, POC (`10100`), and Value Area
+(`10000`–`10100`) matched the raw JSON response exactly — no client-side
+recomputation of what market-data already computed.
+
+### 5. Order-flow footprint — `app/orderFlowFootprint/page.tsx`
+
+FEATURES.md §20 `[P3]`. Calls market-data's real `GET
+/orderFlowFootprint` (`services/market-data/src/
+orderFlowFootprintAggregator.rs`) — one real per-candle grid per response,
+each row a price level with real buy-volume/sell-volume bars, using the
+real aggressor-side flag threaded all the way from matching-engine's
+matching logic (not a synthetic buy/sell split).
+
+**Verified live**: same real order flow as above produced a real
+candle-level footprint (`buyVolume: 20` at `10100`, `sellVolume: 10` at
+`10000`, matching which side genuinely aggressed each of the two real
+crossing trades) — confirmed the page's rendered grid matched the raw
+JSON response.
+
+### 6. Historical DOM replay — `app/domReplay/page.tsx`
+
+FEATURES.md §20 `[P4]`. Calls matching-engine's real `GET /domReplay`
+(`services/matching-engine/src/domReplayHttpServer.rs`), which genuinely
+replays the real write-ahead log (see that service's README's
+"Historical DOM replay" section for the exact mechanism this endpoint
+reuses, not reinvents). A real, if simple, playback control — Prev/Next/
+Play-Pause/slider — steps a held index through the REAL array of
+depth snapshots matching-engine returned; nothing is interpolated or
+fabricated between real snapshots, and playback stops itself at the last
+real one rather than looping.
+
+**Verified live**: fetched a real replay window from the live
+matching-engine process after submitting several real orders across
+multiple price levels and two real crossing trades; confirmed the page's
+bid/ask tables at each stepped index exactly matched the corresponding
+snapshot in the raw JSON array (an ask level appearing then shrinking as
+a buy order crossed it; a bid level appearing then shrinking as a sell
+order crossed it), and that a `startEpochMillis` bound correctly excluded
+earlier snapshots while the book state shown still reflected the full
+pre-window history (not a truncated replay).
+
 ## Tests
 
-`apps/web` has no test runner configured (`package.json` defines only
-`dev`/`build`/`start`/`lint` — no Jest/Vitest/Playwright anywhere in this
-package or its `node_modules`). No frontend automated tests were added
-here; rigor for the three frontend features above instead comes from the
-live-verification transcripts documented per-feature. The one new piece
-of backend STATE this round (`internal/strategyfollowing`) is Go and
-fully unit-tested the same as every other `oms-gateway` package (18
-tests, `go test ./internal/strategyfollowing/...`).
+`apps/web` still has no test runner configured (`package.json` defines
+only `dev`/`build`/`start`/`lint` — no Jest/Vitest/Playwright anywhere in
+this package or its `node_modules`) — still true as of this round too. No
+frontend automated tests were added here; rigor for all six frontend
+features above instead comes from `npx tsc --noEmit`/`npm run lint`/`npm
+run build` all passing clean plus the live-verification transcripts
+documented per-feature. The real work this round is in the two Rust
+services (`market-data`, `matching-engine`), which DO have real `cargo
+test` suites — see their own READMEs.
 
 ## Run it
 
@@ -165,12 +222,14 @@ npm run dev       # http://localhost:3000
 cd ../../services/ledger && go run ./cmd/server            # :8082
 cd ../../services/kyc-onboarding && go run ./cmd/server    # :8083
 cd ../../services/backoffice && go run ./cmd/server        # :8084
-cd ../../services/matching-engine && cargo run              # :9101 (+ market-data ingestion)
-cd ../../services/market-data && cargo run                  # :9102/:9103/:9104 — needed for the price chart, price alerts, and the options chain's spot-price prefill
+cd ../../services/matching-engine && cargo run              # :9101 (+ market-data ingestion), :9106 for GET /domReplay
+cd ../../services/market-data && cargo run                  # :9102/:9103/:9104 — needed for the price chart, price alerts, options chain's spot-price prefill, volume profile, and order-flow footprint
 cd ../../services/quant-engine && python3 -m venv .venv && .venv/bin/pip install -e . && .venv/bin/quant-engine-server   # :8085 — needed for the options chain
 cd ../../services/oms-gateway && go run ./cmd/server        # :8081 — needed for almost everything, including the new /options/chain and /strategies/* endpoints
 ```
 
 Override base URLs via `NEXT_PUBLIC_OMS_GATEWAY_BASE_URL` (default
-`http://localhost:8081`) and `NEXT_PUBLIC_MARKET_DATA_BASE_URL` (default
-`http://localhost:9103`) if any service isn't at its default port.
+`http://localhost:8081`), `NEXT_PUBLIC_MARKET_DATA_BASE_URL` (default
+`http://localhost:9103`), and `NEXT_PUBLIC_MATCHING_ENGINE_DOM_REPLAY_BASE_URL`
+(default `http://localhost:9106`, used only by the Historical DOM replay
+page) if any service isn't at its default port.
