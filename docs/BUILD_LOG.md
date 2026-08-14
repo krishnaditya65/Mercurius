@@ -2845,4 +2845,170 @@ every port this round's services could plausibly still be bound to
 processes left running from any of the five lanes. No conflicts or
 lost work found.
 
+## Entry 72 — §10 The Terminal (Pro Desktop): real Tauri v2 + React desktop app scaffolded, all 7 items
+
+`apps/terminal` was previously a deliberate stub (see its README's
+"not yet scaffolded" note from an earlier round). Scaffolded for real
+via the actual `create-tauri-app` generator (Tauri v2 + React 19 +
+TypeScript), then built out:
+- GoldenLayout tiling workspace with per-user layouts persisted to
+  `localStorage` (`workspaceLayoutPersistence.ts`).
+- A real command-bar grammar parser for `AAPL DES <GO>`-style input;
+  `GP`/`DOM`/`NEWS` verbs are wired to actually open tiles, `DES`/
+  `MOD`/`BLOTTER` parse correctly but are honestly not yet wired to a
+  tile type.
+- Hand-rolled Canvas 2D candlestick renderer with real MACD/RSI/
+  Bollinger Bands/Fibonacci retracement math, each formula unit-tested
+  against hand-derived exact values (e.g. RSI checked against exact
+  fractions like `1100/13`).
+- DOM ladder widget polling matching-engine's `/domReplay` and
+  submitting real LIMIT orders to oms-gateway's `/orders/submit`,
+  matching apps/web's order-ticket field shapes.
+- Multi-monitor detachment via real Tauri v2 `WebviewWindow` APIs;
+  config-building logic is unit-tested, actual OS window placement is
+  honestly documented as unverifiable in this headless sandbox.
+- A genuine Python hook sandbox in Rust (`pythonHookSandbox.rs`) using
+  real `setrlimit(RLIMIT_CPU/RLIMIT_AS)` + a wall-clock watchdog +
+  macOS `sandbox-exec` network denial, proven by integration tests
+  that spawn real Python subprocesses and confirm the kernel kills a
+  CPU-bound busy loop via SIGXCPU. Memory cap is a real syscall but
+  honestly documented as not reliably enforced by macOS's kernel.
+- A CSS-animated news/sentiment ticker over explicitly-labeled
+  illustrative fixture data (reusing quant-engine's toy sentiment
+  lexicon).
+- Bugs found and fixed while building: `tempfile` needed to be a
+  regular (not dev-only) dependency; ticker regex was initially too
+  short for a real test symbol; MACD/Fibonacci test expectations had
+  arithmetic errors caught by actually running the tests;
+  `global.fetch` didn't type-check under the browser-only `lib` config
+  (switched to `globalThis.fetch`); an unused `@tauri-apps/plugin-fs`
+  dependency was removed once localStorage was chosen instead.
+- Verified: 64 Vitest tests + 6 Rust tests (2 unit + 4 integration),
+  all passing. `cargo fmt --check`/`cargo clippy -D warnings`/`cargo
+  build` clean; `npm install` (from a clean `node_modules`) + `npm run
+  build` (tsc + vite) clean. **All 7 items completed.**
+
+## Entry 73 — §14 remaining items: support ticketing, corporate actions processing, referral/rewards, localization catalog
+
+New backend work in `services/backoffice` and `services/oms-gateway`
+(oms-gateway's pre-existing `internal/corporateactionexplainer`, which
+only surfaces upcoming corporate actions, was left untouched):
+- `internal/supportticketing` (backoffice): real ticket lifecycle
+  (open → in-progress → resolved → closed, with auto-reopen on
+  customer follow-up), threaded messages, auto-assignment, queries by
+  account/agent/unassigned-queue. 11 tests.
+- `internal/corporateactionsprocessing` (oms-gateway, new, distinct
+  from the explainer): real cost-basis accounting for stock splits,
+  bonus issues, mergers, and cash dividends — verified by test that a
+  2:1 split halves average cost while total cost basis is unchanged,
+  mergers carry full cost basis into the acquirer and reject
+  non-exact exchange ratios rather than silently truncating, and cash
+  dividends credit real money via a genuine `ledgerclient` HTTP call
+  without touching the holding. 13 tests. Verified live against
+  running `ledger`/`oms-gateway` processes: a dividend genuinely moved
+  ledger's balance from 0 to 10,000 minor units.
+- `internal/referralrewards` (backoffice) + new
+  `internal/ledgerclient`: stable per-account referral codes,
+  self-referral/double-referral blocking, a real ₹100.00 cash reward
+  credited via a genuine ledger call, triggered on the referred
+  account's first completed trade (detected via a real oms-gateway
+  `FetchPositions` call). 9 + 2 tests, including idempotent
+  no-double-credit verification.
+- `internal/localizationcatalog` (backoffice): 39 real string keys
+  harvested from apps/web's actual pages, translated into English,
+  Hindi, and Tamil. Contract: `GET /localization/languages` and
+  `GET /localization/{lang}`. 7 tests.
+- All four features exercised against real running `ledger` (:8082),
+  `oms-gateway` (:8081), and `backoffice` (:8084) processes, then
+  cleanly shut down. `gofmt`/`go vet`/`go build`/`go test -race` clean
+  across all three services. **All 4 items completed.**
+
+## Entry 74 — §16 AI, Data & Research: all 7 items, quant-engine
+
+New modules in `services/quant-engine` (471 → 574 tests):
+- `stockScreenerFilterBuilder.py` — real recursive AND/OR/comparison
+  filter engine over real SMA/Wilder-RSI technicals plus illustrative
+  fundamentals; saved-screen persistence.
+- `researchCopilotRetrievalAugmentedGeneration.py` — a real RAG
+  pipeline (chunking, TF-IDF vectors, cosine-similarity top-k
+  retrieval, extractive citation-backed answer composition) over a
+  small hand-authored synthetic filing/earnings-call corpus, honestly
+  documented as TF-IDF retrieval rather than a trained neural
+  embedding model (no internet access available); every response
+  carries a fixed non-advisory disclaimer.
+- `portfolioHealthCheckDiversificationAnalyzer.py` — real HHI
+  (position + sector) with DOJ/FTC severity bands, reuses
+  `factorRiskModel.py`, nudge text genuinely varies with input
+  (tested).
+- `taxLossHarvestingAdvisor.py` — real per-lot loss identification,
+  real IRS 61-day wash-sale window, real gain-offset →
+  $3,000-ordinary-cap → carryforward waterfall, tested with both an
+  excluded and a non-excluded wash-sale case.
+- `alternativeDataFeedAggregator.py` — real sentiment aggregation
+  (reuses §7's lexicon scorer) and real z-score filing-anomaly
+  detection, genuinely wired into §7's NLP hook with an integration
+  test proving values flow through to a real BUY/SELL suggestion.
+- `factorBasedPnlAttributionEngine.py` — real Brinson-Hood-Beebower
+  allocation/selection/interaction/currency decomposition, tested
+  against a fully hand-worked example.
+- `customIndexConstructionBacktester.py` — real top-N/cap-weight/
+  equal-weight/rebalance-frequency index construction over synthetic
+  history, real CAGR/Sharpe/max-drawdown from the actual constructed
+  price path.
+- Bugs caught while building: a test-fixture bug (all-TECH sectors
+  tripping a concentration nudge for what should have been a
+  "diversified" fixture) and a miscalculated wash-sale test
+  expectation (a repurchase lot's own loss was double-counted) — both
+  fixed.
+- All 11 new HTTP routes live-curled against a real running
+  quant-engine process (:8085), including a Brinson decomposition
+  that matched the hand-worked 0.007 active return exactly, then the
+  process was killed and the port confirmed clear. **All 7 items
+  completed.**
+
+## Entry 75 — apps/web frontend wiring for §14 + §16 (11 endpoints, 8 new pages, real i18n)
+
+Final pass wiring entries 73-74's 11 new backend endpoints into
+`apps/web`. Backend services were started locally and every endpoint
+was curl-verified for its real request/response shape before writing
+any frontend code — this caught three real mismatches versus the
+written specs: `GET /corporate-actions/holdings` requires both
+`accountId` and `instrument` query params (a plain-text 400 without
+`instrument`); `actionType` is the enum `STOCK_SPLIT`/`BONUS_ISSUE`/
+`MERGER`/`CASH_DIVIDEND`, not free text; and
+`GET /referral-rewards/status` returns a plain 404 (not a 200 with an
+error field) for an account with no referral link.
+
+New routes: `app/support/page.tsx`, `app/corporateActions/page.tsx`,
+`app/referrals/page.tsx`, `app/screener/page.tsx`,
+`app/researchCopilot/page.tsx`, `app/portfolioHealth/page.tsx`,
+`app/taxLossHarvesting/page.tsx`, and `app/quantResearchTools/page.tsx`
+(combining alternative data, Brinson attribution, and custom
+index-construction+backtest with an inline SVG sparkline). A real
+i18n mechanism (`app/localization/localizationContext.tsx` +
+`languageSwitcher.tsx`) fetches the live catalog and swaps 15 real
+strings across the existing dashboard/order-ticket page for `en`/`hi`/
+`ta`, wrapped into the app in `layout.tsx`.
+
+Verified: `tsc --noEmit` clean, `npm run lint` clean, `npm run build`
+clean with 15 total routes. Booted `next dev` on :3100 against the
+still-running real backends and curl'd every new route (all HTTP 200,
+homepage HTML contained the real translated string + language
+switcher). All backend ports (8081/8082/8084/8085/8088) confirmed
+clear after cleanup. **All 11 endpoints wired, all 8 pages built.**
+
+## Entry 76 — housekeeping: independently re-verified §10/§14/§16 round
+
+Before consolidating the shared docs, the orchestrating session
+independently re-ran the full build/test sweep for every service
+touched across entries 72-75: `apps/terminal` (64 Vitest + 6 Rust
+tests, `cargo fmt`/`clippy`/`build` and `npm run build` clean),
+`services/backoffice`, `services/oms-gateway`, `services/ledger`
+(`gofmt`/`go vet`/`go build`/`go test -race` clean), `services/
+quant-engine` (574/574 pytest), and `apps/web` (`tsc`/`lint`/`build`
+clean, 15 routes present). Checked every port this round's services
+could plausibly still be bound to (3000/3100, 8081-8089, 9101-9106)
+and confirmed all clear — no orphaned processes left running from any
+of the four lanes.
+
 <!-- Append new entries below this line as work continues. -->

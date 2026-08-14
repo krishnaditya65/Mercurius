@@ -16,14 +16,18 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"log"
 	"log/slog"
 	"net/http"
 	"os"
+	"time"
 
 	"mercurius/kycOnboarding/internal/bankverification"
 	"mercurius/kycOnboarding/internal/httplogging"
+	"mercurius/kycOnboarding/internal/jointholding"
 	"mercurius/kycOnboarding/internal/kycstate"
+	"mercurius/kycOnboarding/internal/nomineedesignation"
 	"mercurius/kycOnboarding/internal/riskprofiling"
 )
 
@@ -33,6 +37,8 @@ func main() {
 	kycVerificationStateMachine := kycstate.NewKycVerificationStateMachine()
 	bankAccountVerifier := bankverification.NewBankAccountVerifier()
 	riskProfiler := riskprofiling.NewRiskProfiler()
+	nomineeDesignationRegistry := nomineedesignation.NewNomineeDesignationRegistry()
+	jointHoldingRegistry := jointholding.NewHoldingRegistry()
 
 	httpRequestMultiplexer := http.NewServeMux()
 	httpRequestMultiplexer.HandleFunc("/health", func(responseWriter http.ResponseWriter, _ *http.Request) {
@@ -50,6 +56,15 @@ func main() {
 	httpRequestMultiplexer.HandleFunc("/risk-profile", buildRiskProfileStatusHandler(riskProfiler))
 	httpRequestMultiplexer.HandleFunc("/kyc/review-queue", buildKycReviewQueueHandler(kycVerificationStateMachine))
 	httpRequestMultiplexer.HandleFunc("/kyc/review-queue/override", buildKycReviewOverrideHandler(kycVerificationStateMachine))
+	httpRequestMultiplexer.HandleFunc("/nominees/submit", buildNomineeSubmitHandler(nomineeDesignationRegistry))
+	httpRequestMultiplexer.HandleFunc("/nominees/add", buildNomineeAddHandler(nomineeDesignationRegistry))
+	httpRequestMultiplexer.HandleFunc("/nominees/update", buildNomineeUpdateHandler(nomineeDesignationRegistry))
+	httpRequestMultiplexer.HandleFunc("/nominees/remove", buildNomineeRemoveHandler(nomineeDesignationRegistry))
+	httpRequestMultiplexer.HandleFunc("/nominees", buildNomineeQueryHandler(nomineeDesignationRegistry))
+	httpRequestMultiplexer.HandleFunc("/joint-holding/register-individual", buildRegisterIndividualAccountHandler(jointHoldingRegistry))
+	httpRequestMultiplexer.HandleFunc("/joint-holding/register-joint", buildRegisterJointAccountHandler(jointHoldingRegistry))
+	httpRequestMultiplexer.HandleFunc("/joint-holding/authorize-operation", buildAuthorizeOperationHandler(jointHoldingRegistry))
+	httpRequestMultiplexer.HandleFunc("/joint-holding", buildJointHoldingQueryHandler(jointHoldingRegistry))
 
 	listenAddress := ":8083"
 	log.Printf("kyc-onboarding listening on %s\n", listenAddress)
@@ -444,5 +459,439 @@ func buildKycReviewOverrideHandler(kycVerificationStateMachine *kycstate.KycVeri
 			SubmittedFullName:  updatedRecord.SubmittedFullName,
 			RejectionReason:    updatedRecord.RejectionReason,
 		})
+	}
+}
+
+// dateOfBirthWireLayout is the wire format for every date-of-birth field
+// below — a plain "YYYY-MM-DD" calendar date, no time-of-day/timezone
+// component, matching how a real nomination form asks for a birth date.
+const dateOfBirthWireLayout = "2006-01-02"
+
+type nomineeInputWireRequest struct {
+	FullName                          string `json:"fullName"`
+	Relationship                      string `json:"relationship"`
+	DateOfBirth                       string `json:"dateOfBirth"`
+	PercentageAllocation              int    `json:"percentageAllocation"`
+	GuardianFullName                  string `json:"guardianFullName,omitempty"`
+	GuardianRelationship              string `json:"guardianRelationship,omitempty"`
+	GuardianIdentityDocumentReference string `json:"guardianIdentityDocumentReference,omitempty"`
+}
+
+func (wireInput nomineeInputWireRequest) toNomineeInput() (nomineedesignation.NomineeInput, error) {
+	var dateOfBirth time.Time
+	if wireInput.DateOfBirth != "" {
+		parsed, parseErr := time.Parse(dateOfBirthWireLayout, wireInput.DateOfBirth)
+		if parseErr != nil {
+			return nomineedesignation.NomineeInput{}, fmt.Errorf("dateOfBirth must be in %s format: %w", dateOfBirthWireLayout, parseErr)
+		}
+		dateOfBirth = parsed
+	}
+	return nomineedesignation.NomineeInput{
+		FullName:                          wireInput.FullName,
+		Relationship:                      wireInput.Relationship,
+		DateOfBirth:                       dateOfBirth,
+		PercentageAllocation:              wireInput.PercentageAllocation,
+		GuardianFullName:                  wireInput.GuardianFullName,
+		GuardianRelationship:              wireInput.GuardianRelationship,
+		GuardianIdentityDocumentReference: wireInput.GuardianIdentityDocumentReference,
+	}, nil
+}
+
+type nomineeWireResponse struct {
+	NomineeId                         string `json:"nomineeId"`
+	FullName                          string `json:"fullName"`
+	Relationship                      string `json:"relationship"`
+	DateOfBirth                       string `json:"dateOfBirth"`
+	PercentageAllocation              int    `json:"percentageAllocation"`
+	IsMinor                           bool   `json:"isMinor"`
+	GuardianFullName                  string `json:"guardianFullName,omitempty"`
+	GuardianRelationship              string `json:"guardianRelationship,omitempty"`
+	GuardianIdentityDocumentReference string `json:"guardianIdentityDocumentReference,omitempty"`
+}
+
+type nomineeDesignationWireResponse struct {
+	AccountIdentifier        string                `json:"accountIdentifier"`
+	IsOptedOutOfNomination   bool                  `json:"isOptedOutOfNomination"`
+	Nominees                 []nomineeWireResponse `json:"nominees"`
+	TotalPercentageAllocated int                   `json:"totalPercentageAllocated"`
+	IsComplete               bool                  `json:"isComplete"`
+	ErrorMessage             string                `json:"errorMessage,omitempty"`
+}
+
+func toNomineeDesignationWireResponse(designation nomineedesignation.NomineeDesignation, now time.Time) nomineeDesignationWireResponse {
+	wireNominees := make([]nomineeWireResponse, 0, len(designation.Nominees))
+	for _, nominee := range designation.Nominees {
+		wireNominees = append(wireNominees, nomineeWireResponse{
+			NomineeId:                         nominee.NomineeId,
+			FullName:                          nominee.FullName,
+			Relationship:                      nominee.Relationship,
+			DateOfBirth:                       nominee.DateOfBirth.Format(dateOfBirthWireLayout),
+			PercentageAllocation:              nominee.PercentageAllocation,
+			IsMinor:                           nominee.IsMinorAsOf(now),
+			GuardianFullName:                  nominee.GuardianFullName,
+			GuardianRelationship:              nominee.GuardianRelationship,
+			GuardianIdentityDocumentReference: nominee.GuardianIdentityDocumentReference,
+		})
+	}
+	return nomineeDesignationWireResponse{
+		AccountIdentifier:        designation.AccountIdentifier,
+		IsOptedOutOfNomination:   designation.IsOptedOutOfNomination,
+		Nominees:                 wireNominees,
+		TotalPercentageAllocated: designation.TotalPercentageAllocated(),
+		IsComplete:               designation.IsComplete(),
+	}
+}
+
+type nomineeSubmitWireRequest struct {
+	AccountIdentifier      string                    `json:"accountIdentifier"`
+	Nominees               []nomineeInputWireRequest `json:"nominees"`
+	IsOptedOutOfNomination bool                      `json:"isOptedOutOfNomination"`
+}
+
+// buildNomineeSubmitHandler is the real "fill in and submit the
+// nomination form" action — see internal/nomineedesignation's package doc
+// for why this is the one endpoint that hard-gates on percentages summing
+// to exactly 100 (or an explicit opt-out).
+func buildNomineeSubmitHandler(registry *nomineedesignation.NomineeDesignationRegistry) http.HandlerFunc {
+	return func(responseWriter http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodPost {
+			http.Error(responseWriter, "only POST is supported", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var wireRequest nomineeSubmitWireRequest
+		if decodeError := json.NewDecoder(request.Body).Decode(&wireRequest); decodeError != nil {
+			http.Error(responseWriter, "malformed nominee submission payload", http.StatusBadRequest)
+			return
+		}
+
+		now := time.Now()
+		nomineeInputs := make([]nomineedesignation.NomineeInput, 0, len(wireRequest.Nominees))
+		for _, wireNominee := range wireRequest.Nominees {
+			input, convertErr := wireNominee.toNomineeInput()
+			if convertErr != nil {
+				respondWithBankVerificationJson(responseWriter, http.StatusBadRequest, nomineeDesignationWireResponse{
+					AccountIdentifier: wireRequest.AccountIdentifier,
+					ErrorMessage:      convertErr.Error(),
+				})
+				return
+			}
+			nomineeInputs = append(nomineeInputs, input)
+		}
+
+		designation, submitErr := registry.SubmitNomination(wireRequest.AccountIdentifier, nomineeInputs, wireRequest.IsOptedOutOfNomination, now)
+		if submitErr != nil {
+			respondWithBankVerificationJson(responseWriter, http.StatusBadRequest, nomineeDesignationWireResponse{
+				AccountIdentifier: wireRequest.AccountIdentifier,
+				ErrorMessage:      submitErr.Error(),
+			})
+			return
+		}
+
+		respondWithBankVerificationJson(responseWriter, http.StatusOK, toNomineeDesignationWireResponse(designation, now))
+	}
+}
+
+type nomineeMutateWireRequest struct {
+	AccountIdentifier string                  `json:"accountIdentifier"`
+	NomineeId         string                  `json:"nomineeId,omitempty"`
+	Nominee           nomineeInputWireRequest `json:"nominee"`
+}
+
+// buildNomineeAddHandler manages an already-existing (or brand new, empty)
+// designation incrementally — see internal/nomineedesignation's
+// AddNominee doc comment for how this differs from the hard-gated /submit
+// form endpoint above.
+func buildNomineeAddHandler(registry *nomineedesignation.NomineeDesignationRegistry) http.HandlerFunc {
+	return func(responseWriter http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodPost {
+			http.Error(responseWriter, "only POST is supported", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var wireRequest nomineeMutateWireRequest
+		if decodeError := json.NewDecoder(request.Body).Decode(&wireRequest); decodeError != nil {
+			http.Error(responseWriter, "malformed nominee add payload", http.StatusBadRequest)
+			return
+		}
+
+		now := time.Now()
+		input, convertErr := wireRequest.Nominee.toNomineeInput()
+		if convertErr != nil {
+			respondWithBankVerificationJson(responseWriter, http.StatusBadRequest, nomineeDesignationWireResponse{
+				AccountIdentifier: wireRequest.AccountIdentifier,
+				ErrorMessage:      convertErr.Error(),
+			})
+			return
+		}
+
+		designation, addErr := registry.AddNominee(wireRequest.AccountIdentifier, input, now)
+		if addErr != nil {
+			respondWithBankVerificationJson(responseWriter, http.StatusBadRequest, nomineeDesignationWireResponse{
+				AccountIdentifier: wireRequest.AccountIdentifier,
+				ErrorMessage:      addErr.Error(),
+			})
+			return
+		}
+
+		respondWithBankVerificationJson(responseWriter, http.StatusOK, toNomineeDesignationWireResponse(designation, now))
+	}
+}
+
+func buildNomineeUpdateHandler(registry *nomineedesignation.NomineeDesignationRegistry) http.HandlerFunc {
+	return func(responseWriter http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodPost {
+			http.Error(responseWriter, "only POST is supported", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var wireRequest nomineeMutateWireRequest
+		if decodeError := json.NewDecoder(request.Body).Decode(&wireRequest); decodeError != nil {
+			http.Error(responseWriter, "malformed nominee update payload", http.StatusBadRequest)
+			return
+		}
+		if wireRequest.NomineeId == "" {
+			respondWithBankVerificationJson(responseWriter, http.StatusBadRequest, nomineeDesignationWireResponse{
+				AccountIdentifier: wireRequest.AccountIdentifier,
+				ErrorMessage:      "nomineeId is required",
+			})
+			return
+		}
+
+		now := time.Now()
+		input, convertErr := wireRequest.Nominee.toNomineeInput()
+		if convertErr != nil {
+			respondWithBankVerificationJson(responseWriter, http.StatusBadRequest, nomineeDesignationWireResponse{
+				AccountIdentifier: wireRequest.AccountIdentifier,
+				ErrorMessage:      convertErr.Error(),
+			})
+			return
+		}
+
+		designation, updateErr := registry.UpdateNominee(wireRequest.AccountIdentifier, wireRequest.NomineeId, input, now)
+		if updateErr != nil {
+			respondWithBankVerificationJson(responseWriter, http.StatusBadRequest, nomineeDesignationWireResponse{
+				AccountIdentifier: wireRequest.AccountIdentifier,
+				ErrorMessage:      updateErr.Error(),
+			})
+			return
+		}
+
+		respondWithBankVerificationJson(responseWriter, http.StatusOK, toNomineeDesignationWireResponse(designation, now))
+	}
+}
+
+type nomineeRemoveWireRequest struct {
+	AccountIdentifier string `json:"accountIdentifier"`
+	NomineeId         string `json:"nomineeId"`
+}
+
+func buildNomineeRemoveHandler(registry *nomineedesignation.NomineeDesignationRegistry) http.HandlerFunc {
+	return func(responseWriter http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodPost {
+			http.Error(responseWriter, "only POST is supported", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var wireRequest nomineeRemoveWireRequest
+		if decodeError := json.NewDecoder(request.Body).Decode(&wireRequest); decodeError != nil {
+			http.Error(responseWriter, "malformed nominee remove payload", http.StatusBadRequest)
+			return
+		}
+
+		now := time.Now()
+		designation, removeErr := registry.RemoveNominee(wireRequest.AccountIdentifier, wireRequest.NomineeId, now)
+		if removeErr != nil {
+			respondWithBankVerificationJson(responseWriter, http.StatusBadRequest, nomineeDesignationWireResponse{
+				AccountIdentifier: wireRequest.AccountIdentifier,
+				ErrorMessage:      removeErr.Error(),
+			})
+			return
+		}
+
+		respondWithBankVerificationJson(responseWriter, http.StatusOK, toNomineeDesignationWireResponse(designation, now))
+	}
+}
+
+func buildNomineeQueryHandler(registry *nomineedesignation.NomineeDesignationRegistry) http.HandlerFunc {
+	return func(responseWriter http.ResponseWriter, request *http.Request) {
+		accountIdentifier := request.URL.Query().Get("accountId")
+		if accountIdentifier == "" {
+			http.Error(responseWriter, "missing accountId query parameter", http.StatusBadRequest)
+			return
+		}
+
+		now := time.Now()
+		designation, wasFound := registry.GetDesignation(accountIdentifier)
+		if !wasFound {
+			respondWithBankVerificationJson(responseWriter, http.StatusNotFound, nomineeDesignationWireResponse{
+				AccountIdentifier: accountIdentifier,
+				ErrorMessage:      "no nominee designation submitted for this account yet",
+			})
+			return
+		}
+
+		respondWithBankVerificationJson(responseWriter, http.StatusOK, toNomineeDesignationWireResponse(designation, now))
+	}
+}
+
+type holderWireResponse struct {
+	HolderId        string `json:"holderId"`
+	FullName        string `json:"fullName"`
+	IsPrimaryHolder bool   `json:"isPrimaryHolder"`
+}
+
+type holdingStructureWireResponse struct {
+	AccountIdentifier string               `json:"accountIdentifier"`
+	HoldingType       string               `json:"holdingType"`
+	HoldingMode       string               `json:"holdingMode,omitempty"`
+	Holders           []holderWireResponse `json:"holders"`
+	ErrorMessage      string               `json:"errorMessage,omitempty"`
+}
+
+func toHoldingStructureWireResponse(structure jointholding.HoldingStructure) holdingStructureWireResponse {
+	wireHolders := make([]holderWireResponse, 0, len(structure.Holders))
+	for _, holder := range structure.Holders {
+		wireHolders = append(wireHolders, holderWireResponse{
+			HolderId:        holder.HolderId,
+			FullName:        holder.FullName,
+			IsPrimaryHolder: holder.IsPrimaryHolder,
+		})
+	}
+	return holdingStructureWireResponse{
+		AccountIdentifier: structure.AccountIdentifier,
+		HoldingType:       string(structure.HoldingType),
+		HoldingMode:       string(structure.HoldingMode),
+		Holders:           wireHolders,
+	}
+}
+
+type registerIndividualAccountWireRequest struct {
+	AccountIdentifier  string `json:"accountIdentifier"`
+	SoleHolderFullName string `json:"soleHolderFullName"`
+}
+
+func buildRegisterIndividualAccountHandler(registry *jointholding.HoldingRegistry) http.HandlerFunc {
+	return func(responseWriter http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodPost {
+			http.Error(responseWriter, "only POST is supported", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var wireRequest registerIndividualAccountWireRequest
+		if decodeError := json.NewDecoder(request.Body).Decode(&wireRequest); decodeError != nil {
+			http.Error(responseWriter, "malformed register-individual payload", http.StatusBadRequest)
+			return
+		}
+
+		structure, registerErr := registry.RegisterIndividualAccount(wireRequest.AccountIdentifier, wireRequest.SoleHolderFullName)
+		if registerErr != nil {
+			respondWithBankVerificationJson(responseWriter, http.StatusBadRequest, holdingStructureWireResponse{
+				AccountIdentifier: wireRequest.AccountIdentifier,
+				ErrorMessage:      registerErr.Error(),
+			})
+			return
+		}
+
+		respondWithBankVerificationJson(responseWriter, http.StatusOK, toHoldingStructureWireResponse(structure))
+	}
+}
+
+type registerJointAccountWireRequest struct {
+	AccountIdentifier  string   `json:"accountIdentifier"`
+	HoldingMode        string   `json:"holdingMode"`
+	HolderFullNames    []string `json:"holderFullNames"`
+	PrimaryHolderIndex int      `json:"primaryHolderIndex"`
+}
+
+func buildRegisterJointAccountHandler(registry *jointholding.HoldingRegistry) http.HandlerFunc {
+	return func(responseWriter http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodPost {
+			http.Error(responseWriter, "only POST is supported", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var wireRequest registerJointAccountWireRequest
+		if decodeError := json.NewDecoder(request.Body).Decode(&wireRequest); decodeError != nil {
+			http.Error(responseWriter, "malformed register-joint payload", http.StatusBadRequest)
+			return
+		}
+
+		structure, registerErr := registry.RegisterJointAccount(
+			wireRequest.AccountIdentifier,
+			jointholding.JointHoldingMode(wireRequest.HoldingMode),
+			wireRequest.HolderFullNames,
+			wireRequest.PrimaryHolderIndex,
+		)
+		if registerErr != nil {
+			respondWithBankVerificationJson(responseWriter, http.StatusBadRequest, holdingStructureWireResponse{
+				AccountIdentifier: wireRequest.AccountIdentifier,
+				ErrorMessage:      registerErr.Error(),
+			})
+			return
+		}
+
+		respondWithBankVerificationJson(responseWriter, http.StatusOK, toHoldingStructureWireResponse(structure))
+	}
+}
+
+type authorizeOperationWireRequest struct {
+	AccountIdentifier   string   `json:"accountIdentifier"`
+	ConsentingHolderIds []string `json:"consentingHolderIds"`
+}
+
+type authorizeOperationWireResponse struct {
+	AccountIdentifier string `json:"accountIdentifier"`
+	IsAuthorized      bool   `json:"isAuthorized"`
+	ErrorMessage      string `json:"errorMessage,omitempty"`
+}
+
+func buildAuthorizeOperationHandler(registry *jointholding.HoldingRegistry) http.HandlerFunc {
+	return func(responseWriter http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodPost {
+			http.Error(responseWriter, "only POST is supported", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var wireRequest authorizeOperationWireRequest
+		if decodeError := json.NewDecoder(request.Body).Decode(&wireRequest); decodeError != nil {
+			http.Error(responseWriter, "malformed authorize-operation payload", http.StatusBadRequest)
+			return
+		}
+
+		isAuthorized, authorizeErr := registry.AuthorizeOperation(wireRequest.AccountIdentifier, wireRequest.ConsentingHolderIds)
+		if authorizeErr != nil {
+			respondWithBankVerificationJson(responseWriter, http.StatusBadRequest, authorizeOperationWireResponse{
+				AccountIdentifier: wireRequest.AccountIdentifier,
+				ErrorMessage:      authorizeErr.Error(),
+			})
+			return
+		}
+
+		respondWithBankVerificationJson(responseWriter, http.StatusOK, authorizeOperationWireResponse{
+			AccountIdentifier: wireRequest.AccountIdentifier,
+			IsAuthorized:      isAuthorized,
+		})
+	}
+}
+
+func buildJointHoldingQueryHandler(registry *jointholding.HoldingRegistry) http.HandlerFunc {
+	return func(responseWriter http.ResponseWriter, request *http.Request) {
+		accountIdentifier := request.URL.Query().Get("accountId")
+		if accountIdentifier == "" {
+			http.Error(responseWriter, "missing accountId query parameter", http.StatusBadRequest)
+			return
+		}
+
+		structure, wasFound := registry.GetHoldingStructure(accountIdentifier)
+		if !wasFound {
+			respondWithBankVerificationJson(responseWriter, http.StatusNotFound, holdingStructureWireResponse{
+				AccountIdentifier: accountIdentifier,
+				ErrorMessage:      "no holding structure registered for this account yet",
+			})
+			return
+		}
+
+		respondWithBankVerificationJson(responseWriter, http.StatusOK, toHoldingStructureWireResponse(structure))
 	}
 }

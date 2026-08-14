@@ -1,0 +1,257 @@
+/* Mercurius / terminal — Pro Desktop Terminal styling. Plain hand-written
+   CSS (no Tailwind here — apps/terminal has its own build, not sharing
+   apps/web's Tailwind pipeline, per this task's "duplicate small pieces
+   rather than a risky cross-package refactor" guidance). Dark, dense,
+   monospace-leaning — a professional trading terminal aesthetic. */
+
+:root {
+  color-scheme: dark;
+  --terminal-bg: #05070d;
+  --terminal-panel-bg: #0b1120;
+  --terminal-border: #1e293b;
+  --terminal-text: #e2e8f0;
+  --terminal-text-dim: #94a3b8;
+  --terminal-accent: #60a5fa;
+  --terminal-bullish: #26a65b;
+  --terminal-bearish: #e0473d;
+}
+
+html, body, #root {
+  height: 100%;
+  margin: 0;
+  background: var(--terminal-bg);
+  color: var(--terminal-text);
+  font-family: "SF Mono", "JetBrains Mono", ui-monospace, Menlo, monospace;
+}
+
+.terminalShell {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+}
+
+/* Command bar */
+.commandBar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  background: var(--terminal-panel-bg);
+  border-bottom: 1px solid var(--terminal-border);
+  flex-shrink: 0;
+}
+.commandBar__prompt {
+  color: var(--terminal-accent);
+  font-weight: bold;
+}
+.commandBar__input {
+  flex: 1;
+  background: transparent;
+  border: none;
+  outline: none;
+  color: var(--terminal-text);
+  font: inherit;
+  font-size: 14px;
+}
+.commandBar__error {
+  color: var(--terminal-bearish);
+  font-size: 12px;
+}
+
+/* Tiling workspace */
+.tilingWorkspace {
+  flex: 1;
+  min-height: 0;
+}
+
+/* Chart tile */
+.chartTileContainer {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+}
+.chartTileContainer__toolbar {
+  display: flex;
+  gap: 12px;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--terminal-border);
+  font-size: 12px;
+}
+.chartTileContainer__overlayToggle {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  cursor: pointer;
+}
+.chartTileContainer__error {
+  color: var(--terminal-bearish);
+  font-size: 12px;
+  padding: 4px 10px;
+}
+.chartTileContainer__canvasWrapper {
+  flex: 1;
+  min-height: 0;
+}
+
+/* DOM ladder */
+.domLadderWidget {
+  padding: 8px;
+  font-size: 12px;
+  overflow: auto;
+  height: 100%;
+  box-sizing: border-box;
+}
+.domLadderWidget__header {
+  margin-bottom: 6px;
+  color: var(--terminal-text-dim);
+}
+.domLadderWidget__error {
+  color: var(--terminal-bearish);
+}
+.domLadderWidget__table {
+  width: 100%;
+  border-collapse: collapse;
+}
+.domLadderWidget__table th {
+  text-align: center;
+  color: var(--terminal-text-dim);
+  font-weight: normal;
+  padding: 2px 4px;
+}
+.domLadderWidget__table td {
+  text-align: center;
+  padding: 2px 6px;
+  border-top: 1px solid var(--terminal-border);
+}
+.domLadderWidget__bidCell {
+  color: var(--terminal-bullish);
+  cursor: pointer;
+}
+.domLadderWidget__bidCell:hover {
+  background: rgba(38, 166, 91, 0.15);
+}
+.domLadderWidget__askCell {
+  color: var(--terminal-bearish);
+  cursor: pointer;
+}
+.domLadderWidget__askCell:hover {
+  background: rgba(224, 71, 61, 0.15);
+}
+.domLadderWidget__priceCell {
+  color: var(--terminal-text);
+  font-weight: bold;
+}
+.domLadderWidget__status {
+  margin-top: 6px;
+  color: var(--terminal-accent);
+}
+
+/* News ticker */
+.newsTickerWidget {
+  position: relative;
+  height: 100%;
+  overflow: hidden;
+  display: flex;
+  align-items: center;
+  background: var(--terminal-panel-bg);
+}
+.newsTickerWidget__badge {
+  position: absolute;
+  top: 2px;
+  right: 6px;
+  font-size: 9px;
+  color: var(--terminal-text-dim);
+  letter-spacing: 0.05em;
+  z-index: 1;
+}
+.newsTickerWidget__track {
+  display: flex;
+  width: max-content;
+  animation: newsTickerScroll 40s linear infinite;
+}
+.newsTickerWidget__sequence {
+  display: flex;
+}
+.newsTickerWidget__item {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 24px;
+  font-size: 12px;
+  white-space: nowrap;
+}
+.newsTickerWidget__sentiment--bullish {
+  color: var(--terminal-bullish);
+}
+.newsTickerWidget__sentiment--bearish {
+  color: var(--terminal-bearish);
+}
+.newsTickerWidget__sentiment--neutral {
+  color: var(--terminal-text-dim);
+}
+@keyframes newsTickerScroll {
+  from {
+    transform: translateX(0);
+  }
+  to {
+    transform: translateX(-50%);
+  }
+}
+
+/* Python hook panel */
+.pythonHookPanel {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  box-sizing: border-box;
+  padding: 8px;
+  gap: 8px;
+}
+.pythonHookPanel__editor {
+  flex: 1;
+  min-height: 100px;
+  background: var(--terminal-panel-bg);
+  color: var(--terminal-text);
+  border: 1px solid var(--terminal-border);
+  font-family: inherit;
+  font-size: 12px;
+  padding: 8px;
+  resize: none;
+}
+.pythonHookPanel__controls button {
+  background: var(--terminal-accent);
+  color: #05070d;
+  border: none;
+  padding: 6px 12px;
+  border-radius: 4px;
+  cursor: pointer;
+  font: inherit;
+  font-size: 12px;
+}
+.pythonHookPanel__controls button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+.pythonHookPanel__error {
+  color: var(--terminal-bearish);
+  font-size: 12px;
+}
+.pythonHookPanel__outcome {
+  font-size: 12px;
+  overflow: auto;
+}
+.pythonHookPanel__stdout,
+.pythonHookPanel__stderr {
+  background: #000;
+  padding: 6px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.pythonHookPanel__stderr {
+  color: var(--terminal-bearish);
+}
+.pythonHookPanel__isolationNotes {
+  color: var(--terminal-text-dim);
+  font-size: 11px;
+  margin-top: 4px;
+}

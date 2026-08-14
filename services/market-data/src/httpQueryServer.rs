@@ -14,15 +14,29 @@
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
 
 use crate::candleAggregator::CandleAggregator;
 use crate::columnarTickStore::ColumnarTickStore;
+use crate::livePnlWidget::{self, computeLivePnlSnapshot};
 use crate::orderFlowFootprintAggregator::computeOrderFlowFootprint;
 use crate::pricealerts::PriceAlertStore;
 use crate::volumeProfileAggregator::{computeTpoProfile, computeVolumeProfile};
 use crate::watchlist::WatchlistStore;
+
+/// Default host:port for oms-gateway's real HTTP API — overridable via
+/// `MARKET_DATA_OMS_GATEWAY_HTTP_ADDRESS`, same env-var-with-a-hardcoded-
+/// default convention as this service's other configuration. `main.rs`
+/// reads the env var itself and always calls
+/// `newEmptyStateWithOmsGatewayAddress` explicitly, so this constant (and
+/// the plain `newEmptyState` convenience constructor below) are only
+/// exercised by this module's own test suite — same
+/// kept-pub-for-tests-only pattern as `candleAggregator.rs`'s
+/// `recordTrade`.
+#[allow(dead_code)]
+const DEFAULT_OMS_GATEWAY_HTTP_ADDRESS: &str = "127.0.0.1:8081";
 
 /// Default price-bucket width (minor units) for `GET /volumeProfile` and
 /// `GET /orderFlowFootprint` when the caller doesn't specify one — a
@@ -49,17 +63,39 @@ pub struct SharedMarketDataState {
     pub columnarTickStore: ColumnarTickStore,
     pub watchlists: WatchlistStore,
     pub priceAlerts: PriceAlertStore,
+    /// `host:port` this process calls out to for `GET /pnl/live`'s
+    /// real, read-only fetch of oms-gateway's mark-to-market cost basis
+    /// (`livePnlWidget.rs`). Not touched by anything else in this
+    /// struct — read-only client state, not shared mutable state.
+    pub omsGatewayHttpAddress: String,
 }
 
 impl SharedMarketDataState {
+    #[allow(dead_code)]
     pub fn newEmptyState() -> Self {
+        SharedMarketDataState::newEmptyStateWithOmsGatewayAddress(DEFAULT_OMS_GATEWAY_HTTP_ADDRESS)
+    }
+
+    pub fn newEmptyStateWithOmsGatewayAddress(omsGatewayHttpAddress: &str) -> Self {
         SharedMarketDataState {
             candleAggregator: Mutex::new(CandleAggregator::newEmptyAggregator()),
             columnarTickStore: ColumnarTickStore::newEmptyStore(),
             watchlists: WatchlistStore::newEmptyStore(),
             priceAlerts: PriceAlertStore::newEmptyStore(),
+            omsGatewayHttpAddress: omsGatewayHttpAddress.to_string(),
         }
     }
+}
+
+/// Current wall-clock time as epoch MILLISECONDS (not seconds — see
+/// watchlist.rs's module doc for why) — used to stamp real watchlist
+/// mutations (`POST /watchlist/add`/`/watchlist/remove`) with a real
+/// `lastModifiedAt`/change-log timestamp for the sync-freshness mechanism.
+fn currentEpochMillis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 pub fn runHttpQueryServer(listenAddress: &str, sharedState: Arc<SharedMarketDataState>) {
@@ -73,7 +109,7 @@ pub fn runHttpQueryServer(listenAddress: &str, sharedState: Arc<SharedMarketData
     println!(
         "market-data HTTP query server listening on {listenAddress} (GET /trades, GET /candles, \
          GET /ticks/range, GET /volumeProfile, GET /orderFlowFootprint, GET/POST /watchlist, \
-         POST /alerts/create, GET /alerts)"
+         GET /watchlist/changes, POST /alerts/create, GET /alerts, GET /pnl/live)"
     );
 
     for incomingConnection in tcpListener.incoming() {
@@ -132,6 +168,12 @@ fn readRequestLineAndBody(connectionStream: &std::net::TcpStream) -> Option<(Str
 struct WatchlistMutationWireRequest {
     accountIdentifier: String,
     instrumentSymbol: String,
+    /// Optional caller-supplied identifier for the device/browser session
+    /// making this change — purely informational (see `watchlist.rs`'s
+    /// module doc), lets a client prove a change came from a different
+    /// device than the one it's running on.
+    #[serde(default)]
+    deviceIdentifier: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -309,25 +351,36 @@ fn handleOneHttpRequest(
                 );
             }
             let symbols = sharedState.watchlists.symbolsForAccount(&accountIdentifier);
-            (
-                "HTTP/1.1 200 OK".to_string(),
-                serde_json::to_string(&symbols).unwrap_or_else(|_| "[]".to_string()),
-            )
+            let lastModifiedAtEpochMillis = sharedState
+                .watchlists
+                .lastModifiedAtEpochMillisForAccount(&accountIdentifier);
+            let bodyJson = serde_json::json!({
+                "accountIdentifier": accountIdentifier,
+                "symbols": symbols,
+                "lastModifiedAtEpochMillis": lastModifiedAtEpochMillis,
+            });
+            ("HTTP/1.1 200 OK".to_string(), bodyJson.to_string())
         }
         ("POST", "/watchlist/add") => match serde_json::from_str::<WatchlistMutationWireRequest>(requestBody) {
             Ok(wireRequest) => {
-                let wasAdded = sharedState
-                    .watchlists
-                    .addSymbol(&wireRequest.accountIdentifier, &wireRequest.instrumentSymbol);
+                let wasAdded = sharedState.watchlists.addSymbol(
+                    &wireRequest.accountIdentifier,
+                    &wireRequest.instrumentSymbol,
+                    wireRequest.deviceIdentifier.as_deref(),
+                    currentEpochMillis(),
+                );
                 ("HTTP/1.1 200 OK".to_string(), format!(r#"{{"wasAdded":{wasAdded}}}"#))
             }
             Err(_) => malformedJsonBodyResponse(),
         },
         ("POST", "/watchlist/remove") => match serde_json::from_str::<WatchlistMutationWireRequest>(requestBody) {
             Ok(wireRequest) => {
-                let wasRemoved = sharedState
-                    .watchlists
-                    .removeSymbol(&wireRequest.accountIdentifier, &wireRequest.instrumentSymbol);
+                let wasRemoved = sharedState.watchlists.removeSymbol(
+                    &wireRequest.accountIdentifier,
+                    &wireRequest.instrumentSymbol,
+                    wireRequest.deviceIdentifier.as_deref(),
+                    currentEpochMillis(),
+                );
                 (
                     "HTTP/1.1 200 OK".to_string(),
                     format!(r#"{{"wasRemoved":{wasRemoved}}}"#),
@@ -335,6 +388,35 @@ fn handleOneHttpRequest(
             }
             Err(_) => malformedJsonBodyResponse(),
         },
+
+        // Cross-device sync-freshness: "what changed since I last synced"
+        // — see watchlist.rs's module doc. sinceEpochMillis defaults to
+        // 0 (everything) when omitted.
+        ("GET", "/watchlist/changes") => {
+            if accountIdentifier.is_empty() {
+                return (
+                    "HTTP/1.1 400 Bad Request".to_string(),
+                    r#"{"errorMessage":"accountIdentifier query parameter is required"}"#.to_string(),
+                );
+            }
+            let sinceEpochMillis = queryParams
+                .get("sinceEpochMillis")
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(0);
+            let changes = sharedState
+                .watchlists
+                .changesForAccountSince(&accountIdentifier, sinceEpochMillis);
+            let lastModifiedAtEpochMillis = sharedState
+                .watchlists
+                .lastModifiedAtEpochMillisForAccount(&accountIdentifier);
+            let bodyJson = serde_json::json!({
+                "accountIdentifier": accountIdentifier,
+                "sinceEpochMillis": sinceEpochMillis,
+                "changes": changes,
+                "lastModifiedAtEpochMillis": lastModifiedAtEpochMillis,
+            });
+            ("HTTP/1.1 200 OK".to_string(), bodyJson.to_string())
+        }
 
         ("GET", "/alerts") => {
             if accountIdentifier.is_empty() {
@@ -361,6 +443,44 @@ fn handleOneHttpRequest(
             }
             Err(_) => malformedJsonBodyResponse(),
         },
+
+        // Home-screen live P&L widget (FEATURES.md §21) — a real,
+        // read-only fetch of oms-gateway's mark-to-market cost basis
+        // combined with market-data's OWN live trade tape. See
+        // livePnlWidget.rs's module doc for the full contract and its
+        // one documented upstream limitation.
+        ("GET", "/pnl/live") => {
+            if accountIdentifier.is_empty() {
+                return (
+                    "HTTP/1.1 400 Bad Request".to_string(),
+                    r#"{"errorMessage":"accountIdentifier query parameter is required"}"#.to_string(),
+                );
+            }
+            match livePnlWidget::fetchOmsGatewayCostBasisForAccount(
+                &sharedState.omsGatewayHttpAddress,
+                &accountIdentifier,
+            ) {
+                Ok(omsPositions) => {
+                    let candleAggregator = sharedState
+                        .candleAggregator
+                        .lock()
+                        .expect("candle aggregator mutex poisoned");
+                    let snapshot = computeLivePnlSnapshot(&accountIdentifier, &omsPositions, &candleAggregator);
+                    (
+                        "HTTP/1.1 200 OK".to_string(),
+                        serde_json::to_string(&snapshot).unwrap_or_else(|_| "{}".to_string()),
+                    )
+                }
+                Err(fetchError) => (
+                    "HTTP/1.1 502 Bad Gateway".to_string(),
+                    serde_json::json!({
+                        "errorMessage": format!("failed to fetch cost basis from oms-gateway: {fetchError}"),
+                        "omsGatewayHttpAddress": sharedState.omsGatewayHttpAddress,
+                    })
+                    .to_string(),
+                ),
+            }
+        }
 
         _ => ("HTTP/1.1 404 Not Found".to_string(), "[]".to_string()),
     }
@@ -439,7 +559,82 @@ mod tests {
         let (getStatus, getBody) =
             handleOneHttpRequest("GET /watchlist?accountIdentifier=acct-001 HTTP/1.1", "", &sharedState);
         assert_eq!(getStatus, "HTTP/1.1 200 OK");
-        assert_eq!(getBody, r#"["DEMO-EQ"]"#);
+        assert!(getBody.contains(r#""symbols":["DEMO-EQ"]"#));
+        assert!(!getBody.contains("\"lastModifiedAtEpochMillis\":0")); // a real epoch stamp was recorded
+    }
+
+    #[test]
+    fn watchlistAddWithADeviceIdentifierIsVisibleFromADifferentQueryContextForTheSameAccount() {
+        // Proves the cross-device sync story end to end over the real
+        // HTTP routing layer: a mutation tagged with one device
+        // identifier is immediately visible to a plain GET (standing in
+        // for a different device's session) for the same account.
+        let sharedState = Arc::new(SharedMarketDataState::newEmptyState());
+        let (addStatus, _addBody) = handleOneHttpRequest(
+            "POST /watchlist/add HTTP/1.1",
+            r#"{"accountIdentifier":"acct-001","instrumentSymbol":"DEMO-EQ","deviceIdentifier":"device-phone"}"#,
+            &sharedState,
+        );
+        assert_eq!(addStatus, "HTTP/1.1 200 OK");
+
+        let (getStatus, getBody) =
+            handleOneHttpRequest("GET /watchlist?accountIdentifier=acct-001 HTTP/1.1", "", &sharedState);
+        assert_eq!(getStatus, "HTTP/1.1 200 OK");
+        assert!(getBody.contains(r#""symbols":["DEMO-EQ"]"#));
+    }
+
+    #[test]
+    fn watchlistChangesSinceReturnsOnlyTheRealDeltaAfterAGivenTimestamp() {
+        let sharedState = Arc::new(SharedMarketDataState::newEmptyState());
+        handleOneHttpRequest(
+            "POST /watchlist/add HTTP/1.1",
+            r#"{"accountIdentifier":"acct-001","instrumentSymbol":"AAPL","deviceIdentifier":"device-A"}"#,
+            &sharedState,
+        );
+
+        // A full sync: read the current lastModifiedAtEpochMillis as the
+        // client's own "synced as of" marker.
+        let (_status, firstGetBody) =
+            handleOneHttpRequest("GET /watchlist?accountIdentifier=acct-001 HTTP/1.1", "", &sharedState);
+        let firstSnapshot: serde_json::Value = serde_json::from_str(&firstGetBody).unwrap();
+        let syncedAsOf = firstSnapshot["lastModifiedAtEpochMillis"].as_u64().unwrap();
+
+        // Immediately since its own timestamp: nothing new yet.
+        let (_status, noChangesBody) = handleOneHttpRequest(
+            &format!("GET /watchlist/changes?accountIdentifier=acct-001&sinceEpochMillis={syncedAsOf} HTTP/1.1"),
+            "",
+            &sharedState,
+        );
+        assert!(noChangesBody.contains("\"changes\":[]"));
+
+        // A second, later real change from a DIFFERENT device. A tiny
+        // real sleep guarantees a distinct millisecond timestamp from the
+        // first change, even on a very fast machine — this test asserts
+        // on real wall-clock timestamps, not injected/mocked ones.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        handleOneHttpRequest(
+            "POST /watchlist/add HTTP/1.1",
+            r#"{"accountIdentifier":"acct-001","instrumentSymbol":"MSFT","deviceIdentifier":"device-desktop"}"#,
+            &sharedState,
+        );
+
+        let (changesStatus, changesBody) = handleOneHttpRequest(
+            &format!("GET /watchlist/changes?accountIdentifier=acct-001&sinceEpochMillis={syncedAsOf} HTTP/1.1"),
+            "",
+            &sharedState,
+        );
+        assert_eq!(changesStatus, "HTTP/1.1 200 OK");
+        assert!(changesBody.contains("\"instrumentSymbol\":\"MSFT\""));
+        assert!(changesBody.contains("\"wasAdded\":true"));
+        assert!(changesBody.contains("\"deviceIdentifier\":\"device-desktop\""));
+        assert!(!changesBody.contains("\"instrumentSymbol\":\"AAPL\"")); // outside the delta window
+    }
+
+    #[test]
+    fn watchlistChangesRouteWithoutAccountIdentifierReturns400() {
+        let sharedState = Arc::new(SharedMarketDataState::newEmptyState());
+        let (statusLine, _) = handleOneHttpRequest("GET /watchlist/changes HTTP/1.1", "", &sharedState);
+        assert_eq!(statusLine, "HTTP/1.1 400 Bad Request");
     }
 
     #[test]
@@ -570,5 +765,76 @@ mod tests {
         let (statusLine, bodyJson) = handleOneHttpRequest("OPTIONS /watchlist/add HTTP/1.1", "", &sharedState);
         assert_eq!(statusLine, "HTTP/1.1 204 No Content");
         assert_eq!(bodyJson, "");
+    }
+
+    // -------------------------------------------------------------
+    // GET /pnl/live — the home-screen live P&L widget endpoint.
+    // -------------------------------------------------------------
+
+    #[test]
+    fn pnlLiveRouteWithoutAccountIdentifierReturns400() {
+        let sharedState = Arc::new(SharedMarketDataState::newEmptyState());
+        let (statusLine, _) = handleOneHttpRequest("GET /pnl/live HTTP/1.1", "", &sharedState);
+        assert_eq!(statusLine, "HTTP/1.1 400 Bad Request");
+    }
+
+    #[test]
+    fn pnlLiveRouteReturns502WhenOmsGatewayIsUnreachable() {
+        // Port 1 is reserved — nothing should ever be listening there, so
+        // this exercises a real failed outbound connection, not a mock.
+        let sharedState = Arc::new(SharedMarketDataState::newEmptyStateWithOmsGatewayAddress("127.0.0.1:1"));
+        let (statusLine, bodyJson) =
+            handleOneHttpRequest("GET /pnl/live?accountIdentifier=acct-001 HTTP/1.1", "", &sharedState);
+        assert_eq!(statusLine, "HTTP/1.1 502 Bad Gateway");
+        assert!(bodyJson.contains("errorMessage"));
+    }
+
+    #[test]
+    fn pnlLiveRouteComputesARealSnapshotFromARealLocalStandInForOmsGatewayAndMarketDatasOwnLiveTrades() {
+        use std::net::TcpListener;
+        use std::thread;
+
+        // A real local HTTP server standing in for oms-gateway's GET
+        // /mark-to-market — proves the FULL round trip through this
+        // route: a real outbound HTTP call, a real JSON parse, and a
+        // real join against market-data's OWN candle aggregator state
+        // (seeded below with a real trade), not a hardcoded number.
+        let listener = TcpListener::bind("127.0.0.1:0").expect("failed to bind ephemeral test listener");
+        let listenAddress = listener.local_addr().expect("failed to read local addr").to_string();
+
+        let serverThread = thread::spawn(move || {
+            let (mut connectionStream, _) = listener.accept().expect("failed to accept test connection");
+            let mut readBuffer = [0u8; 512];
+            let _ = connectionStream.read(&mut readBuffer);
+
+            let responseBody = r#"{"accountIdentifier":"acct-001","isLeveragedAccount":true,"positions":[{"instrumentSymbol":"DEMO-EQ","netQuantity":10,"averageEntryPriceInMinorUnits":10000,"currentMarketPriceInMinorUnits":10000,"unrealizedPnLInMinorUnits":0}],"totalUnrealizedPnLInMinorUnits":0}"#;
+            let httpResponse = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{responseBody}",
+                responseBody.len()
+            );
+            let _ = connectionStream.write_all(httpResponse.as_bytes());
+        });
+
+        let sharedState = Arc::new(SharedMarketDataState::newEmptyStateWithOmsGatewayAddress(
+            &listenAddress,
+        ));
+        // market-data's OWN real live price for DEMO-EQ, independent of
+        // whatever oms-gateway's stub response said.
+        sharedState
+            .candleAggregator
+            .lock()
+            .unwrap()
+            .recordTrade("DEMO-EQ", 12_000, 1, 1_000);
+
+        let (statusLine, bodyJson) =
+            handleOneHttpRequest("GET /pnl/live?accountIdentifier=acct-001 HTTP/1.1", "", &sharedState);
+        serverThread.join().expect("test server thread panicked");
+
+        assert_eq!(statusLine, "HTTP/1.1 200 OK");
+        // 10 * (12_000 - 10_000) = 20_000 — computed from the real join,
+        // not the stub's own (deliberately wrong/zero) unrealizedPnL.
+        assert!(bodyJson.contains("\"totalUnrealizedPnLInMinorUnits\":20000"));
+        assert!(bodyJson.contains("\"currentMarketPriceInMinorUnits\":12000"));
+        assert!(bodyJson.contains("\"currentMarketPriceIsLive\":true"));
     }
 }

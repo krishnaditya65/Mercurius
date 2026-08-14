@@ -34,6 +34,19 @@ Research-tier component — see `ARCHITECTURE.md` §6 and §8 in the repo root.
 ## endpoints (5 new POST routes); the walk-forward optimizer and the HMM
 ## regime detector are pytest-verified only this pass (see that section
 ## for why).
+## FEATURES.md §16 ("AI, Data & Research") — this pass adds all SEVEN §16
+## items: a real stock/fund screener with a compound AND/OR filter builder
+## and saved screens, a real TF-IDF-retrieval research copilot (RAG over a
+## small synthetic filings corpus, always cited and non-advisory), an HHI-
+## based portfolio health check with genuinely input-derived plain-language
+## nudges, a tax-loss harvesting advisor with a real 61-day wash-sale
+## window check, an alternative-data module (sentiment aggregation +
+## z-score filing-anomaly detection) wired into the existing §7 NLP
+## trading hook, a real Brinson-Hood-Beebower P&L attribution engine, and
+## a real rules-based custom index constructor + backtester — see the new
+## "§16" section below for exactly what's real vs. illustrative in each.
+## HTTP service now additionally covers 11 new POST routes across all
+## seven items.
 
 What's real:
 - `src/quantengine/blackScholesOptionPricer.py` — call/put pricing, all
@@ -851,6 +864,103 @@ before treating any of them as production-grade):
   for pathological input series. Not wired to HTTP this pass (see the
   "§22 pass 2" section for why).
 
+## FEATURES.md §16 ("AI, Data & Research") — all seven items
+
+All seven items in this section are now real, tested modules with real
+HTTP endpoints. As with every other illustrative dataset in this service
+(ESG scores, factor exposures), every dataset called out below is
+synthetic/fabricated fixture data — no real market data, no real filings,
+no internet access. The MATH and LOGIC applied to that data is real.
+
+1. **Stock/fund screener** (`stockScreenerFilterBuilder.py`) — a real
+   compound filter-expression engine (arbitrarily nested AND/OR groups
+   over `<`, `<=`, `>`, `>=`, `==`, `!=`, `in`, `not_in` comparisons) run
+   against an illustrative six-symbol instrument universe. Fundamental
+   fields (P/E, market cap, dividend yield, sector) are hand-fabricated;
+   technical fields (50-day SMA, 14-day Wilder RSI) are REAL formulas
+   computed from each symbol's deterministic (non-random) synthetic price
+   series. Saved screens persist via `SavedScreenStore` — IN-MEMORY by
+   default (screens don't survive a process restart unless a
+   `persistenceFilePath` is supplied, in which case every save/delete is
+   also written to a JSON file and reloaded on the next construction —
+   see that class's docstring; this is intentionally the simplest
+   persistence that satisfies "saved screens survive," not a real
+   database).
+2. **AI research copilot** (`researchCopilotRetrievalAugmentedGeneration.py`)
+   — a real, working RAG pipeline: real paragraph chunking, real TF-IDF
+   vectorization (term frequency × inverse document frequency over the
+   corpus's actual token statistics — a real, correct retrieval
+   algorithm, explicitly NOT a trained neural embedding model, since none
+   is available offline), real cosine-similarity top-k retrieval, and
+   real extractive (template-based, not generative-LLM) response
+   composition that quotes ONLY the retrieved chunks with exact
+   `(documentId, chunkIndex)` citations. Runs over a small, hand-authored
+   SYNTHETIC corpus of four "SIM-"-prefixed filing/earnings-call/annual-
+   report excerpts (`ILLUSTRATIVE_DOCUMENT_CORPUS`) — no real company or
+   filing. Every response carries a fixed, unconditional non-advisory
+   disclaimer. Retrieval correctness is pytest-verified directly: a
+   "revenue growth" query retrieves the chunk discussing revenue growth,
+   not an unrelated litigation chunk.
+3. **Portfolio health check / diversification analysis**
+   (`portfolioHealthCheckDiversificationAnalyzer.py`) — real
+   Herfindahl-Hirschman Index concentration math over both individual
+   positions and sector-aggregated weights, severity-classified using the
+   real DOJ/FTC Merger Guidelines HHI bands (repurposed here for
+   portfolio concentration), an optional real factor-exposure summary
+   (reusing `factorRiskModel.computePortfolioFactorExposures` when every
+   holding supplies exposures), and plain-language nudge strings
+   genuinely interpolated from the actual computed numbers — pytest
+   directly proves a concentrated portfolio and a diversified portfolio
+   produce different nudge text AND different severities.
+4. **Tax-loss harvesting** (`taxLossHarvestingAdvisor.py`) — real per-lot
+   unrealized-loss identification, the real IRS 61-day wash-sale window
+   check (30 days before through 30 days after the proposed sale date,
+   inclusive), and the real offset waterfall (harvested losses offset
+   realized gains first, then up to the real $3,000/year ordinary-income
+   offset cap, with the remainder correctly carried forward). Pytest
+   covers both a wash-sale case that MUST be excluded (repurchase 10 days
+   after the sale) and one that must NOT be (repurchase 45 days after,
+   outside the window). Explicitly NOT tax advice — see the module
+   docstring for exact scope limits (no short/long-term rate handling, no
+   state tax rules, "substantially identical" approximated as same
+   symbol).
+5. **Alternative data feeds** (`alternativeDataFeedAggregator.py`) — real
+   pooled-count sentiment aggregation (reusing §7's
+   `illustrativeSentimentTradingHook.calculateIllustrativeLexiconSentimentScore`
+   per snippet, then pooling positive/negative counts across all snippets
+   before scoring) over a small illustrative news/social snippet fixture
+   set, plus real z-score outlier detection (population-stddev
+   convention, same as `riskStatistics.py`) over illustrative multi-period
+   filing metrics (e.g. debt-to-equity). Genuinely wired into the §7 NLP
+   module: `buildIntegratedAlternativeDataSignal` concatenates the
+   aggregated snippets and feeds that text directly into §7's real
+   `generateOrderHookSuggestion` (same kill-switch-off-by-default safety
+   gate) — pytest proves the aggregated data actually flows through into
+   a real BUY/SELL/HOLD suggestion, not a disconnected parallel pipeline.
+6. **Factor-based P&L attribution** (`factorBasedPnlAttributionEngine.py`)
+   — the real, classic Brinson-Hood-Beebower three-term decomposition
+   (allocation + selection + interaction effects per sector) plus a
+   separate currency-overlay effect for multi-currency portfolios. Tested
+   against a fully hand-worked two-sector example with pre-computed
+   expected values for every effect, AND a property-style check that the
+   allocation+selection+interaction identity exactly reconstructs total
+   active return for arbitrary multi-sector input.
+7. **Custom index construction + backtesting**
+   (`customIndexConstructionBacktester.py`) — real rules-based index
+   construction (top-N by market cap, EQUAL_WEIGHT or CAP_WEIGHT, a
+   configurable rebalance frequency) over an illustrative six-symbol
+   constituent universe with deterministic synthetic price/shares-
+   outstanding history, producing a real computed index level path
+   (buy-and-hold share counts between rebalances, weights drift with
+   price exactly like a real index fund). Backtested performance stats
+   (CAGR via the standard compound formula; annualized Sharpe ratio and
+   max drawdown REUSING `riskStatistics.py`) are computed directly from
+   that actual constructed price path, not fabricated. "Licensable to
+   other institutions" (the FEATURES.md item's product framing) has no
+   technical licensing/entitlement system here — that's a commercial
+   concern outside this module's scope; what's built is the real
+   construction-and-backtest engine such a product would sit on top of.
+
 ## Important constraint
 
 This is explicitly a **research-tier** module (ARCHITECTURE.md §8): fine
@@ -978,5 +1088,52 @@ curl -X POST http://127.0.0.1:8085/options/corporate-action/early-exercise-risk 
   "symbol": "DEMO-EQ", "strikePrice": 100.0, "quantity": 1.0,
   "exerciseStyle": "AMERICAN", "contractSide": "CALL",
   "underlyingSpotPrice": 110.0, "callMarketPrice": 10.5, "dividendAmount": 1.0
+}'
+
+# FEATURES.md §16 ("AI, Data & Research") — screener, research copilot,
+# portfolio health check, tax-loss harvesting, alternative data, P&L
+# attribution, and custom index construction (see the "§16" section above
+# for exactly what's real vs. illustrative in each).
+curl -X POST http://127.0.0.1:8085/screener/run -d '{
+  "filterExpression": {"logic": "AND", "conditions": [
+    {"field": "priceToEarningsRatio", "operator": "<", "value": 20.0},
+    {"field": "dividendYieldPercent", "operator": ">=", "value": 4.0}
+  ]}
+}'
+curl -X POST http://127.0.0.1:8085/screener/saved-screens/save -d '{
+  "screenName": "cheap-div", "filterExpression": {"field": "dividendYieldPercent", "operator": ">=", "value": 4.0}
+}'
+curl -X POST http://127.0.0.1:8085/screener/saved-screens/list -d '{}'
+curl -X POST http://127.0.0.1:8085/research/copilot/ask -d '{"query": "revenue growth", "topK": 2}'
+curl -X POST http://127.0.0.1:8085/portfolio/health-check -d '{
+  "holdings": [
+    {"symbol": "MEGA", "sector": "TECH", "portfolioWeight": 0.85},
+    {"symbol": "SMALL1", "sector": "FINANCIALS", "portfolioWeight": 0.10},
+    {"symbol": "SMALL2", "sector": "FINANCIALS", "portfolioWeight": 0.05}
+  ]
+}'
+curl -X POST http://127.0.0.1:8085/tax/loss-harvesting-plan -d '{
+  "lots": [
+    {"lotId": "L1", "symbol": "SIM-AAPL", "quantity": 10, "buyPricePerShare": 200.0, "buyDate": "2024-01-01", "currentPricePerShare": 100.0},
+    {"lotId": "L2", "symbol": "SIM-AAPL", "quantity": 5, "buyPricePerShare": 105.0, "buyDate": "2026-06-20", "currentPricePerShare": 110.0}
+  ],
+  "realizedGainsYtd": 2000.0,
+  "proposedSaleDate": "2026-06-15"
+}'
+curl -X POST http://127.0.0.1:8085/alternative-data/sentiment-signal -d '{
+  "snippets": [{"source": "NEWSWIRE-A", "text": "strong revenue growth and record profit"}],
+  "killSwitchEnabled": true
+}'
+curl -X POST http://127.0.0.1:8085/alternative-data/filing-anomaly -d '{
+  "metrics": {"debtToEquityRatio": {"historicalValues": [0.4, 0.42, 0.39, 0.41, 0.40, 0.43], "currentValue": 0.95}}
+}'
+curl -X POST http://127.0.0.1:8085/pnl-attribution/brinson -d '{
+  "sectors": [
+    {"sectorName": "TECH", "portfolioWeight": 0.6, "portfolioLocalReturn": 0.10, "benchmarkWeight": 0.5, "benchmarkLocalReturn": 0.08},
+    {"sectorName": "FINANCIALS", "portfolioWeight": 0.4, "portfolioLocalReturn": 0.03, "benchmarkWeight": 0.5, "benchmarkLocalReturn": 0.05}
+  ]
+}'
+curl -X POST http://127.0.0.1:8085/index/construct-and-backtest -d '{
+  "constituentCount": 3, "weightingScheme": "CAP_WEIGHT", "rebalanceFrequencyInBars": 20
 }'
 ```

@@ -25,6 +25,9 @@
 import { useEffect, useState } from "react";
 import Link from "next/link";
 import NotificationCenterSection from "./notificationCenter/notificationCenterSection";
+import LanguageSwitcher from "./localization/languageSwitcher";
+import { useLocalization } from "./localization/localizationContext";
+import HomeScreenLivePnlWidget from "./homeScreenLivePnlWidget";
 
 const omsGatewayBaseUrl = process.env.NEXT_PUBLIC_OMS_GATEWAY_BASE_URL ?? "http://localhost:8081";
 const marketDataBaseUrl = process.env.NEXT_PUBLIC_MARKET_DATA_BASE_URL ?? "http://localhost:9103";
@@ -68,23 +71,37 @@ function generateIdempotencyKey(): string {
 }
 
 export default function RetailTradingDashboardPage() {
+  const { translate } = useLocalization();
   return (
     <main className="mx-auto flex max-w-2xl flex-col gap-10 p-8 font-sans">
       <div>
-        <h1 className="text-xl font-semibold">Mercurius (skeleton dashboard)</h1>
+        <div className="flex items-start justify-between gap-4">
+          <h1 className="text-xl font-semibold">{translate("dashboard.title", "Mercurius (skeleton dashboard)")}</h1>
+          <LanguageSwitcher />
+        </div>
         <p className="text-sm text-neutral-500">
           Talks directly to oms-gateway&apos;s real endpoints — see FEATURES.md §11 for the full retail app scope.
         </p>
-        <nav className="mt-2 flex gap-4 text-sm underline">
+        <nav className="mt-2 flex flex-wrap gap-4 text-sm underline">
+          <Link href="/watchlist">Watchlist (cross-device sync)</Link>
           <Link href="/optionsChain">Options chain</Link>
           <Link href="/strategies">Follow strategies</Link>
           <Link href="/volumeProfile">Volume Profile / TPO</Link>
           <Link href="/orderFlowFootprint">Order-flow footprint</Link>
           <Link href="/domReplay">Historical DOM replay</Link>
+          <Link href="/support">Support tickets</Link>
+          <Link href="/corporateActions">Corporate actions</Link>
+          <Link href="/referrals">Referrals</Link>
+          <Link href="/screener">Screener</Link>
+          <Link href="/researchCopilot">Research copilot</Link>
+          <Link href="/portfolioHealth">Portfolio health</Link>
+          <Link href="/taxLossHarvesting">Tax-loss harvesting</Link>
+          <Link href="/quantResearchTools">Alt-data / P&amp;L / index builder</Link>
         </nav>
       </div>
 
       <AccountSection />
+      <HomeScreenLivePnlWidget />
       <OrderTicketSection />
       <PriceChartSection />
       <MarketSessionSection />
@@ -245,6 +262,7 @@ function AccountSection() {
 // ---------------------------------------------------------------------
 
 function OrderTicketSection() {
+  const { translate } = useLocalization();
   const [clientAccountIdentifier, setClientAccountIdentifier] = useState("acct-001");
   const [instrumentSymbol, setInstrumentSymbol] = useState("DEMO-EQ");
   const [orderSideIsBuyNotSell, setOrderSideIsBuyNotSell] = useState(true);
@@ -328,7 +346,7 @@ function OrderTicketSection() {
 
   return (
     <section className="flex flex-col gap-4">
-      <h2 className="text-lg font-medium">Order ticket</h2>
+      <h2 className="text-lg font-medium">{translate("orderTicket.heading", "Order ticket")}</h2>
 
       <form onSubmit={handleOrderTicketSubmit} className="flex flex-col gap-4">
         <LabeledTextField
@@ -337,7 +355,7 @@ function OrderTicketSection() {
           onFieldValueChange={setClientAccountIdentifier}
         />
         <LabeledTextField
-          labelText="Instrument symbol"
+          labelText={translate("orderTicket.instrumentSymbol.label", "Instrument symbol")}
           fieldValue={instrumentSymbol}
           onFieldValueChange={setInstrumentSymbol}
         />
@@ -348,7 +366,7 @@ function OrderTicketSection() {
             checked={orderSideIsBuyNotSell}
             onChange={(changeEvent) => setOrderSideIsBuyNotSell(changeEvent.target.checked)}
           />
-          Buy (unchecked = sell)
+          {translate("orderTicket.buySellToggle.label", "Buy (unchecked = sell)")}
         </label>
 
         <label className="flex flex-col gap-1 text-sm">
@@ -358,10 +376,10 @@ function OrderTicketSection() {
             value={orderTypeSelection}
             onChange={(changeEvent) => setOrderTypeSelection(changeEvent.target.value as typeof orderTypeSelection)}
           >
-            <option value="LIMIT">Limit</option>
-            <option value="MARKET">Market</option>
-            <option value="SL">Stop-loss, limit (SL)</option>
-            <option value="SL_M">Stop-loss, market (SL-M)</option>
+            <option value="LIMIT">{translate("orderTicket.orderType.limit", "Limit")}</option>
+            <option value="MARKET">{translate("orderTicket.orderType.market", "Market")}</option>
+            <option value="SL">{translate("orderTicket.orderType.stopLossLimit", "Stop-loss, limit (SL)")}</option>
+            <option value="SL_M">{translate("orderTicket.orderType.stopLossMarket", "Stop-loss, market (SL-M)")}</option>
           </select>
         </label>
 
@@ -378,7 +396,11 @@ function OrderTicketSection() {
             onFieldValueChange={setStopTriggerPriceInMinorUnits}
           />
         )}
-        <LabeledNumberField labelText="Quantity" fieldValue={orderQuantity} onFieldValueChange={setOrderQuantity} />
+        <LabeledNumberField
+          labelText={translate("orderTicket.quantity.label", "Quantity")}
+          fieldValue={orderQuantity}
+          onFieldValueChange={setOrderQuantity}
+        />
 
         <label className="flex items-center gap-2 text-sm">
           <input
@@ -427,7 +449,11 @@ function OrderTicketSection() {
           disabled={isSubmittingOrder}
           className="rounded bg-black px-4 py-2 text-white disabled:opacity-50"
         >
-          {isSubmittingOrder ? "Submitting…" : isCoverOrder ? "Submit cover order" : "Submit order"}
+          {isSubmittingOrder
+            ? translate("orderTicket.submit.inProgress", "Submitting…")
+            : isCoverOrder
+              ? translate("orderTicket.submit.coverOrder", "Submit cover order")
+              : translate("orderTicket.submit.default", "Submit order")}
         </button>
       </form>
 
@@ -540,6 +566,7 @@ type TradeTick = {
 const CHART_POLL_INTERVAL_MILLISECONDS = 5_000;
 
 function PriceChartSection() {
+  const { translate } = useLocalization();
   const [instrumentSymbol, setInstrumentSymbol] = useState("DEMO-EQ");
   const [candles, setCandles] = useState<CandleBar[]>([]);
   const [mostRecentTrade, setMostRecentTrade] = useState<TradeTick | null>(null);
@@ -590,7 +617,7 @@ function PriceChartSection() {
 
   return (
     <section className="flex flex-col gap-3 rounded border border-neutral-200 p-4">
-      <h2 className="text-lg font-medium">Price chart (1m candles)</h2>
+      <h2 className="text-lg font-medium">{translate("dashboard.priceChart.heading", "Price chart (1m candles)")}</h2>
       <div className="flex items-end gap-3">
         <LabeledTextField labelText="Instrument" fieldValue={instrumentSymbol} onFieldValueChange={setInstrumentSymbol} />
         <button className="rounded border px-3 py-2 text-sm" onClick={refreshChartData} type="button">
@@ -625,6 +652,7 @@ function PriceChartSection() {
 
 function CandlestickChart(props: { candles: CandleBar[] }) {
   const { candles } = props;
+  const { translate } = useLocalization();
 
   const chartWidth = 640;
   const chartHeight = 200;
@@ -646,7 +674,7 @@ function CandlestickChart(props: { candles: CandleBar[] }) {
       viewBox={`0 0 ${chartWidth} ${chartHeight}`}
       className="w-full rounded border border-neutral-100 bg-white"
       role="img"
-      aria-label="OHLC candlestick chart"
+      aria-label={translate("dashboard.candlestickChart.ariaLabel", "OHLC candlestick chart")}
     >
       {candles.map((candle, candleIndex) => {
         const isBullish = candle.closePriceInMinorUnits >= candle.openPriceInMinorUnits;
@@ -686,6 +714,7 @@ function CandlestickChart(props: { candles: CandleBar[] }) {
 // ---------------------------------------------------------------------
 
 function MarketSessionSection() {
+  const { translate } = useLocalization();
   const [isMarketOpen, setIsMarketOpen] = useState<boolean | null>(null);
   const [queuedAfterMarketOrders, setQueuedAfterMarketOrders] = useState<number | null>(null);
   const [statusErrorMessage, setStatusErrorMessage] = useState<string | null>(null);
@@ -714,7 +743,7 @@ function MarketSessionSection() {
 
   return (
     <section className="flex flex-col gap-3 rounded border border-neutral-200 p-4">
-      <h2 className="text-lg font-medium">Market session (admin)</h2>
+      <h2 className="text-lg font-medium">{translate("dashboard.marketSessionAdmin.heading", "Market session (admin)")}</h2>
       <div className="flex items-center gap-3 text-sm">
         <button className="rounded border px-3 py-1" onClick={refreshStatus} type="button">
           Refresh
@@ -744,6 +773,7 @@ function MarketSessionSection() {
 // ---------------------------------------------------------------------
 
 function PositionsSection() {
+  const { translate } = useLocalization();
   const [accountIdentifier, setAccountIdentifier] = useState("acct-001");
   const [netQuantityByInstrumentSymbol, setNetQuantityByInstrumentSymbol] = useState<Record<string, number> | null>(
     null
@@ -765,7 +795,7 @@ function PositionsSection() {
 
   return (
     <section className="flex flex-col gap-3 rounded border border-neutral-200 p-4">
-      <h2 className="text-lg font-medium">Positions</h2>
+      <h2 className="text-lg font-medium">{translate("dashboard.positions.heading", "Positions")}</h2>
       <div className="flex items-end gap-3">
         <LabeledTextField labelText="Account" fieldValue={accountIdentifier} onFieldValueChange={setAccountIdentifier} />
         <button className="rounded border px-3 py-2 text-sm" onClick={fetchPositions} type="button">
@@ -776,7 +806,7 @@ function PositionsSection() {
       {netQuantityByInstrumentSymbol && (
         <ul className="text-sm">
           {Object.keys(netQuantityByInstrumentSymbol).length === 0 ? (
-            <li className="text-neutral-500">No open positions.</li>
+            <li className="text-neutral-500">{translate("dashboard.positions.empty", "No open positions.")}</li>
           ) : (
             Object.entries(netQuantityByInstrumentSymbol).map(([instrumentSymbol, netQuantity]) => (
               <li key={instrumentSymbol}>
@@ -795,6 +825,7 @@ function PositionsSection() {
 // ---------------------------------------------------------------------
 
 function OrderLookupSection() {
+  const { translate } = useLocalization();
   const [instrumentSymbol, setInstrumentSymbol] = useState("DEMO-EQ");
   const [matchingEngineOrderSequenceNumber, setMatchingEngineOrderSequenceNumber] = useState(1);
   const [statusResult, setStatusResult] = useState<Record<string, unknown> | null>(null);
@@ -833,7 +864,7 @@ function OrderLookupSection() {
 
   return (
     <section className="flex flex-col gap-3 rounded border border-neutral-200 p-4">
-      <h2 className="text-lg font-medium">Order status / cancel</h2>
+      <h2 className="text-lg font-medium">{translate("orderStatus.heading", "Order status / cancel")}</h2>
       <div className="flex items-end gap-3">
         <LabeledTextField labelText="Instrument" fieldValue={instrumentSymbol} onFieldValueChange={setInstrumentSymbol} />
         <LabeledNumberField

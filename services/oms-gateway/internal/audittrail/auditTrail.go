@@ -40,6 +40,31 @@ const (
 	// limits — recorded when internal/algolimits rejects an order before
 	// it ever reaches the KYC/freeze/risk gates.
 	EventStrategyLimitRejected EventType = "STRATEGY_LIMIT_REJECTED"
+
+	// EventOrderRoutedToMatchingEngine is appended ONLY once a live
+	// (non-paper) order successfully hands off to matching-engine and is
+	// assigned a MatchingEngineOrderSequenceNumber — i.e. strictly after
+	// the EventOrderSubmitted entry for the same order, which is
+	// appended earlier (right after OMS-side sequencing, before the
+	// matching-engine round trip) and therefore can never itself carry
+	// that sequence number.
+	//
+	// This entry exists SOLELY so internal/tradesurveillance (and any
+	// other future consumer) has a reliable join key: it repeats the
+	// order's shape (side/quantity/price/order-type) already recorded on
+	// EventOrderSubmitted, but this time paired with the
+	// MatchingEngineOrderSequenceNumber that a later EventOrderCancelled/
+	// EventOrderCancelFailed/EventOrderFilled entry for the same order
+	// will also carry — see cmd/server/main.go's buildCancelOrderHandler,
+	// which never learns ClientAccountIdentifier from
+	// orders.CancelOrderRequest and so cannot stamp it directly; this
+	// entry's MatchingEngineOrderSequenceNumber is the only thing that
+	// links a cancellation back to the account/order-shape that placed
+	// it. A paper-trading order never reaches this point (see
+	// EventPaperOrderFilled/EventPaperOrderSimulationFailed) and so never
+	// gets one of these — surveillance is scoped to real, matching-
+	// engine-routed orders only.
+	EventOrderRoutedToMatchingEngine EventType = "ORDER_ROUTED_TO_MATCHING_ENGINE"
 )
 
 // Entry is one immutable audit record. Every field is set at append time
@@ -52,6 +77,49 @@ type Entry struct {
 	InstrumentSymbol                  string    `json:"instrumentSymbol,omitempty"`
 	MatchingEngineOrderSequenceNumber uint64    `json:"matchingEngineOrderSequenceNumber,omitempty"`
 	DetailMessage                     string    `json:"detailMessage,omitempty"`
+
+	// The fields below are ADDITIVE (all omitempty; every pre-existing
+	// caller/entry that never sets them is completely unaffected) and
+	// exist so internal/tradesurveillance can compute real spoofing/
+	// layering/wash-trade heuristics directly off structured audit data
+	// instead of parsing DetailMessage's free-text sentences. Only
+	// EventOrderSubmitted, EventOrderRoutedToMatchingEngine, and
+	// EventOrderFilled entries populate them as of this build — see each
+	// field's own comment for exactly which event types set it.
+
+	// OrderSideIsBuyNotSell mirrors orders.OrderSubmissionRequest's field
+	// of the same name. Set on EventOrderSubmitted and
+	// EventOrderRoutedToMatchingEngine. Pointer so "side unknown/not
+	// applicable" (nil — every event type other than those two, plus
+	// every entry appended before this field existed) is distinguishable
+	// from a genuine sell (false).
+	OrderSideIsBuyNotSell *bool `json:"orderSideIsBuyNotSell,omitempty"`
+
+	// OrderQuantity and LimitPriceInMinorUnits mirror
+	// orders.OrderSubmissionRequest's fields of the same name. Set on
+	// EventOrderSubmitted and EventOrderRoutedToMatchingEngine.
+	// LimitPriceInMinorUnits is 0 (meaningless, same convention as the
+	// request type itself) for a market order — see
+	// OrderIsMarketOrderNotLimit below to tell the two apart.
+	OrderQuantity          uint64 `json:"orderQuantity,omitempty"`
+	LimitPriceInMinorUnits int64  `json:"limitPriceInMinorUnits,omitempty"`
+
+	// OrderIsMarketOrderNotLimit mirrors
+	// orders.OrderSubmissionRequest's field of the same name. Set on
+	// EventOrderSubmitted and EventOrderRoutedToMatchingEngine.
+	OrderIsMarketOrderNotLimit bool `json:"orderIsMarketOrderNotLimit,omitempty"`
+
+	// BuyingClientAccountIdentifier, SellingClientAccountIdentifier,
+	// ExecutedPriceInMinorUnits, and ExecutedQuantity are set only on
+	// EventOrderFilled — the structured equivalent of that event's
+	// existing free-text DetailMessage (kept as-is for backward
+	// compatibility/human readability). A wash-trade check needs these
+	// two account fields on the SAME entry to detect one account on both
+	// sides of one trade without any text parsing.
+	BuyingClientAccountIdentifier  string `json:"buyingClientAccountIdentifier,omitempty"`
+	SellingClientAccountIdentifier string `json:"sellingClientAccountIdentifier,omitempty"`
+	ExecutedPriceInMinorUnits      int64  `json:"executedPriceInMinorUnits,omitempty"`
+	ExecutedQuantity               uint64 `json:"executedQuantity,omitempty"`
 }
 
 // AuditTrail is an append-only, in-memory log. "Immutable" here means:

@@ -27,6 +27,7 @@ mod ingestionWireProtocol;
 mod l1QuotePublisher;
 mod l1QuoteWebSocketServer;
 mod l1QuoteWireProtocol;
+mod livePnlWidget;
 mod marketDataEventTypes;
 mod orderFlowFootprintAggregator;
 mod pricealerts;
@@ -91,12 +92,18 @@ fn main() {
         "MARKET_DATA_UDP_MULTICAST_GROUP_ADDRESS",
         udpMulticastPublisher::DEFAULT_MULTICAST_GROUP_ADDRESS,
     );
+    // Where `GET /pnl/live` (livePnlWidget.rs) reads oms-gateway's real,
+    // read-only mark-to-market cost-basis data from — FEATURES.md §21's
+    // home-screen live P&L widget.
+    let omsGatewayHttpAddress = readStringEnvVar("MARKET_DATA_OMS_GATEWAY_HTTP_ADDRESS", "127.0.0.1:8081");
 
     println!(
         "market-data listening on {MARKET_DATA_INGESTION_TCP_LISTEN_ADDRESS} for depth publishes from matching-engine"
     );
 
-    let sharedState = Arc::new(SharedMarketDataState::newEmptyState());
+    let sharedState = Arc::new(SharedMarketDataState::newEmptyStateWithOmsGatewayAddress(
+        &omsGatewayHttpAddress,
+    ));
 
     // The HTTP query server runs on its own thread — it only ever touches
     // sharedState behind its own internal mutexes, so it can't violate

@@ -1729,9 +1729,13 @@ section.
   reproduced identically on a repeat query.
 
 - **Corporate-action explainer** (`internal/corporateactionexplainer`,
-  FEATURES.md §21 — explicitly NOT §14 corporate-actions processing,
-  which does not exist anywhere in this codebase and remains out of
-  scope): given a (today always manual/synthetic, since there's no real
+  FEATURES.md §21 — explicitly NOT §14 corporate-actions processing;
+  **update from a later build**: §14 corporate-actions processing DOES
+  now exist, in `internal/corporateactionsprocessing` — see that
+  package's own section further below. This explainer package is
+  unchanged and still does exactly what this paragraph originally
+  described: narrate a caller-supplied outcome, never compute one):
+  given a (today always manual/synthetic, since there's no real
   corporate-actions feed — loudly documented) quantity/average-price
   adjustment event on a position, generates a real, accurate,
   human-readable one-line explanation reflecting the ACTUAL supplied
@@ -1841,4 +1845,107 @@ curl -X POST localhost:8081/positions/corporate-action-adjustments/apply -d '{
   "averagePriceBeforeInMinorUnits":20000,"averagePriceAfterInMinorUnits":10000
 }'
 curl "localhost:8081/positions/corporate-action-adjustments?accountId=acct-001"
+```
+
+## Real FEATURES.md §14 corporate actions processing (`internal/corporateactionsprocessing`)
+
+The REAL implementation the item above's explainer explicitly punted
+on: given a real corporate-action input (a split ratio, a bonus ratio, a
+merger exchange ratio, or a cash-dividend-per-share amount), this
+package COMPUTES the correct new quantity and total cost basis itself
+using real accounting rules, rather than narrating a caller-supplied
+outcome. 13 tests in `internal/corporateactionsprocessing`, asserting
+exact post-action position/cost-basis numbers (not just "it changed").
+
+Accounting rules implemented, all with `HoldingsBook`'s own cost-basis-
+aware store (`positions.PositionBook` has no cost-basis field at all —
+see that package's doc — so this feature owns its own `Holding{
+QuantityHeld, TotalCostBasisInMinorUnits }` store, syncing quantity into
+`positions.PositionBook.SetPositionDirectly` after every mutation so
+ordinary `GET /positions` immediately reflects it):
+
+- **Stock split** (e.g. 2:1): quantity multiplies by the ratio, total
+  cost basis is UNCHANGED. Verified: 10 shares @ ₹10,000.00 total cost
+  basis, 2:1 split -> 20 shares, cost basis still ₹10,000.00, average
+  cost per share exactly halves (₹1,000.00 -> ₹500.00).
+- **Bonus issue** (e.g. 1:1): additional free shares are added
+  (quantity * (1 + ratio)), total cost basis UNCHANGED (the same
+  dilution effect as a split, different issuer mechanism). Verified: 10
+  shares @ ₹10,000.00, 1:1 bonus -> 20 shares, cost basis still
+  ₹10,000.00.
+- **Merger / share exchange** (e.g. 2 old shares -> 1 new share): the
+  quantity converts by the exchange ratio into the acquirer instrument
+  and the ENTIRE prior cost basis carries over unchanged; if the account
+  already independently holds some of the acquirer, the converted
+  position is ADDED onto it (not overwritten), and the old instrument's
+  holding is removed entirely (from both `HoldingsBook` and
+  `positions.PositionBook`, the latter zeroed via `SetPositionDirectly`).
+  A merger ratio that doesn't divide the held quantity evenly is
+  REJECTED (`ErrExchangeRatioProducesFractionalShares`), never silently
+  truncated — fractional-share cash-in-lieu is an honest, documented
+  gap, not implemented.
+- **Cash dividend** (e.g. ₹5.00/share): holding quantity and cost basis
+  are COMPLETELY UNCHANGED. The total dividend
+  (quantity * perShare) is credited to the account's REAL ledger balance
+  via a genuine HTTP call — `ledgerclient.PostDividendCreditJournalEntry`
+  posting a real balanced journal entry to ledger's `/journal-entries`
+  endpoint — never a local bookkeeping fiction. If the ledger call fails,
+  the handler returns `502` (nothing was mutated locally for a dividend
+  to roll back).
+
+Endpoints:
+
+```
+POST /corporate-actions/holdings/seed   {clientAccountIdentifier, instrumentSymbol, quantity, totalCostBasisInMinorUnits}
+GET  /corporate-actions/holdings?accountId=...&instrument=...
+POST /corporate-actions/process         {actionType, clientAccountIdentifier, instrumentSymbol,
+                                          ratioNumerator, ratioDenominator,      // split / bonus / merger
+                                          mergerTargetInstrumentSymbol,          // merger only
+                                          dividendPerShareInMinorUnits}          // cash dividend only
+GET  /corporate-actions/processed-actions?accountId=...
+```
+
+**Verified live** against a real running `ledger` + `oms-gateway`:
+seeded `acct-001` 10 RELIANCE shares @ ₹10,000.00 total cost basis;
+applied a 2:1 split via `POST /corporate-actions/process` and confirmed
+both `GET /corporate-actions/holdings` (20 shares, ₹10,000.00 cost
+basis, ₹500.00 avg) AND `GET /positions` (20 shares) reflected it
+immediately; applied a ₹5.00/share cash dividend on the resulting 20
+shares and confirmed `ledger`'s real `GET /accounts/balance` rose by
+exactly 10,000 minor units (0 -> 10,000) while the holding itself stayed
+completely untouched (still 20 shares, ₹10,000.00 cost basis).
+
+```bash
+# Seed a starting holding
+curl -X POST localhost:8081/corporate-actions/holdings/seed -d '{
+  "clientAccountIdentifier":"acct-001","instrumentSymbol":"RELIANCE",
+  "quantity":10,"totalCostBasisInMinorUnits":1000000
+}'
+
+# Real 2:1 stock split
+curl -X POST localhost:8081/corporate-actions/process -d '{
+  "actionType":"STOCK_SPLIT","clientAccountIdentifier":"acct-001",
+  "instrumentSymbol":"RELIANCE","ratioNumerator":2,"ratioDenominator":1
+}'
+curl "localhost:8081/corporate-actions/holdings?accountId=acct-001&instrument=RELIANCE"
+curl "localhost:8081/positions?accountId=acct-001"
+
+# Real cash dividend -- genuinely credits ledger
+curl -X POST localhost:8081/corporate-actions/process -d '{
+  "actionType":"CASH_DIVIDEND","clientAccountIdentifier":"acct-001",
+  "instrumentSymbol":"RELIANCE","dividendPerShareInMinorUnits":500
+}'
+curl "http://127.0.0.1:8082/accounts/balance?accountId=acct-001"
+
+# Real merger: 2 old shares -> 1 new share, full cost basis carries over
+curl -X POST localhost:8081/corporate-actions/holdings/seed -d '{
+  "clientAccountIdentifier":"acct-001","instrumentSymbol":"OLDCO",
+  "quantity":10,"totalCostBasisInMinorUnits":1000000
+}'
+curl -X POST localhost:8081/corporate-actions/process -d '{
+  "actionType":"MERGER","clientAccountIdentifier":"acct-001",
+  "instrumentSymbol":"OLDCO","mergerTargetInstrumentSymbol":"NEWCO",
+  "ratioNumerator":1,"ratioDenominator":2
+}'
+curl "localhost:8081/corporate-actions/processed-actions?accountId=acct-001"
 ```

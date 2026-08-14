@@ -2,7 +2,7 @@
 
 Tier 1 component — see `ARCHITECTURE.md` §5 in the repo root.
 
-## Status: ingests real depth AND trade-tick publishes from matching-engine (or a deterministic simulated feed, standalone); serves a trade tape, OHLCV candles, a columnar tick store, watchlists, real price alerts, an L1 WS feed, and UDP multicast fan-out
+## Status: ingests real depth AND trade-tick publishes from matching-engine (or a deterministic simulated feed, standalone); serves a trade tape, OHLCV candles, a columnar tick store, watchlists with cross-device sync-freshness, real price alerts, a live P&L aggregation widget, an L1 WS feed, and UDP multicast fan-out
 
 What's real:
 - Sequenced snapshot+delta message contract
@@ -210,6 +210,77 @@ What's real:
   11 unit tests with a hand-worked buy/sell-split fixture (see the
   module's test comments).
 
+- **Cross-device watchlist sync-freshness** (`src/watchlist.rs`,
+  FEATURES.md §21) — the watchlist store was already account-scoped (any
+  session querying the same `accountIdentifier` always saw the same live
+  set), so the genuinely new work here is a real delta-sync mechanism, not
+  just shared storage: every mutation is stamped with a real wall-clock
+  `epochMillis` (millisecond, not second, resolution — deliberately, since
+  two real mutations from two different devices landing in the same
+  wall-clock second is an ordinary case for this feature, and second
+  resolution silently dropped the second of two same-second changes from
+  a since-query during this build's own test development) and appended to
+  a real per-account change log. `GET
+  /watchlist?accountIdentifier=...` now also returns
+  `lastModifiedAtEpochMillis`; `GET
+  /watchlist/changes?accountIdentifier=...&sinceEpochMillis=...` returns
+  only the real changes strictly after that timestamp (a device's own
+  "since I last synced" cursor) instead of the whole watchlist. `POST
+  /watchlist/add`/`/watchlist/remove` also accept an optional
+  `deviceIdentifier` (purely informational, never used for access control
+  — the watchlist stays account-scoped) so a client can prove a change
+  came from a genuinely different device/session. 12 unit tests in
+  `watchlist.rs` plus 5 in `httpQueryServer.rs` exercising the full HTTP
+  round trip, including a real two-"device"-query-context scenario and a
+  real delta-since-timestamp scenario. **Verified live**: added a symbol
+  tagged `device-phone`, read it back via a separate plain `GET` (standing
+  in for a second device), then added a second symbol tagged
+  `device-desktop` and confirmed `GET /watchlist/changes?sinceEpochMillis=...`
+  returned exactly that one new change and nothing older.
+- **Home-screen live P&L widget** (`src/livePnlWidget.rs`, FEATURES.md
+  §21) — `GET /pnl/live?accountIdentifier=...` computes a real aggregated
+  unrealized P&L per account by joining two genuinely different real data
+  sources: average cost basis + net quantity per position from
+  oms-gateway's real mark-to-market engine
+  (`services/oms-gateway/internal/marktomarket`, built from real fills)
+  over a real, READ-ONLY HTTP call to `GET
+  /mark-to-market?accountId=...`, combined with the CURRENT MARKET PRICE
+  from market-data's OWN real trade-tick store (the most recent trade for
+  that instrument) — deliberately not oms-gateway's own
+  `currentMarketPriceInMinorUnits`, which only reflects whatever price (if
+  any) was last manually pushed to oms-gateway. `unrealizedPnL =
+  netQuantity * (marketDataLivePrice - omsGatewayAverageEntryPrice)`,
+  summed into a real per-account total. 8 unit/integration tests in
+  `livePnlWidget.rs` (including a real local `TcpListener` standing in for
+  oms-gateway to prove the HTTP fetch itself, not just the pure
+  computation) plus 3 in `httpQueryServer.rs`. **Verified live** against
+  the real running `oms-gateway` + `matching-engine` + `market-data`
+  binaries: submitted a real crossing trade at price 100.00 (`10000` minor
+  units) establishing real cost basis in oms-gateway, pledged the holding
+  to make the account "leveraged" (see limitation below), then confirmed
+  `GET /pnl/live` computed `netQuantity * (marketDataOwnLivePrice -
+  omsGatewayAverageEntryPrice)` correctly from the real numbers on both
+  sides — not hardcoded, not a passthrough of either upstream's own P&L
+  figure.
+  - **KNOWN LIMITATION, discovered live and documented honestly**:
+    oms-gateway's `GET /mark-to-market` only returns position data for
+    accounts it considers "leveraged" (outstanding margin-funding
+    principal, or any pledged holding — a gate inside oms-gateway's own
+    HTTP handler, not its underlying engine). A SECOND, separate gate was
+    found during live verification: oms-gateway's mark-to-market engine
+    also withholds a position from that response entirely until SOME
+    price has been pushed to it via `POST /mark-to-market/price` for that
+    instrument (`internal/marktomarket`'s own doc: "a live position with
+    no pushed market price yet simply won't appear in `GET
+    /mark-to-market` until one is") — even though the real cost basis
+    already exists internally from the real fill. This module never
+    writes to oms-gateway (read-only per this build's scope), so it
+    cannot lift either gate; a real build would need oms-gateway to add a
+    genuine "give me cost basis for ANY account, gated or not, primed or
+    not" endpoint. Until then, this widget honestly reports an empty
+    position list / zero P&L for an account that hasn't cleared both of
+    oms-gateway's gates, rather than fabricating a number.
+
 What's a placeholder:
 - Fan-out (both the depth-delta println sink AND the L1 WS feed) is
   still in-process — a real `tokio::sync::broadcast` channel inside one
@@ -273,8 +344,26 @@ What's a placeholder:
 - Watchlists/alerts: in-memory only, no auth, no "technical" triggers
   (moving averages, RSI, etc. — only a plain price threshold), no push
   notification (a client has to poll `GET /alerts` to discover a fired
-  one), a fired alert never re-arms, and `apps/web` has no UI for any of
-  this yet (curl-verified only)
+  one), a fired alert never re-arms. `apps/web`'s `/watchlist` page
+  (`homeScreenLivePnlWidget.tsx` on the dashboard for the P&L side) gives
+  watchlists a real UI now; price alerts still have none (curl-verified
+  only).
+- Cross-device sync: still poll-based on both sides — market-data has no
+  WS/push channel for watchlist changes (a client has to call `GET
+  /watchlist/changes` itself; nothing notifies it a change happened), and
+  `apps/web`'s watchlist page polls the full list on an interval in
+  addition to exercising the real delta endpoint. The change log is
+  unbounded (grows forever, never compacted, never persisted — a restart
+  loses it and every symbol on every watchlist).
+- Live P&L widget: a single blocking synchronous HTTP round-trip to
+  oms-gateway per request — fine for an on-demand refresh or a several-
+  second poll (`apps/web`'s widget polls every 7s), not something to
+  hammer on a tight interval. No caching, no retry/backoff on a transient
+  oms-gateway connection failure (surfaced to the caller as a plain 502
+  instead). See the two-gates limitation written up above for why an
+  ordinary (non-leveraged, or never-price-pushed) account's real
+  positions may not appear even though this module has no bug — the gate
+  is entirely upstream, in oms-gateway.
 
 ## Run it
 
@@ -300,7 +389,9 @@ sequence. Everything downstream works exactly as it does off a real
 matching-engine feed: `GET /candles`, `GET /trades`, `GET /ticks/range`,
 the L1 WS feed, and UDP multicast fan-out all populate from it. Other
 env vars: `MARKET_DATA_UDP_MULTICAST_ENABLED` (default `true`),
-`MARKET_DATA_UDP_MULTICAST_GROUP_ADDRESS` (default `239.1.1.1:9105`).
+`MARKET_DATA_UDP_MULTICAST_GROUP_ADDRESS` (default `239.1.1.1:9105`),
+`MARKET_DATA_OMS_GATEWAY_HTTP_ADDRESS` (default `127.0.0.1:8081` — where
+`GET /pnl/live` fetches oms-gateway's real cost-basis data from).
 
 To see it receive real data instead, start `matching-engine` too and
 submit an order through `oms-gateway` (or directly over TCP to
@@ -368,9 +459,15 @@ curl "http://127.0.0.1:9103/orderFlowFootprint?instrumentSymbol=DEMO-EQ&priceBuc
 # the deterministic replay machinery it reuses both live there. See that
 # service's README for why and for curl examples.
 
-# watchlist
-curl -X POST localhost:9103/watchlist/add -d '{"accountIdentifier":"acct-001","instrumentSymbol":"DEMO-EQ"}'
+# watchlist — deviceIdentifier is optional and purely informational
+curl -X POST localhost:9103/watchlist/add -d '{"accountIdentifier":"acct-001","instrumentSymbol":"DEMO-EQ","deviceIdentifier":"device-phone"}'
 curl "localhost:9103/watchlist?accountIdentifier=acct-001"
+# -> {"accountIdentifier":"acct-001","symbols":["DEMO-EQ"],"lastModifiedAtEpochMillis":...}
+
+# cross-device sync-freshness: only what changed after a given timestamp
+# (FEATURES.md §21) — pass the lastModifiedAtEpochMillis from a prior
+# fetch as sinceEpochMillis to get just the real delta since then
+curl "localhost:9103/watchlist/changes?accountIdentifier=acct-001&sinceEpochMillis=0"
 
 # price alert — fires the next time a real trade prints at/above 100
 curl -X POST localhost:9103/alerts/create -d '{
@@ -380,4 +477,13 @@ curl -X POST localhost:9103/alerts/create -d '{
   "thresholdPriceInMinorUnits": 100
 }'
 curl "localhost:9103/alerts?accountIdentifier=acct-001"
+
+# home-screen live P&L widget (FEATURES.md §21) — real, read-only fetch
+# of oms-gateway's cost basis (GET /mark-to-market on 127.0.0.1:8081,
+# overridable via MARKET_DATA_OMS_GATEWAY_HTTP_ADDRESS) combined with
+# market-data's OWN live trade price. See the "KNOWN LIMITATION" note
+# above this section: oms-gateway only reports cost basis for a
+# "leveraged" account with at least one price already pushed to it via
+# POST /mark-to-market/price.
+curl "localhost:9103/pnl/live?accountIdentifier=acct-001"
 ```

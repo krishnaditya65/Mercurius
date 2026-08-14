@@ -169,13 +169,13 @@ onto an internal one later is expensive.
 
 ## 10. The Terminal (Pro Desktop)
 
-- [ ] `[P2]` GoldenLayout-based tiling workspace, saved layouts per user
-- [ ] `[P2]` Command bar / hotkey system (`AAPL DES <GO>` style)
-- [ ] `[P2]` WebGL/Canvas candlestick charts with indicator overlays (MACD, RSI, BB, Fib)
-- [ ] `[P2]` DOM ladder widget with click-to-trade
-- [ ] `[P3]` Multi-monitor window detachment (Tauri native windows)
-- [ ] `[P3]` Local Python hook sandbox for algo traders (isolated subprocess, resource-capped)
-- [ ] `[P3]` News/sentiment ticker widget
+- [ ] 🚧 `[P2]` GoldenLayout-based tiling workspace, saved layouts per user
+- [ ] 🚧 `[P2]` Command bar / hotkey system (`AAPL DES <GO>` style)
+- [ ] 🚧 `[P2]` WebGL/Canvas candlestick charts with indicator overlays (MACD, RSI, BB, Fib)
+- [ ] 🚧 `[P2]` DOM ladder widget with click-to-trade
+- [ ] 🚧 `[P3]` Multi-monitor window detachment (Tauri native windows)
+- [ ] 🚧 `[P3]` Local Python hook sandbox for algo traders (isolated subprocess, resource-capped)
+- [ ] 🚧 `[P3]` News/sentiment ticker widget
 
 ## 11. Retail Web/Mobile App
 
@@ -209,13 +209,13 @@ onto an internal one later is expensive.
 
 ## 14. Customer Support & Ops Tooling
 
-- [ ] `[P1]` In-app support chat / ticketing integration
+- [ ] 🚧 `[P1]` In-app support chat / ticketing integration
 - [ ] 🚧 `[P1]` Admin/backoffice panel: KYC review queue, manual order intervention,
       account freeze/unfreeze
-- [ ] `[P2]` Corporate actions processing: dividends, splits, bonuses, mergers
+- [ ] 🚧 `[P2]` Corporate actions processing: dividends, splits, bonuses, mergers
       reflected automatically in holdings and cost basis
-- [ ] `[P2]` Referral & rewards program
-- [ ] `[P3]` Multi-language/localization support for the retail app
+- [ ] 🚧 `[P2]` Referral & rewards program
+- [ ] 🚧 `[P3]` Multi-language/localization support for the retail app
 
 ## 15. Advanced Execution & Trading Sophistication
 
@@ -238,19 +238,19 @@ onto an internal one later is expensive.
 
 ## 16. AI, Data & Research
 
-- [ ] `[P2]` Stock/fund screener with custom filter builder (fundamental +
+- [ ] 🚧 `[P2]` Stock/fund screener with custom filter builder (fundamental +
       technical criteria, saved screens)
-- [ ] `[P3]` AI research copilot: RAG over filings/earnings calls/annual
+- [ ] 🚧 `[P3]` AI research copilot: RAG over filings/earnings calls/annual
       reports, cites sources, clearly labeled as non-advisory
-- [ ] `[P3]` Portfolio health check / diversification analysis (sector,
+- [ ] 🚧 `[P3]` Portfolio health check / diversification analysis (sector,
       factor, concentration risk) with plain-language nudges
-- [ ] `[P3]` Tax-loss harvesting suggestions (identify unrealized losses to
+- [ ] 🚧 `[P3]` Tax-loss harvesting suggestions (identify unrealized losses to
       offset realized gains, respecting wash-sale-equivalent rules)
-- [ ] `[P4]` Alternative data feeds (sentiment aggregation, filing-anomaly
+- [ ] 🚧 `[P4]` Alternative data feeds (sentiment aggregation, filing-anomaly
       detection) feeding into the NLP trading module from §7
-- [ ] `[P4]` Factor-based P&L attribution (how much of return is sector beta
+- [ ] 🚧 `[P4]` Factor-based P&L attribution (how much of return is sector beta
       vs. stock selection vs. currency)
-- [ ] `[P4]` Custom index construction + backtested historical performance,
+- [ ] 🚧 `[P4]` Custom index construction + backtested historical performance,
       licensable to other institutions
 
 ## 17. Wealth & Product Breadth

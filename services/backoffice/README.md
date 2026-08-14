@@ -2,7 +2,7 @@
 
 See `FEATURES.md` §14 in the repo root for the full intended scope.
 
-## Status: account freeze/unfreeze is real (oms-gateway genuinely gates on it); strategy leaderboard, family account access, and nominee succession are also real
+## Status: account freeze/unfreeze is real (oms-gateway genuinely gates on it); strategy leaderboard, family account access, and nominee succession are also real; support ticketing, referral rewards, and the localization catalog are also real (this build)
 
 What's real:
 - `internal/accountcontrol`: `FreezeAccount`/`UnfreezeAccount`/
@@ -185,4 +185,147 @@ curl "localhost:8084/nominee-succession/status?accountId=acct-owner"
 curl "localhost:8084/nominee-succession/audit-trail?accountId=acct-owner"
 
 go test ./... -race
+```
+
+## In-app support chat / ticketing (`internal/supportticketing`) — FEATURES.md §14, item 1
+
+Real ticket creation, a real enforced status lifecycle
+(`open -> in-progress -> resolved -> closed`, with `resolved` able to
+fall back to `in-progress` — either because the customer follows up
+with another message, which does this automatically, or because an
+agent explicitly reopens it), real per-ticket message threads
+(customer messages AND agent replies, both attributed and timestamped),
+real agent assignment (explicit, or automatic on first reply — a
+team-inbox model), and real query paths for account holders ("my
+tickets") and support staff ("my queue" / unassigned triage queue /
+everything). 11 tests in `internal/supportticketing`.
+
+Honest gaps: in-memory (a restart loses every ticket), no auth/RBAC
+(same documented gap as every other backoffice endpoint), no real-time
+push (a client polls `GET /support/tickets/thread`), no attachments.
+
+```bash
+# Customer opens a ticket (seeds the thread with their own first message)
+curl -X POST localhost:8084/support/tickets/create -d '{
+  "accountIdentifier": "acct-001", "subject": "Withdrawal stuck",
+  "initialMessageBody": "My withdrawal has not landed in 2 days."
+}'
+
+# Agent replies -- auto-assigns them and moves the ticket to in-progress
+curl -X POST localhost:8084/support/tickets/agent-reply -d '{
+  "ticketIdentifier": "ticket-000001", "agentIdentifier": "agent-priya",
+  "messageBody": "Checking this now."
+}'
+
+# Customer follows up (reopens a resolved ticket automatically, if it was resolved)
+curl -X POST localhost:8084/support/tickets/customer-message -d '{
+  "ticketIdentifier": "ticket-000001", "accountIdentifier": "acct-001",
+  "messageBody": "Still not resolved."
+}'
+
+curl -X POST localhost:8084/support/tickets/status -d '{
+  "ticketIdentifier": "ticket-000001", "newStatus": "resolved"
+}'
+
+curl "localhost:8084/support/tickets/thread?ticketId=ticket-000001"
+curl "localhost:8084/support/tickets/by-account?accountId=acct-001"
+curl "localhost:8084/support/tickets/by-agent?agentId=agent-priya"
+curl "localhost:8084/support/tickets/queue"          # unassigned open tickets
+curl "localhost:8084/support/tickets/queue?all=true"  # every ticket
+```
+
+## Referral & rewards program (`internal/referralrewards`, `internal/ledgerclient`) — FEATURES.md §14, item 3
+
+A real, stable referral code per account (`POST
+/referral-rewards/generate-code`, idempotent — same code every time),
+real referral tracking (`POST /referral-rewards/record-referral`,
+rejects an unknown code, self-referral, and re-referring an
+already-referred account), and a real cash reward genuinely credited
+via ledger's actual `/journal-entries` HTTP API
+(`internal/ledgerclient`, a small backoffice-local client, mirroring
+oms-gateway's own `ledgerclient.PostDividendCreditJournalEntry`'s
+debit/credit assignment) — never a local bookkeeping fiction.
+
+**The qualifying event is the referred account's first completed real
+trade** — concretely, `POST /referral-rewards/check-and-qualify` calls
+the real `omsGatewayClient.FetchPositions` (the same client method
+`buildFamilyAccessPositionsHandler` already uses) and checks whether the
+referred account's position book is non-empty. If it is, the referrer
+is credited `StandardReferralRewardInMinorUnits` (₹100.00) and the link
+is marked `rewarded` — a one-way, idempotent transition (`MarkRewarded`
+rejects a second call for the same account), so re-triggering the check
+after a reward already fired is a safe no-op, verified with a real
+running ledger (see below). 9 tests in `internal/referralrewards`, 2 in
+`internal/ledgerclient`.
+
+Why "first trade" and not "KYC + funding": backoffice has no ready HTTP
+client into kyc-onboarding today (only `omsgatewayclient` exists), and
+a real, already-wired signal beats inventing a second fake one.
+
+Honest gaps: in-memory; no auth/RBAC; the check is pull-based (a caller
+has to invoke `check-and-qualify` — there's no push/webhook from
+oms-gateway when a first trade actually happens); referral codes are
+short and human-shareable, not cryptographically unguessable (bounded
+abuse surface — see the package doc).
+
+**Verified live** against a real running ledger + oms-gateway: generated
+a code for `acct-001`, referred `acct-002`, confirmed `check-and-qualify`
+reported `qualified: false` while `acct-002` had no position, seeded
+`acct-002` a real position, re-ran `check-and-qualify`, confirmed it
+reported `qualified: true` AND `acct-001`'s real ledger balance rose by
+exactly 10,000 minor units (10,000 -> 20,000 minor units in this run,
+since `acct-001` had already received a 10,000-minor-unit dividend
+credit earlier in the same session — see the corporate-actions section
+of `oms-gateway`'s README), then re-ran `check-and-qualify` a third time
+and confirmed the balance did NOT rise again (`alreadyRewarded: true`).
+
+```bash
+curl -X POST localhost:8084/referral-rewards/generate-code -d '{"accountIdentifier":"acct-001"}'
+curl -X POST localhost:8084/referral-rewards/record-referral -d '{
+  "referralCode": "MERC-XXXXXX", "referredAccountIdentifier": "acct-002"
+}'
+curl -X POST localhost:8084/referral-rewards/check-and-qualify -d '{"referredAccountIdentifier":"acct-002"}'
+curl "localhost:8084/referral-rewards/status?accountId=acct-002"
+curl "localhost:8084/referral-rewards/referrals?accountId=acct-001"
+```
+
+## Localization catalog (`internal/localizationcatalog`) — FEATURES.md §14, item 4
+
+A real, complete translation-string catalog covering apps/web's ACTUAL
+current UI copy (harvested by reading `apps/web/app/page.tsx`,
+`app/strategies/page.tsx`, `app/optionsChain/page.tsx`,
+`app/domReplay/page.tsx`, `app/volumeProfile/page.tsx`, and
+`app/orderFlowFootprint/page.tsx` — not invented placeholder strings),
+translated into English (`en`), Hindi (`hi`), and Tamil (`ta`) — see
+`internal/localizationcatalog`'s package doc for why those two
+non-English languages specifically. 39 string keys, every key present
+and non-empty in all 3 languages (enforced by
+`TestEveryStringHasATranslationInEverySupportedLanguage`). 7 tests.
+
+**This build deliberately does NOT touch `apps/web`** — that's a
+follow-up frontend-wiring pass. What's here is the complete backend
+contract that pass needs to consume:
+
+```
+GET /localization/languages
+  -> {"supportedLanguages": ["en", "hi", "ta"]}
+
+GET /localization/{lang}          e.g. GET /localization/hi
+  -> 200 {"languageCode": "hi", "translations": {"orderTicket.heading": "ऑर्डर टिकट", ...}}
+  -> 404 {"errorMessage": "unsupported language code", "supportedLanguages": [...]} for an unknown lang
+```
+
+`translations` is a flat `stringKey -> translatedText` object — every
+key matches a real `data-i18n`-style key a frontend pass would assign to
+the corresponding JSX text it replaces (e.g. `orderTicket.heading`,
+`dashboard.positions.empty`, `optionsChain.strike`). The intended
+frontend integration: fetch this once per language on app load (or on
+language switch), cache it client-side, and look up each UI string by
+its key instead of the hardcoded English literal currently in the JSX.
+
+```bash
+curl localhost:8084/localization/languages
+curl localhost:8084/localization/hi
+curl localhost:8084/localization/ta
+curl -i localhost:8084/localization/fr   # 404, unsupported
 ```

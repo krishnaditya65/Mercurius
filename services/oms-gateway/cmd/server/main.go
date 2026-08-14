@@ -29,7 +29,9 @@ import (
 	"mercurius/omsgateway/internal/basketorders"
 	"mercurius/omsgateway/internal/chargescalculator"
 	"mercurius/omsgateway/internal/connectivitykillswitch"
+	"mercurius/omsgateway/internal/conversationalorderparser"
 	"mercurius/omsgateway/internal/corporateactionexplainer"
+	"mercurius/omsgateway/internal/corporateactionsprocessing"
 	"mercurius/omsgateway/internal/dmagateway"
 	"mercurius/omsgateway/internal/drip"
 	"mercurius/omsgateway/internal/executionalgos"
@@ -64,6 +66,7 @@ import (
 	"mercurius/omsgateway/internal/securitieslendingborrowing"
 	"mercurius/omsgateway/internal/sequencing"
 	"mercurius/omsgateway/internal/strategyfollowing"
+	"mercurius/omsgateway/internal/tradesurveillance"
 )
 
 // demoTrackedAccountIdentifiers is the set of accounts this skeleton
@@ -197,6 +200,13 @@ func main() {
 	// for the honest "this is the explainer surface only, not real
 	// corporate-actions processing (§14)" scope boundary.
 	corporateActionExplainerLog := corporateactionexplainer.NewLog()
+	// corporateActionsHoldingsBook: FEATURES.md §14's REAL corporate
+	// actions processing — see internal/corporateactionsprocessing's
+	// package doc for exactly how this differs from the explainer above
+	// (that one only narrates a caller-supplied outcome; this one
+	// computes the outcome itself from real split/bonus/merger/dividend
+	// inputs, with real cost-basis accounting).
+	corporateActionsHoldingsBook := corporateactionsprocessing.NewHoldingsBook()
 	metricsRegistry := metrics.NewRegistry()
 
 	preTradeRiskEngine := riskengine.NewPreTradeRiskEngineWithSeedBalances(map[string]int64{})
@@ -275,9 +285,16 @@ func main() {
 	httpRequestMultiplexer.HandleFunc("/market-session/close", buildMarketSessionCloseHandler(marketSession, auditTrail))
 	httpRequestMultiplexer.HandleFunc("/market-session/set-phase", buildSetSessionPhaseHandler(marketSession))
 	httpRequestMultiplexer.HandleFunc("/audit-trail", buildAuditTrailHandler(auditTrail))
+	httpRequestMultiplexer.HandleFunc("/compliance/surveillance", buildTradeSurveillanceHandler(auditTrail))
+	httpRequestMultiplexer.HandleFunc("/conversational-order/parse", buildConversationalOrderParseHandler())
+	httpRequestMultiplexer.HandleFunc("/conversational-order/confirm-and-submit", buildConversationalOrderConfirmAndSubmitHandler(orderSubmissionDeps))
 	httpRequestMultiplexer.HandleFunc("/orders/reconcile", buildOrderReconcileHandler(idempotencyStore))
 	httpRequestMultiplexer.HandleFunc("/positions/corporate-action-adjustments/apply", buildApplyCorporateActionAdjustmentHandler(positionBook, corporateActionExplainerLog))
 	httpRequestMultiplexer.HandleFunc("/positions/corporate-action-adjustments", buildCorporateActionAdjustmentsHandler(corporateActionExplainerLog))
+	httpRequestMultiplexer.HandleFunc("/corporate-actions/holdings/seed", buildSeedCorporateActionsHoldingHandler(corporateActionsHoldingsBook, positionBook))
+	httpRequestMultiplexer.HandleFunc("/corporate-actions/holdings", buildGetCorporateActionsHoldingHandler(corporateActionsHoldingsBook))
+	httpRequestMultiplexer.HandleFunc("/corporate-actions/process", buildProcessCorporateActionHandler(corporateActionsHoldingsBook, positionBook, ledgerClient))
+	httpRequestMultiplexer.HandleFunc("/corporate-actions/processed-actions", buildProcessedCorporateActionsHandler(corporateActionsHoldingsBook))
 	httpRequestMultiplexer.HandleFunc("/orders/estimate-charges", buildEstimateChargesHandler())
 	httpRequestMultiplexer.HandleFunc("/metrics", metrics.BuildMetricsHandler(metricsRegistry))
 	httpRequestMultiplexer.HandleFunc("/margin-pledge/pledge", buildPledgeHoldingHandler(pledgeBook, positionBook, preTradeRiskEngine))
@@ -1079,10 +1096,14 @@ func processOrderSubmission(
 	assignedGlobalSequenceNumber := dependencies.globalSequenceNumberAllocator.AllocateNextSequenceNumber()
 
 	dependencies.auditTrail.Append(audittrail.Entry{
-		EventType:               audittrail.EventOrderSubmitted,
-		ClientAccountIdentifier: incomingOrderSubmissionRequest.ClientAccountIdentifier,
-		InstrumentSymbol:        incomingOrderSubmissionRequest.InstrumentSymbol,
-		DetailMessage:           fmt.Sprintf("assignedGlobalSequenceNumber=%d", assignedGlobalSequenceNumber),
+		EventType:                  audittrail.EventOrderSubmitted,
+		ClientAccountIdentifier:    incomingOrderSubmissionRequest.ClientAccountIdentifier,
+		InstrumentSymbol:           incomingOrderSubmissionRequest.InstrumentSymbol,
+		DetailMessage:              fmt.Sprintf("assignedGlobalSequenceNumber=%d", assignedGlobalSequenceNumber),
+		OrderSideIsBuyNotSell:      &incomingOrderSubmissionRequest.OrderSideIsBuyNotSell,
+		OrderQuantity:              incomingOrderSubmissionRequest.OrderQuantity,
+		LimitPriceInMinorUnits:     incomingOrderSubmissionRequest.LimitPriceInMinorUnits,
+		OrderIsMarketOrderNotLimit: incomingOrderSubmissionRequest.OrderIsMarketOrderNotLimit,
 	})
 
 	acknowledgement := orders.OrderAcknowledgementResponse{
@@ -1260,6 +1281,21 @@ func processOrderSubmission(
 	default:
 		if matchingEngineResponse.AssignedOrderSequenceNumber != nil {
 			acknowledgement.MatchingEngineOrderSequenceNumber = *matchingEngineResponse.AssignedOrderSequenceNumber
+			// See audittrail.EventOrderRoutedToMatchingEngine's doc
+			// comment: this is the ONLY entry that pairs this order's
+			// account/shape with the MatchingEngineOrderSequenceNumber a
+			// later cancel entry will also carry — internal/
+			// tradesurveillance joins on it.
+			dependencies.auditTrail.Append(audittrail.Entry{
+				EventType:                         audittrail.EventOrderRoutedToMatchingEngine,
+				ClientAccountIdentifier:           incomingOrderSubmissionRequest.ClientAccountIdentifier,
+				InstrumentSymbol:                  incomingOrderSubmissionRequest.InstrumentSymbol,
+				MatchingEngineOrderSequenceNumber: acknowledgement.MatchingEngineOrderSequenceNumber,
+				OrderSideIsBuyNotSell:             &incomingOrderSubmissionRequest.OrderSideIsBuyNotSell,
+				OrderQuantity:                     incomingOrderSubmissionRequest.OrderQuantity,
+				LimitPriceInMinorUnits:            incomingOrderSubmissionRequest.LimitPriceInMinorUnits,
+				OrderIsMarketOrderNotLimit:        incomingOrderSubmissionRequest.OrderIsMarketOrderNotLimit,
+			})
 		}
 		for _, tradeExecutionWireEvent := range matchingEngineResponse.TradeExecutionEvents {
 			acknowledgement.TradeExecutionEvents = append(acknowledgement.TradeExecutionEvents, orders.TradeExecutionSummary{
@@ -1300,6 +1336,10 @@ func processOrderSubmission(
 					tradeExecutionWireEvent.BuyingClientAccountId,
 					tradeExecutionWireEvent.SellingClientAccountId,
 				),
+				BuyingClientAccountIdentifier:  tradeExecutionWireEvent.BuyingClientAccountId,
+				SellingClientAccountIdentifier: tradeExecutionWireEvent.SellingClientAccountId,
+				ExecutedPriceInMinorUnits:      tradeExecutionWireEvent.ExecutedPriceInMinorUnits,
+				ExecutedQuantity:               tradeExecutionWireEvent.ExecutedQuantity,
 			})
 		}
 	}
@@ -1409,6 +1449,189 @@ func buildCorporateActionAdjustmentsHandler(corporateActionExplainerLog *corpora
 			return
 		}
 		respondWithJson(responseWriter, http.StatusOK, corporateActionExplainerLog.AllEntries())
+	}
+}
+
+// ---------------------------------------------------------------------
+// FEATURES.md §14's REAL corporate actions processing —
+// internal/corporateactionsprocessing. See that package's doc for why
+// this is materially different from the explainer above: this actually
+// COMPUTES the correct new quantity/cost-basis from real split/bonus/
+// merger/dividend inputs, rather than narrating a caller-supplied
+// outcome. TODO(real build): no auth/RBAC, same documented gap as every
+// other handler in this file.
+
+type seedCorporateActionsHoldingWireRequest struct {
+	ClientAccountIdentifier    string `json:"clientAccountIdentifier"`
+	InstrumentSymbol           string `json:"instrumentSymbol"`
+	Quantity                   int64  `json:"quantity"`
+	TotalCostBasisInMinorUnits int64  `json:"totalCostBasisInMinorUnits"`
+}
+
+// buildSeedCorporateActionsHoldingHandler seeds an account's starting
+// quantity + total cost basis for one instrument — see
+// HoldingsBook.SeedHolding's doc. Also syncs the seeded quantity into
+// the real positions.PositionBook via SetPositionDirectly so a fresh
+// holding seeded here is immediately visible through GET /positions
+// too, exactly like every Apply* handler below keeps the two books in
+// sync.
+func buildSeedCorporateActionsHoldingHandler(holdingsBook *corporateactionsprocessing.HoldingsBook, positionBook *positions.PositionBook) http.HandlerFunc {
+	return func(responseWriter http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodPost {
+			http.Error(responseWriter, "only POST is supported", http.StatusMethodNotAllowed)
+			return
+		}
+		var wireRequest seedCorporateActionsHoldingWireRequest
+		if decodeError := json.NewDecoder(request.Body).Decode(&wireRequest); decodeError != nil {
+			http.Error(responseWriter, "malformed seed-holding payload", http.StatusBadRequest)
+			return
+		}
+		holding, seedError := holdingsBook.SeedHolding(wireRequest.ClientAccountIdentifier, wireRequest.InstrumentSymbol, wireRequest.Quantity, wireRequest.TotalCostBasisInMinorUnits)
+		if seedError != nil {
+			respondWithJson(responseWriter, http.StatusBadRequest, map[string]any{"errorMessage": seedError.Error()})
+			return
+		}
+		positionBook.SetPositionDirectly(wireRequest.ClientAccountIdentifier, wireRequest.InstrumentSymbol, holding.QuantityHeld)
+		respondWithJson(responseWriter, http.StatusOK, holding)
+	}
+}
+
+func buildGetCorporateActionsHoldingHandler(holdingsBook *corporateactionsprocessing.HoldingsBook) http.HandlerFunc {
+	return func(responseWriter http.ResponseWriter, request *http.Request) {
+		accountIdentifier := request.URL.Query().Get("accountId")
+		instrumentSymbol := request.URL.Query().Get("instrument")
+		if accountIdentifier == "" || instrumentSymbol == "" {
+			http.Error(responseWriter, "accountId and instrument query parameters are both required", http.StatusBadRequest)
+			return
+		}
+		holding, exists := holdingsBook.GetHolding(accountIdentifier, instrumentSymbol)
+		if !exists {
+			respondWithJson(responseWriter, http.StatusNotFound, map[string]any{"errorMessage": "no holding found for this account/instrument"})
+			return
+		}
+		respondWithJson(responseWriter, http.StatusOK, map[string]any{
+			"holding":                         holding,
+			"averageCostPerShareInMinorUnits": holding.AverageCostPerShareInMinorUnits(),
+		})
+	}
+}
+
+// processCorporateActionWireRequest is the single wire shape for every
+// action type POST /corporate-actions/process accepts — fields not
+// relevant to a given actionType are simply left zero/empty.
+type processCorporateActionWireRequest struct {
+	ActionType                   corporateactionsprocessing.ActionType `json:"actionType"`
+	ClientAccountIdentifier      string                                `json:"clientAccountIdentifier"`
+	InstrumentSymbol             string                                `json:"instrumentSymbol"`
+	RatioNumerator               int64                                 `json:"ratioNumerator,omitempty"`
+	RatioDenominator             int64                                 `json:"ratioDenominator,omitempty"`
+	MergerTargetInstrumentSymbol string                                `json:"mergerTargetInstrumentSymbol,omitempty"`
+	DividendPerShareInMinorUnits int64                                 `json:"dividendPerShareInMinorUnits,omitempty"`
+}
+
+// buildProcessCorporateActionHandler is the real, single entry point for
+// FEATURES.md §14: given one of the four real action types, it computes
+// the correct new holding via internal/corporateactionsprocessing,
+// syncs the resulting quantity into positions.PositionBook (so ordinary
+// position queries immediately reflect the corporate action, exactly
+// like the pre-existing explainer's apply handler already did for its
+// own caller-supplied outcomes), and — for a cash dividend only — makes
+// a REAL HTTP call to ledger's /journal-entries endpoint via
+// ledgerclient.PostDividendCreditJournalEntry to actually credit the
+// account's cash balance. If the ledger call fails, the error is
+// surfaced to the caller as a 502 — the holding itself was never
+// mutated for a dividend (ComputeCashDividendAmount is a pure read of
+// the existing holding), so there's nothing to roll back.
+func buildProcessCorporateActionHandler(
+	holdingsBook *corporateactionsprocessing.HoldingsBook,
+	positionBook *positions.PositionBook,
+	ledgerClient *ledgerclient.LedgerClient,
+) http.HandlerFunc {
+	return func(responseWriter http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodPost {
+			http.Error(responseWriter, "only POST is supported", http.StatusMethodNotAllowed)
+			return
+		}
+		var wireRequest processCorporateActionWireRequest
+		if decodeError := json.NewDecoder(request.Body).Decode(&wireRequest); decodeError != nil {
+			http.Error(responseWriter, "malformed corporate-action-process payload", http.StatusBadRequest)
+			return
+		}
+		if validateError := corporateactionsprocessing.ValidateActionType(wireRequest.ActionType); validateError != nil {
+			respondWithJson(responseWriter, http.StatusBadRequest, map[string]any{"errorMessage": validateError.Error()})
+			return
+		}
+
+		now := time.Now()
+		var processed corporateactionsprocessing.ProcessedAction
+		var processError error
+
+		switch wireRequest.ActionType {
+		case corporateactionsprocessing.ActionTypeStockSplit:
+			processed, processError = holdingsBook.ApplyStockSplit(wireRequest.ClientAccountIdentifier, wireRequest.InstrumentSymbol, wireRequest.RatioNumerator, wireRequest.RatioDenominator, now)
+		case corporateactionsprocessing.ActionTypeBonusIssue:
+			processed, processError = holdingsBook.ApplyBonusIssue(wireRequest.ClientAccountIdentifier, wireRequest.InstrumentSymbol, wireRequest.RatioNumerator, wireRequest.RatioDenominator, now)
+		case corporateactionsprocessing.ActionTypeMerger:
+			processed, processError = holdingsBook.ApplyMerger(wireRequest.ClientAccountIdentifier, wireRequest.InstrumentSymbol, wireRequest.MergerTargetInstrumentSymbol, wireRequest.RatioNumerator, wireRequest.RatioDenominator, now)
+		case corporateactionsprocessing.ActionTypeCashDividend:
+			processed, processError = holdingsBook.ComputeCashDividendAmount(wireRequest.ClientAccountIdentifier, wireRequest.InstrumentSymbol, wireRequest.DividendPerShareInMinorUnits, now)
+		}
+
+		if processError != nil {
+			respondWithJson(responseWriter, http.StatusBadRequest, map[string]any{"errorMessage": processError.Error()})
+			return
+		}
+
+		if wireRequest.ActionType == corporateactionsprocessing.ActionTypeCashDividend {
+			creditError := ledgerClient.PostDividendCreditJournalEntry(
+				wireRequest.ClientAccountIdentifier,
+				processed.CashCreditedInMinorUnits,
+				fmt.Sprintf("cash dividend: %s @ %d minor units/share", wireRequest.InstrumentSymbol, wireRequest.DividendPerShareInMinorUnits),
+			)
+			if creditError != nil {
+				log.Printf("corporate-action dividend credit failed: account=%s instrument=%s amount=%d error=%v", wireRequest.ClientAccountIdentifier, wireRequest.InstrumentSymbol, processed.CashCreditedInMinorUnits, creditError)
+				http.Error(responseWriter, "dividend computed but ledger credit failed: "+creditError.Error(), http.StatusBadGateway)
+				return
+			}
+			log.Printf("CORPORATE_ACTION_DIVIDEND_CREDITED: account=%s instrument=%s amount=%d", wireRequest.ClientAccountIdentifier, wireRequest.InstrumentSymbol, processed.CashCreditedInMinorUnits)
+		} else {
+			// Splits/bonuses/mergers change quantity — keep
+			// positions.PositionBook (the ordinary trading position
+			// book) in sync so GET /positions immediately reflects it,
+			// same convention the pre-existing explainer apply handler
+			// already uses.
+			positionBook.SetPositionDirectly(wireRequest.ClientAccountIdentifier, processed.HoldingAfter.InstrumentSymbol, processed.HoldingAfter.QuantityHeld)
+			if wireRequest.ActionType == corporateactionsprocessing.ActionTypeMerger && processed.InstrumentSymbol != processed.HoldingAfter.InstrumentSymbol {
+				// The old instrument's position must be zeroed out too —
+				// the merger removed the holding entirely.
+				positionBook.SetPositionDirectly(wireRequest.ClientAccountIdentifier, processed.InstrumentSymbol, 0)
+			}
+			log.Printf("CORPORATE_ACTION_PROCESSED: type=%s account=%s instrument=%s quantityBefore=%d quantityAfter=%d costBasisBefore=%d costBasisAfter=%d",
+				processed.ActionType, wireRequest.ClientAccountIdentifier, wireRequest.InstrumentSymbol,
+				processed.HoldingBefore.QuantityHeld, processed.HoldingAfter.QuantityHeld,
+				processed.HoldingBefore.TotalCostBasisInMinorUnits, processed.HoldingAfter.TotalCostBasisInMinorUnits)
+		}
+
+		respondWithJson(responseWriter, http.StatusOK, processed)
+	}
+}
+
+// buildProcessedCorporateActionsHandler serves GET
+// /corporate-actions/processed-actions?accountId=... — the real audit
+// trail of every corporate action this endpoint has actually processed
+// for an account (as opposed to the explainer log, which only records
+// caller-narrated outcomes).
+func buildProcessedCorporateActionsHandler(holdingsBook *corporateactionsprocessing.HoldingsBook) http.HandlerFunc {
+	return func(responseWriter http.ResponseWriter, request *http.Request) {
+		accountIdentifier := request.URL.Query().Get("accountId")
+		if accountIdentifier == "" {
+			http.Error(responseWriter, "missing accountId query parameter", http.StatusBadRequest)
+			return
+		}
+		respondWithJson(responseWriter, http.StatusOK, map[string]any{
+			"accountIdentifier": accountIdentifier,
+			"processedActions":  holdingsBook.ProcessedActionsForAccount(accountIdentifier),
+		})
 	}
 }
 
@@ -1780,6 +2003,179 @@ func buildAuditTrailHandler(auditTrail *audittrail.AuditTrail) http.HandlerFunc 
 			return
 		}
 		respondWithJson(responseWriter, http.StatusOK, auditTrail.AllEntries())
+	}
+}
+
+// buildTradeSurveillanceHandler is FEATURES.md §1's compliance-officer
+// query endpoint for internal/tradesurveillance — see that package's doc
+// comment for the full heuristic-proxy-not-certified caveat this endpoint
+// inherits.
+//
+// GET /compliance/surveillance?accountId=...&windowStartTime=RFC3339&windowEndTime=RFC3339
+// runs every detector (spoofing, layering, wash-trade) over that
+// account's REAL audit-trail entries restricted to that time window and
+// returns a tradesurveillance.SurveillanceReport — genuinely computed
+// from audittrail.AuditTrail.EntriesForAccount every time, never canned.
+//
+// accountId is required (this package's detectors are documented as
+// per-account by design — see its doc comment on why there's no
+// cross-account linkage). windowStartTime/windowEndTime are optional;
+// omitting either defaults to the widest possible window (Go's zero time
+// through effectively-forever), i.e. "every entry this account has".
+func buildTradeSurveillanceHandler(auditTrail *audittrail.AuditTrail) http.HandlerFunc {
+	engine := tradesurveillance.NewSurveillanceEngine(tradesurveillance.DefaultDetectorConfiguration())
+
+	return func(responseWriter http.ResponseWriter, request *http.Request) {
+		accountIdentifier := request.URL.Query().Get("accountId")
+		if accountIdentifier == "" {
+			http.Error(responseWriter, "accountId query parameter is required — tradesurveillance's detectors are scoped to one account at a time (see its package doc for why)", http.StatusBadRequest)
+			return
+		}
+
+		windowStartTime := time.Time{}
+		if rawStart := request.URL.Query().Get("windowStartTime"); rawStart != "" {
+			parsedStart, parseError := time.Parse(time.RFC3339, rawStart)
+			if parseError != nil {
+				http.Error(responseWriter, fmt.Sprintf("malformed windowStartTime (expected RFC3339): %v", parseError), http.StatusBadRequest)
+				return
+			}
+			windowStartTime = parsedStart
+		}
+
+		windowEndTime := time.Now().Add(100 * 365 * 24 * time.Hour) // effectively "no upper bound"
+		if rawEnd := request.URL.Query().Get("windowEndTime"); rawEnd != "" {
+			parsedEnd, parseError := time.Parse(time.RFC3339, rawEnd)
+			if parseError != nil {
+				http.Error(responseWriter, fmt.Sprintf("malformed windowEndTime (expected RFC3339): %v", parseError), http.StatusBadRequest)
+				return
+			}
+			windowEndTime = parsedEnd
+		}
+
+		// See tradesurveillance.ScopeEntriesToAccount's doc comment for
+		// why this deliberately passes AllEntries(), not
+		// EntriesForAccount(accountIdentifier) — the latter silently
+		// drops every cancellation, which would make this endpoint blind
+		// to the exact pattern it exists to catch.
+		report := engine.RunAllDetectors(accountIdentifier, auditTrail.AllEntries(), windowStartTime, windowEndTime)
+		respondWithJson(responseWriter, http.StatusOK, report)
+	}
+}
+
+// conversationalOrderParseRequest is POST /conversational-order/parse's
+// request body.
+type conversationalOrderParseRequest struct {
+	CommandText string `json:"commandText"`
+	// ClientAccountIdentifier is OPTIONAL here — the parser itself never
+	// needs an account (see conversationalorderparser's package doc: it
+	// only extracts instrument/side/quantity/order-type from the
+	// sentence). If supplied, the response ALSO includes a ready-to-review
+	// orders.OrderSubmissionRequest for convenience, so a client doesn't
+	// have to reconstruct one by hand before the separate confirm step.
+	ClientAccountIdentifier string `json:"clientAccountIdentifier,omitempty"`
+}
+
+// conversationalOrderParseResponse is POST /conversational-order/parse's
+// response body. Deliberately carries NO acceptance/execution
+// information whatsoever — see conversationalorderparser's package doc
+// for why this endpoint can never itself result in a submitted order.
+type conversationalOrderParseResponse struct {
+	ParsedIntent conversationalorderparser.ParsedOrderIntent `json:"parsedIntent"`
+	// OrderSubmissionRequest is set only when the request supplied
+	// ClientAccountIdentifier — pass this value straight through (after a
+	// human reviews ParsedIntent.ConfirmationSummary) to
+	// POST /conversational-order/confirm-and-submit with
+	// explicitConfirmation:true to actually place the order.
+	OrderSubmissionRequest *orders.OrderSubmissionRequest `json:"orderSubmissionRequest,omitempty"`
+}
+
+// buildConversationalOrderParseHandler serves POST
+// /conversational-order/parse — FEATURES.md §21's conversational order
+// placement, text/chat half only (see conversationalorderparser's package
+// doc for the honest voice-out-of-scope statement). This handler ONLY
+// parses; it never touches processOrderSubmission, the audit trail, KYC,
+// risk, or matching-engine — see buildConversationalOrderConfirmAndSubmitHandler
+// for the separate, explicit call that actually submits.
+func buildConversationalOrderParseHandler() http.HandlerFunc {
+	return func(responseWriter http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodPost {
+			http.Error(responseWriter, "only POST is supported", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var parseRequest conversationalOrderParseRequest
+		if decodeError := json.NewDecoder(request.Body).Decode(&parseRequest); decodeError != nil {
+			http.Error(responseWriter, fmt.Sprintf("malformed request: %v", decodeError), http.StatusBadRequest)
+			return
+		}
+
+		parsedIntent, parseError := conversationalorderparser.ParseConversationalOrderCommand(parseRequest.CommandText)
+		if parseError != nil {
+			// FEATURES.md §21 "never silently trade on ambiguous input":
+			// a specific, real reason, never a bare parse failure.
+			http.Error(responseWriter, parseError.Error(), http.StatusUnprocessableEntity)
+			return
+		}
+
+		response := conversationalOrderParseResponse{ParsedIntent: parsedIntent}
+		if parseRequest.ClientAccountIdentifier != "" {
+			builtRequest := parsedIntent.ToOrderSubmissionRequest(parseRequest.ClientAccountIdentifier)
+			response.OrderSubmissionRequest = &builtRequest
+		}
+		respondWithJson(responseWriter, http.StatusOK, response)
+	}
+}
+
+// conversationalOrderConfirmAndSubmitRequest is POST
+// /conversational-order/confirm-and-submit's request body.
+type conversationalOrderConfirmAndSubmitRequest struct {
+	OrderSubmissionRequest orders.OrderSubmissionRequest `json:"orderSubmissionRequest"`
+
+	// ExplicitConfirmation MUST be true or this request is rejected — see
+	// FEATURES.md §21's "explicit confirmation step before submission,
+	// never silently trade on ambiguous input". This is deliberate
+	// defense-in-depth on top of this simply being a distinct endpoint
+	// from /conversational-order/parse: even a client that (by bug or
+	// design) calls this endpoint automatically right after parsing still
+	// cannot place an order without this field explicitly set true.
+	ExplicitConfirmation bool `json:"explicitConfirmation"`
+}
+
+// buildConversationalOrderConfirmAndSubmitHandler serves POST
+// /conversational-order/confirm-and-submit — the SEPARATE, explicit call
+// FEATURES.md §21 requires between a parsed conversational intent and an
+// actually-submitted order. It performs NO parsing of its own; it takes
+// the orders.OrderSubmissionRequest a client got back from
+// /conversational-order/parse (after a human reviewed
+// ParsedIntent.ConfirmationSummary) and — once ExplicitConfirmation is
+// true — hands it to processOrderSubmission, the EXACT SAME function that
+// backs POST /orders/submit. Every KYC/freeze/pledge/risk/exposure/
+// strategy-limit gate, sequencing, matching-engine hand-off, and audit
+// trail entry that a normal order goes through applies identically here —
+// there is no bespoke, gate-skipping "conversational" submission path.
+func buildConversationalOrderConfirmAndSubmitHandler(dependencies orderSubmissionDependencies) http.HandlerFunc {
+	return func(responseWriter http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodPost {
+			http.Error(responseWriter, "only POST is supported", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var confirmRequest conversationalOrderConfirmAndSubmitRequest
+		if decodeError := json.NewDecoder(request.Body).Decode(&confirmRequest); decodeError != nil {
+			http.Error(responseWriter, fmt.Sprintf("malformed request: %v", decodeError), http.StatusBadRequest)
+			return
+		}
+		if !confirmRequest.ExplicitConfirmation {
+			http.Error(
+				responseWriter,
+				"this order was not explicitly confirmed — set explicitConfirmation:true after reviewing the confirmation summary returned by /conversational-order/parse; a conversational order is never submitted without this",
+				http.StatusBadRequest,
+			)
+			return
+		}
+
+		acknowledgement := processOrderSubmission(dependencies, confirmRequest.OrderSubmissionRequest)
+		respondWithJson(responseWriter, http.StatusOK, acknowledgement)
 	}
 }
 

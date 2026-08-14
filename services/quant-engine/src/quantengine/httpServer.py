@@ -22,8 +22,14 @@ from __future__ import annotations
 
 import json
 import threading
+from datetime import date
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+from quantengine.alternativeDataFeedAggregator import (
+    NewsSnippet,
+    buildIntegratedAlternativeDataSignal,
+    detectAnomaliesAcrossFilingMetrics,
+)
 from quantengine.arbitrageScanner import scanForTheoreticalVersusLivePriceDeviation
 from quantengine.blackScholesOptionPricer import (
     BlackScholesInputParameters,
@@ -37,9 +43,21 @@ from quantengine.correlationMatrixEngine import (
     buildPairwiseCorrelationMatrix,
     findPairsTradingCandidatePairsAboveCorrelationThreshold,
 )
+from quantengine.customIndexConstructionBacktester import (
+    ILLUSTRATIVE_INDEX_CONSTITUENT_UNIVERSE,
+    IndexConstituentHistory,
+    IndexConstructionRule,
+    IndexWeightingScheme,
+    backtestConstructedIndex,
+    constructCustomIndex,
+)
 from quantengine.esgScoringEngine import (
     EsgScreeningCriteria,
     screenCandidateSymbolsAgainstEsgCriteria,
+)
+from quantengine.factorBasedPnlAttributionEngine import (
+    SectorAttributionInput,
+    computeBrinsonAttribution,
 )
 from quantengine.factorRiskModel import (
     PortfolioHoldingWithFactorExposures,
@@ -69,11 +87,24 @@ from quantengine.portfolioGreeksAggregator import (
     PortfolioPosition,
     aggregatePortfolioGreeks,
 )
+from quantengine.portfolioHealthCheckDiversificationAnalyzer import (
+    PortfolioHoldingForHealthCheck,
+    performPortfolioHealthCheck,
+)
+from quantengine.researchCopilotRetrievalAugmentedGeneration import (
+    answerResearchQuestion,
+    buildIllustrativeRetrievalIndex,
+)
 from quantengine.riskStatistics import (
     calculateAnnualizedSharpeRatio,
     calculateAnnualizedSortinoRatio,
     calculateMaximumDrawdownFromReturns,
 )
+from quantengine.stockScreenerFilterBuilder import (
+    SavedScreenStore,
+    runScreenAgainstUniverse,
+)
+from quantengine.taxLossHarvestingAdvisor import TaxLot, buildTaxLossHarvestingPlan
 from quantengine.valueAtRiskCalculator import (
     calculateHistoricalValueAtRisk,
     calculateParametricValueAtRisk,
@@ -88,6 +119,19 @@ QUANT_ENGINE_HTTP_LISTEN_ADDRESS = ("127.0.0.1", 8085)
 # before this. This lock guards every sandbox access below.
 _marketMakingSandbox = MarketMakingSandbox()
 _marketMakingSandboxLock = threading.Lock()
+
+# Two more pieces of shared mutable/shared-once state, same locking
+# discipline as the market-making sandbox above:
+#   - `_savedScreenStore` is a real (in-memory-only — see
+#     `stockScreenerFilterBuilder.SavedScreenStore`'s docstring)
+#     save/list/get/delete store for the screener's saved screens.
+#   - `_researchCopilotIndex` is built ONCE at process start (real TF-IDF
+#     vocabulary/document-frequency statistics over the illustrative
+#     corpus) and only ever READ afterward, so — unlike the sandbox and
+#     the screen store — it needs no lock.
+_savedScreenStore = SavedScreenStore()
+_savedScreenStoreLock = threading.Lock()
+_researchCopilotIndex = buildIllustrativeRetrievalIndex()
 
 
 def buildInputParametersFromRequestBody(requestBody: dict) -> BlackScholesInputParameters:
@@ -164,6 +208,30 @@ class QuantEngineRequestHandler(BaseHTTPRequestHandler):
             self._handleStockSplitAdjustmentRequest(requestBody)
         elif self.path == "/options/corporate-action/early-exercise-risk":
             self._handleEarlyExerciseRiskRequest(requestBody)
+        elif self.path == "/screener/run":
+            self._handleScreenerRunRequest(requestBody)
+        elif self.path == "/screener/saved-screens/save":
+            self._handleSavedScreenSaveRequest(requestBody)
+        elif self.path == "/screener/saved-screens/get":
+            self._handleSavedScreenGetRequest(requestBody)
+        elif self.path == "/screener/saved-screens/list":
+            self._handleSavedScreenListRequest(requestBody)
+        elif self.path == "/screener/saved-screens/delete":
+            self._handleSavedScreenDeleteRequest(requestBody)
+        elif self.path == "/research/copilot/ask":
+            self._handleResearchCopilotAskRequest(requestBody)
+        elif self.path == "/portfolio/health-check":
+            self._handlePortfolioHealthCheckRequest(requestBody)
+        elif self.path == "/tax/loss-harvesting-plan":
+            self._handleTaxLossHarvestingPlanRequest(requestBody)
+        elif self.path == "/alternative-data/sentiment-signal":
+            self._handleAlternativeDataSentimentSignalRequest(requestBody)
+        elif self.path == "/alternative-data/filing-anomaly":
+            self._handleAlternativeDataFilingAnomalyRequest(requestBody)
+        elif self.path == "/pnl-attribution/brinson":
+            self._handleBrinsonAttributionRequest(requestBody)
+        elif self.path == "/index/construct-and-backtest":
+            self._handleIndexConstructAndBacktestRequest(requestBody)
         else:
             self._writeJsonResponse(404, {"errorMessage": f"no POST route for {self.path}"})
 
@@ -969,6 +1037,482 @@ class QuantEngineRequestHandler(BaseHTTPRequestHandler):
             },
         )
 
+    def _handleScreenerRunRequest(self, requestBody: dict) -> None:
+        """`POST /screener/run` — body carries `filterExpression` (a
+        compound AND/OR/comparison filter tree — see
+        `stockScreenerFilterBuilder.evaluateFilterExpression`'s
+        docstring for the exact node shapes). Runs it against the
+        service's ILLUSTRATIVE instrument universe (real fundamentals +
+        real SMA/RSI technical fields computed from illustrative synthetic
+        price series — see that module's docstring) and returns every
+        matching instrument's full field snapshot, sorted alphabetically
+        (FEATURES.md §16).
+        """
+        try:
+            filterExpression = dict(requestBody["filterExpression"])
+        except (KeyError, TypeError) as validationError:
+            self._writeJsonResponse(400, {"errorMessage": f"invalid request body: {validationError}"})
+            return
+
+        try:
+            results = runScreenAgainstUniverse(filterExpression)
+        except (KeyError, ValueError) as screenError:
+            self._writeJsonResponse(422, {"errorMessage": str(screenError)})
+            return
+
+        self._writeJsonResponse(200, {"matchingInstruments": [snapshot.asFieldDict() for snapshot in results]})
+
+    def _handleSavedScreenSaveRequest(self, requestBody: dict) -> None:
+        """`POST /screener/saved-screens/save` — body carries `screenName`,
+        `filterExpression`, and an optional `description`. Creates or
+        OVERWRITES a saved screen. Persistence is IN-MEMORY ONLY for the
+        life of this process — see `SavedScreenStore`'s docstring.
+        """
+        try:
+            screenName = str(requestBody["screenName"])
+            filterExpression = dict(requestBody["filterExpression"])
+            description = str(requestBody.get("description", ""))
+        except (KeyError, TypeError) as validationError:
+            self._writeJsonResponse(400, {"errorMessage": f"invalid request body: {validationError}"})
+            return
+
+        try:
+            with _savedScreenStoreLock:
+                screen = _savedScreenStore.saveScreen(screenName, filterExpression, description)
+        except ValueError as saveError:
+            self._writeJsonResponse(422, {"errorMessage": str(saveError)})
+            return
+
+        self._writeJsonResponse(
+            200,
+            {"screenName": screen.screenName, "filterExpression": screen.filterExpression, "description": screen.description},
+        )
+
+    def _handleSavedScreenGetRequest(self, requestBody: dict) -> None:
+        """`POST /screener/saved-screens/get` — body carries `screenName`.
+        404s if no screen with that name has been saved.
+        """
+        try:
+            screenName = str(requestBody["screenName"])
+        except (KeyError, TypeError) as validationError:
+            self._writeJsonResponse(400, {"errorMessage": f"invalid request body: {validationError}"})
+            return
+
+        try:
+            with _savedScreenStoreLock:
+                screen = _savedScreenStore.getScreen(screenName)
+        except KeyError as notFoundError:
+            self._writeJsonResponse(404, {"errorMessage": str(notFoundError)})
+            return
+
+        self._writeJsonResponse(
+            200,
+            {"screenName": screen.screenName, "filterExpression": screen.filterExpression, "description": screen.description},
+        )
+
+    def _handleSavedScreenListRequest(self, requestBody: dict) -> None:
+        """`POST /screener/saved-screens/list` — no required body fields.
+        Returns every saved screen, sorted alphabetically by name.
+        """
+        with _savedScreenStoreLock:
+            screens = _savedScreenStore.listScreens()
+        self._writeJsonResponse(
+            200,
+            {
+                "screens": [
+                    {"screenName": screen.screenName, "filterExpression": screen.filterExpression, "description": screen.description}
+                    for screen in screens
+                ]
+            },
+        )
+
+    def _handleSavedScreenDeleteRequest(self, requestBody: dict) -> None:
+        """`POST /screener/saved-screens/delete` — body carries
+        `screenName`. 404s if no screen with that name has been saved.
+        """
+        try:
+            screenName = str(requestBody["screenName"])
+        except (KeyError, TypeError) as validationError:
+            self._writeJsonResponse(400, {"errorMessage": f"invalid request body: {validationError}"})
+            return
+
+        try:
+            with _savedScreenStoreLock:
+                _savedScreenStore.deleteScreen(screenName)
+        except KeyError as notFoundError:
+            self._writeJsonResponse(404, {"errorMessage": str(notFoundError)})
+            return
+
+        self._writeJsonResponse(200, {"screenName": screenName, "deleted": True})
+
+    def _handleResearchCopilotAskRequest(self, requestBody: dict) -> None:
+        """`POST /research/copilot/ask` — body carries `query` and an
+        optional `topK` (default 3). Runs REAL TF-IDF + cosine-similarity
+        retrieval over a small SYNTHETIC/ILLUSTRATIVE filings/earnings-call
+        corpus (see `researchCopilotRetrievalAugmentedGeneration.py`'s
+        docstring — no real filings data, no internet access), composes an
+        extractive answer citing the retrieved source chunks, and ALWAYS
+        includes a non-advisory disclaimer (FEATURES.md §16).
+        """
+        try:
+            query = str(requestBody["query"])
+            topK = int(requestBody.get("topK", 3))
+        except (KeyError, TypeError, ValueError) as validationError:
+            self._writeJsonResponse(400, {"errorMessage": f"invalid request body: {validationError}"})
+            return
+
+        try:
+            answer = answerResearchQuestion(_researchCopilotIndex, query, topK)
+        except ValueError as retrievalError:
+            self._writeJsonResponse(422, {"errorMessage": str(retrievalError)})
+            return
+
+        self._writeJsonResponse(
+            200,
+            {
+                "query": answer.query,
+                "disclaimer": answer.disclaimer,
+                "composedAnswerText": answer.composedAnswerText,
+                "retrievedChunks": [
+                    {
+                        "documentId": result.chunk.documentId,
+                        "documentTitle": result.chunk.documentTitle,
+                        "chunkIndex": result.chunk.chunkIndex,
+                        "text": result.chunk.text,
+                        "cosineSimilarityScore": result.cosineSimilarityScore,
+                    }
+                    for result in answer.retrievedChunks
+                ],
+            },
+        )
+
+    def _handlePortfolioHealthCheckRequest(self, requestBody: dict) -> None:
+        """`POST /portfolio/health-check` — body carries `holdings`, a
+        list of `{symbol, sector, portfolioWeight, factorExposuresByName}`
+        objects (`factorExposuresByName` optional per holding — a real
+        factor-exposure summary is only computed when EVERY holding
+        supplies it). Returns real HHI-based position/sector concentration
+        metrics, an optional real factor-exposure summary (reusing
+        `factorRiskModel.py`), and genuinely input-derived plain-language
+        nudges with severities (FEATURES.md §16).
+        """
+        try:
+            holdings = [
+                PortfolioHoldingForHealthCheck(
+                    symbol=str(oneHolding["symbol"]),
+                    sector=str(oneHolding["sector"]),
+                    portfolioWeight=float(oneHolding["portfolioWeight"]),
+                    factorExposuresByName=(
+                        {str(k): float(v) for k, v in oneHolding["factorExposuresByName"].items()}
+                        if oneHolding.get("factorExposuresByName") is not None
+                        else None
+                    ),
+                )
+                for oneHolding in requestBody["holdings"]
+            ]
+        except (KeyError, TypeError, ValueError) as validationError:
+            self._writeJsonResponse(400, {"errorMessage": f"invalid request body: {validationError}"})
+            return
+
+        try:
+            result = performPortfolioHealthCheck(holdings)
+        except ValueError as healthCheckError:
+            self._writeJsonResponse(422, {"errorMessage": str(healthCheckError)})
+            return
+
+        self._writeJsonResponse(
+            200,
+            {
+                "positionHhi": result.positionHhi,
+                "sectorHhi": result.sectorHhi,
+                "effectiveNumberOfHoldings": result.effectiveNumberOfHoldings,
+                "weightsBySector": result.weightsBySector,
+                "topPositionSymbol": result.topPositionSymbol,
+                "topPositionWeight": result.topPositionWeight,
+                "topSector": result.topSector,
+                "topSectorWeight": result.topSectorWeight,
+                "portfolioExposureByFactor": result.portfolioExposureByFactor,
+                "nudges": [{"severity": nudge.severity.value, "message": nudge.message} for nudge in result.nudges],
+            },
+        )
+
+    def _handleTaxLossHarvestingPlanRequest(self, requestBody: dict) -> None:
+        """`POST /tax/loss-harvesting-plan` — body carries `lots` (a list
+        of `{lotId, symbol, quantity, buyPricePerShare, buyDate (ISO
+        "YYYY-MM-DD"), currentPricePerShare}`), `realizedGainsYtd`, and
+        `proposedSaleDate` (ISO "YYYY-MM-DD"). Applies the real 61-day
+        wash-sale window check and real gain/ordinary-income-offset/
+        carryforward waterfall (FEATURES.md §16,
+        `taxLossHarvestingAdvisor.py`). NOT tax advice — see that module's
+        docstring.
+        """
+        try:
+            lots = [
+                TaxLot(
+                    lotId=str(oneLot["lotId"]),
+                    symbol=str(oneLot["symbol"]),
+                    quantity=float(oneLot["quantity"]),
+                    buyPricePerShare=float(oneLot["buyPricePerShare"]),
+                    buyDate=date.fromisoformat(str(oneLot["buyDate"])),
+                    currentPricePerShare=float(oneLot["currentPricePerShare"]),
+                )
+                for oneLot in requestBody["lots"]
+            ]
+            realizedGainsYtd = float(requestBody["realizedGainsYtd"])
+            proposedSaleDate = date.fromisoformat(str(requestBody["proposedSaleDate"]))
+        except (KeyError, TypeError, ValueError) as validationError:
+            self._writeJsonResponse(400, {"errorMessage": f"invalid request body: {validationError}"})
+            return
+
+        try:
+            plan = buildTaxLossHarvestingPlan(lots, realizedGainsYtd, proposedSaleDate)
+        except ValueError as planError:
+            self._writeJsonResponse(422, {"errorMessage": str(planError)})
+            return
+
+        self._writeJsonResponse(
+            200,
+            {
+                "proposedSaleDate": plan.proposedSaleDate.isoformat(),
+                "realizedGainsYtd": plan.realizedGainsYtd,
+                "eligibleLotsInHarvestOrder": [
+                    {
+                        "lotId": lot.lotId,
+                        "symbol": lot.symbol,
+                        "quantity": lot.quantity,
+                        "unrealizedGainOrLoss": lot.unrealizedGainOrLoss,
+                    }
+                    for lot in plan.eligibleLotsInHarvestOrder
+                ],
+                "excludedLotsDueToWashSale": [
+                    {
+                        "lotId": evaluation.lot.lotId,
+                        "symbol": evaluation.lot.symbol,
+                        "unrealizedGainOrLoss": evaluation.lot.unrealizedGainOrLoss,
+                        "washSaleViolatingLotIds": evaluation.washSaleViolatingLotIds,
+                    }
+                    for evaluation in plan.excludedLotsDueToWashSale
+                ],
+                "totalHarvestableLoss": plan.totalHarvestableLoss,
+                "amountOffsettingRealizedGains": plan.amountOffsettingRealizedGains,
+                "amountOffsettingOrdinaryIncome": plan.amountOffsettingOrdinaryIncome,
+                "carryForwardLoss": plan.carryForwardLoss,
+            },
+        )
+
+    def _handleAlternativeDataSentimentSignalRequest(self, requestBody: dict) -> None:
+        """`POST /alternative-data/sentiment-signal` — body carries
+        `snippets` (a list of `{source, text}` news/social snippets — an
+        ILLUSTRATIVE alternative-data feed, not a live one, see
+        `alternativeDataFeedAggregator.py`'s docstring), an optional
+        `killSwitchEnabled` (default `False`), and optional
+        `buyThreshold`/`sellThreshold`. Returns the real pooled sentiment
+        aggregation AND the resulting §7 NLP module `OrderHookSuggestion`
+        the aggregated text produces — proving the alternative-data output
+        genuinely feeds that module (FEATURES.md §16).
+        """
+        try:
+            snippets = [
+                NewsSnippet(source=str(oneSnippet["source"]), text=str(oneSnippet["text"]))
+                for oneSnippet in requestBody["snippets"]
+            ]
+            killSwitchEnabled = bool(requestBody.get("killSwitchEnabled", False))
+            buyThreshold = float(requestBody.get("buyThreshold", 0.3))
+            sellThreshold = float(requestBody.get("sellThreshold", -0.3))
+        except (KeyError, TypeError, ValueError) as validationError:
+            self._writeJsonResponse(400, {"errorMessage": f"invalid request body: {validationError}"})
+            return
+
+        try:
+            signal = buildIntegratedAlternativeDataSignal(snippets, killSwitchEnabled, buyThreshold, sellThreshold)
+        except ValueError as signalError:
+            self._writeJsonResponse(422, {"errorMessage": str(signalError)})
+            return
+
+        self._writeJsonResponse(
+            200,
+            {
+                "aggregatedSentiment": {
+                    "snippetCount": signal.aggregatedSentiment.snippetCount,
+                    "totalPositiveWordCount": signal.aggregatedSentiment.totalPositiveWordCount,
+                    "totalNegativeWordCount": signal.aggregatedSentiment.totalNegativeWordCount,
+                    "pooledSentimentScore": signal.aggregatedSentiment.pooledSentimentScore,
+                    "meanSentimentScoreBySource": signal.aggregatedSentiment.meanSentimentScoreBySource,
+                },
+                "combinedSnippetText": signal.combinedSnippetText,
+                "orderHookSuggestion": {
+                    "direction": signal.orderHookSuggestion.direction.value,
+                    "confidence": signal.orderHookSuggestion.confidence,
+                    "explanation": signal.orderHookSuggestion.explanation,
+                    "killSwitchEngaged": signal.orderHookSuggestion.killSwitchEngaged,
+                },
+            },
+        )
+
+    def _handleAlternativeDataFilingAnomalyRequest(self, requestBody: dict) -> None:
+        """`POST /alternative-data/filing-anomaly` — body carries
+        `metrics`, a dict of `metricName -> {historicalValues: [floats],
+        currentValue: float}`, and an optional `zScoreThreshold` (default
+        2.0). Returns real z-score outlier detection per metric over an
+        ILLUSTRATIVE set of filing metrics (FEATURES.md §16,
+        `alternativeDataFeedAggregator.py`).
+        """
+        try:
+            metricsInput = {
+                str(metricName): (
+                    [float(v) for v in metricData["historicalValues"]],
+                    float(metricData["currentValue"]),
+                )
+                for metricName, metricData in requestBody["metrics"].items()
+            }
+            zScoreThreshold = float(requestBody.get("zScoreThreshold", 2.0))
+        except (KeyError, TypeError, ValueError) as validationError:
+            self._writeJsonResponse(400, {"errorMessage": f"invalid request body: {validationError}"})
+            return
+
+        try:
+            results = detectAnomaliesAcrossFilingMetrics(metricsInput, zScoreThreshold)
+        except ValueError as anomalyError:
+            self._writeJsonResponse(422, {"errorMessage": str(anomalyError)})
+            return
+
+        self._writeJsonResponse(
+            200,
+            {
+                metricName: {
+                    "currentValue": result.currentValue,
+                    "historicalMean": result.historicalMean,
+                    "historicalPopulationStandardDeviation": result.historicalPopulationStandardDeviation,
+                    "zScore": result.zScore,
+                    "isAnomalous": result.isAnomalous,
+                    "zScoreThreshold": result.zScoreThreshold,
+                }
+                for metricName, result in results.items()
+            },
+        )
+
+    def _handleBrinsonAttributionRequest(self, requestBody: dict) -> None:
+        """`POST /pnl-attribution/brinson` — body carries `sectors`, a
+        list of `{sectorName, portfolioWeight, portfolioLocalReturn,
+        benchmarkWeight, benchmarkLocalReturn, currencyReturn}`
+        (`currencyReturn` optional, defaults to 0.0). Returns the real
+        Brinson-Hood-Beebower allocation/selection/interaction
+        decomposition per sector and in total, plus the separate currency
+        overlay effect (FEATURES.md §16,
+        `factorBasedPnlAttributionEngine.py`).
+        """
+        try:
+            sectors = [
+                SectorAttributionInput(
+                    sectorName=str(oneSector["sectorName"]),
+                    portfolioWeight=float(oneSector["portfolioWeight"]),
+                    portfolioLocalReturn=float(oneSector["portfolioLocalReturn"]),
+                    benchmarkWeight=float(oneSector["benchmarkWeight"]),
+                    benchmarkLocalReturn=float(oneSector["benchmarkLocalReturn"]),
+                    currencyReturn=float(oneSector.get("currencyReturn", 0.0)),
+                )
+                for oneSector in requestBody["sectors"]
+            ]
+        except (KeyError, TypeError, ValueError) as validationError:
+            self._writeJsonResponse(400, {"errorMessage": f"invalid request body: {validationError}"})
+            return
+
+        try:
+            result = computeBrinsonAttribution(sectors)
+        except ValueError as attributionError:
+            self._writeJsonResponse(422, {"errorMessage": str(attributionError)})
+            return
+
+        self._writeJsonResponse(
+            200,
+            {
+                "sectorResults": [
+                    {
+                        "sectorName": sectorResult.sectorName,
+                        "allocationEffect": sectorResult.allocationEffect,
+                        "selectionEffect": sectorResult.selectionEffect,
+                        "interactionEffect": sectorResult.interactionEffect,
+                        "currencyEffect": sectorResult.currencyEffect,
+                        "totalSectorEffect": sectorResult.totalSectorEffect,
+                    }
+                    for sectorResult in result.sectorResults
+                ],
+                "totalPortfolioLocalReturn": result.totalPortfolioLocalReturn,
+                "totalBenchmarkReturn": result.totalBenchmarkReturn,
+                "totalActiveReturn": result.totalActiveReturn,
+                "totalAllocationEffect": result.totalAllocationEffect,
+                "totalSelectionEffect": result.totalSelectionEffect,
+                "totalInteractionEffect": result.totalInteractionEffect,
+                "totalCurrencyEffect": result.totalCurrencyEffect,
+                "totalPortfolioReturnIncludingCurrency": result.totalPortfolioReturnIncludingCurrency,
+            },
+        )
+
+    def _handleIndexConstructAndBacktestRequest(self, requestBody: dict) -> None:
+        """`POST /index/construct-and-backtest` — body carries an optional
+        `constituents` list (`{symbol, closingPrices, sharesOutstandingBillions}`
+        — defaults to the service's ILLUSTRATIVE constituent universe if
+        omitted, see `customIndexConstructionBacktester.py`'s docstring),
+        `constituentCount`, `weightingScheme` ("EQUAL_WEIGHT" or
+        "CAP_WEIGHT"), `rebalanceFrequencyInBars`, an optional `barCount`,
+        and optional `periodsPerYear`/`periodicRiskFreeRate` for the
+        backtest stats. Returns the constructed index's real level series,
+        every rebalance event, and real backtested CAGR/Sharpe/max-
+        drawdown computed from that ACTUAL price path (FEATURES.md §16).
+        """
+        try:
+            if "constituents" in requestBody:
+                universe = [
+                    IndexConstituentHistory(
+                        symbol=str(oneConstituent["symbol"]),
+                        closingPrices=[float(p) for p in oneConstituent["closingPrices"]],
+                        sharesOutstandingBillions=float(oneConstituent["sharesOutstandingBillions"]),
+                    )
+                    for oneConstituent in requestBody["constituents"]
+                ]
+            else:
+                universe = ILLUSTRATIVE_INDEX_CONSTITUENT_UNIVERSE
+            rule = IndexConstructionRule(
+                constituentCount=int(requestBody["constituentCount"]),
+                weightingScheme=IndexWeightingScheme(str(requestBody["weightingScheme"]).upper()),
+                rebalanceFrequencyInBars=int(requestBody["rebalanceFrequencyInBars"]),
+            )
+            barCount = int(requestBody["barCount"]) if requestBody.get("barCount") is not None else None
+            periodsPerYear = float(requestBody.get("periodsPerYear", 252.0))
+            periodicRiskFreeRate = float(requestBody.get("periodicRiskFreeRate", 0.0))
+        except (KeyError, TypeError, ValueError) as validationError:
+            self._writeJsonResponse(400, {"errorMessage": f"invalid request body: {validationError}"})
+            return
+
+        try:
+            constructed = constructCustomIndex(universe, rule, barCount)
+            performance = backtestConstructedIndex(constructed, periodsPerYear, periodicRiskFreeRate)
+        except ValueError as indexError:
+            self._writeJsonResponse(422, {"errorMessage": str(indexError)})
+            return
+
+        self._writeJsonResponse(
+            200,
+            {
+                "indexLevelSeries": constructed.indexLevelSeries,
+                "rebalanceEvents": [
+                    {
+                        "barIndex": event.barIndex,
+                        "constituentSymbols": event.constituentSymbols,
+                        "targetWeights": event.targetWeights,
+                    }
+                    for event in constructed.rebalanceEvents
+                ],
+                "startingIndexLevel": performance.startingIndexLevel,
+                "endingIndexLevel": performance.endingIndexLevel,
+                "compoundAnnualGrowthRate": performance.compoundAnnualGrowthRate,
+                "annualizedSharpeRatio": performance.annualizedSharpeRatio,
+                "maximumDrawdownFraction": performance.maximumDrawdownFraction,
+                "barCount": performance.barCount,
+                "periodsPerYear": performance.periodsPerYear,
+            },
+        )
+
     def _writeJsonResponse(self, statusCode: int, responseBody: dict) -> None:
         responseBytes = json.dumps(responseBody).encode("utf-8")
         self.send_response(statusCode)
@@ -995,7 +1539,13 @@ def runQuantEngineHttpServer() -> None:
         "POST /portfolio/delta-hedge-check, POST /sizing/kelly-criterion, "
         "POST /portfolio/factor-risk, POST /latency/benchmark, "
         "POST /options/corporate-action/split-adjustment, "
-        "POST /options/corporate-action/early-exercise-risk)"
+        "POST /options/corporate-action/early-exercise-risk, "
+        "POST /screener/run, POST /screener/saved-screens/save, "
+        "POST /screener/saved-screens/get, POST /screener/saved-screens/list, "
+        "POST /screener/saved-screens/delete, POST /research/copilot/ask, "
+        "POST /portfolio/health-check, POST /tax/loss-harvesting-plan, "
+        "POST /alternative-data/sentiment-signal, POST /alternative-data/filing-anomaly, "
+        "POST /pnl-attribution/brinson, POST /index/construct-and-backtest)"
     )
     httpServer.serve_forever()
 
