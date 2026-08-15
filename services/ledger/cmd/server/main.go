@@ -1,14 +1,18 @@
 // Mercurius / ledger
 //
-// Tier 2 component per ARCHITECTURE.md §6. A real in-memory double-entry
-// accounting core (internal/doubleentry) exposed over HTTP — now
-// including a /journal-entries endpoint so other services (oms-gateway,
-// as of this build) can actually post trade settlements, not just read
-// balances, and a real withdrawal workflow with T+N settlement holds
-// (internal/withdrawalworkflow). NOT yet backed by PostgreSQL.
+// Tier 2 component per ARCHITECTURE.md §6. A real double-entry
+// accounting core (internal/doubleentry) exposed over HTTP — including a
+// /journal-entries endpoint so other services (oms-gateway) can actually
+// post trade settlements, not just read balances, and a real withdrawal
+// workflow with T+N settlement holds (internal/withdrawalworkflow). Now
+// real-Postgres-backed by default (internal/pgstore) — see
+// docs/BUILD_LOG.md's Postgres-persistence entry — with an in-memory
+// fallback if Postgres isn't reachable at startup (see main()'s own
+// comment on that choice).
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -25,6 +29,7 @@ import (
 	"mercurius/ledger/internal/httplogging"
 	"mercurius/ledger/internal/multicurrencywallet"
 	"mercurius/ledger/internal/paymentmandate"
+	"mercurius/ledger/internal/pgstore"
 	"mercurius/ledger/internal/withdrawalworkflow"
 )
 
@@ -44,17 +49,48 @@ func main() {
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, nil)))
 
 	// TODO(real build): accounts must be created via a real account-opening
-	// flow (tied to KYC completion), not hardcoded, and the ledger must be
-	// PostgreSQL-backed, not in-memory. Account IDs here deliberately match
-	// oms-gateway's demo seed accounts (acct-001, acct-002) so the two
-	// services can be exercised together end-to-end.
-	ledgerBook := doubleentry.NewInMemoryDoubleEntryLedgerBookWithAccounts([]string{
+	// flow (tied to KYC completion), not hardcoded. Account IDs here
+	// deliberately match oms-gateway's demo seed accounts (acct-001,
+	// acct-002) so the two services can be exercised together end-to-end.
+	demoAccountIdentifiers := []string{
 		"acct-001",
 		"acct-002",
 		"firm-clearing-acct",
 		"client-money-custody-pool",
 		"external-cash-suspense",
-	})
+	}
+
+	// Real Postgres persistence (docs/BUILD_LOG.md's Postgres-persistence
+	// entry): defaults to postgres://trading:trading@localhost:5432/ledger,
+	// same hardcoded-dev-default pattern as e.g.
+	// AUTH_JWT_SIGNING_SECRET elsewhere in this repo. Overridable via
+	// POSTGRES_DSN. Known limitation, deliberate for this pass: no
+	// retry/backoff if Postgres isn't reachable at startup — this fails
+	// OPEN to an in-memory book (logged loudly) rather than crashing the
+	// process, matching this repo's existing "degrade, don't crash"
+	// convention for other optional startup dependencies (see
+	// syncRiskEngineBalancesFromLedger in oms-gateway for the same
+	// pattern). A real production deployment would likely want the
+	// opposite (fail hard if the system of record for money isn't
+	// reachable) — see docs/BUILD_LOG.md's known-limitations list.
+	postgresDsn := os.Getenv("POSTGRES_DSN")
+	if postgresDsn == "" {
+		postgresDsn = "postgres://trading:trading@localhost:5432/ledger"
+	}
+
+	var ledgerBook doubleentry.LedgerBook
+	postgresLedgerBook, postgresConnectError := pgstore.NewPostgresLedgerBook(context.Background(), postgresDsn, demoAccountIdentifiers)
+	if postgresConnectError != nil {
+		log.Printf(
+			"WARNING: could not connect ledger to Postgres (%v) — falling back to IN-MEMORY ledger, "+
+				"balances will NOT survive a restart. Set POSTGRES_DSN to point at a reachable Postgres to fix this.",
+			postgresConnectError,
+		)
+		ledgerBook = doubleentry.NewInMemoryDoubleEntryLedgerBookWithAccounts(demoAccountIdentifiers)
+	} else {
+		log.Printf("ledger connected to Postgres at %s — balances and journal entries are now durable across restarts", postgresDsn)
+		ledgerBook = postgresLedgerBook
+	}
 
 	// Client fund segregation (FEATURES.md §1): acct-001/acct-002 are the
 	// firm's demo CLIENT accounts, firm-clearing-acct is the firm's own
@@ -158,15 +194,15 @@ func main() {
 
 	listenAddress := ":8082"
 	log.Printf(
-		"ledger listening on %s — in-memory only, not Postgres-backed yet (withdrawal settlement hold: T+%d days)\n",
-		listenAddress, settlementHoldDurationDays,
+		"ledger listening on %s — postgresBacked=%t (withdrawal settlement hold: T+%d days)\n",
+		listenAddress, postgresConnectError == nil, settlementHoldDurationDays,
 	)
 	if serverStartupError := http.ListenAndServe(listenAddress, httplogging.WithRequestLogging(httpRequestMultiplexer)); serverStartupError != nil {
 		log.Fatalf("ledger failed to start: %v", serverStartupError)
 	}
 }
 
-func buildBalanceLookupHandler(ledgerBook *doubleentry.InMemoryDoubleEntryLedgerBook, withdrawalWorkflowInstance *withdrawalworkflow.WithdrawalWorkflow) http.HandlerFunc {
+func buildBalanceLookupHandler(ledgerBook doubleentry.LedgerBook, withdrawalWorkflowInstance *withdrawalworkflow.WithdrawalWorkflow) http.HandlerFunc {
 	return func(responseWriter http.ResponseWriter, request *http.Request) {
 		accountIdentifier := request.URL.Query().Get("accountId")
 		if accountIdentifier == "" {
@@ -218,7 +254,7 @@ type PostJournalEntryWireResponse struct {
 	ErrorMessage          string `json:"errorMessage,omitempty"`
 }
 
-func buildPostJournalEntryHandler(ledgerBook *doubleentry.InMemoryDoubleEntryLedgerBook) http.HandlerFunc {
+func buildPostJournalEntryHandler(ledgerBook doubleentry.LedgerBook) http.HandlerFunc {
 	return func(responseWriter http.ResponseWriter, request *http.Request) {
 		if request.Method != http.MethodPost {
 			http.Error(responseWriter, "only POST is supported", http.StatusMethodNotAllowed)
@@ -1160,7 +1196,7 @@ func buildWalletListHandler(registry *multicurrencywallet.MultiCurrencyWalletReg
 // journal entry, in post order) as JSON — exactly
 // doubleentry.LedgerBookSnapshot's shape, so the response body can be
 // saved to disk and later POSTed back to /admin/restore unmodified.
-func buildAdminSnapshotHandler(ledgerBook *doubleentry.InMemoryDoubleEntryLedgerBook) http.HandlerFunc {
+func buildAdminSnapshotHandler(ledgerBook doubleentry.LedgerBook) http.HandlerFunc {
 	return func(responseWriter http.ResponseWriter, request *http.Request) {
 		if request.Method != http.MethodGet {
 			http.Error(responseWriter, "only GET is supported", http.StatusMethodNotAllowed)
@@ -1186,7 +1222,7 @@ type adminRestoreWireResponse struct {
 // not a merge. Safe under concurrent requests: the actual swap happens
 // inside doubleentry.RestoreFromSnapshot, under the same mutex every
 // other ledger mutation goes through.
-func buildAdminRestoreHandler(ledgerBook *doubleentry.InMemoryDoubleEntryLedgerBook) http.HandlerFunc {
+func buildAdminRestoreHandler(ledgerBook doubleentry.LedgerBook) http.HandlerFunc {
 	return func(responseWriter http.ResponseWriter, request *http.Request) {
 		if request.Method != http.MethodPost {
 			http.Error(responseWriter, "only POST is supported", http.StatusMethodNotAllowed)

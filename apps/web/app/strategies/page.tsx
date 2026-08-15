@@ -29,6 +29,7 @@
 
 import { useEffect, useState } from "react";
 import Link from "next/link";
+import { loadSession } from "../session/authSession";
 
 const omsGatewayBaseUrl = process.env.NEXT_PUBLIC_OMS_GATEWAY_BASE_URL ?? "http://localhost:8081";
 
@@ -53,8 +54,15 @@ export default function StrategiesPage() {
 
   async function refreshVerifiedStrategies() {
     setErrorMessage(null);
+    const storedSession = loadSession();
+    if (!storedSession?.accessToken) {
+      setErrorMessage("Log in first from the dashboard's Account panel to use this.");
+      return;
+    }
     try {
-      const httpResponse = await fetch(`${omsGatewayBaseUrl}/strategies`);
+      const httpResponse = await fetch(`${omsGatewayBaseUrl}/strategies`, {
+        headers: { Authorization: `Bearer ${storedSession.accessToken}` },
+      });
       if (!httpResponse.ok) throw new Error(`HTTP ${httpResponse.status}`);
       const parsed: VerifiedStrategy[] = await httpResponse.json();
       setVerifiedStrategies(parsed);
@@ -68,9 +76,12 @@ export default function StrategiesPage() {
   }
 
   async function refreshFollowedStrategies() {
+    const storedSession = loadSession();
+    if (!storedSession?.accessToken) return;
     try {
       const httpResponse = await fetch(
-        `${omsGatewayBaseUrl}/strategies/following?accountId=${encodeURIComponent(accountIdentifier)}`
+        `${omsGatewayBaseUrl}/strategies/following?accountId=${encodeURIComponent(accountIdentifier)}`,
+        { headers: { Authorization: `Bearer ${storedSession.accessToken}` } }
       );
       if (!httpResponse.ok) throw new Error(`HTTP ${httpResponse.status}`);
       const parsed: { followedStrategyIdentifiers: string[] } = await httpResponse.json();
@@ -94,14 +105,22 @@ export default function StrategiesPage() {
   }, [accountIdentifier]);
 
   async function toggleFollow(strategyIdentifier: string, shouldFollowNotUnfollow: boolean) {
-    setIsBusyStrategyIdentifier(strategyIdentifier);
     setErrorMessage(null);
+    const storedSession = loadSession();
+    if (!storedSession?.accessToken) {
+      setErrorMessage("Log in first from the dashboard's Account panel to use this.");
+      return;
+    }
+    setIsBusyStrategyIdentifier(strategyIdentifier);
     try {
       const httpResponse = await fetch(
         `${omsGatewayBaseUrl}/strategies/${shouldFollowNotUnfollow ? "follow" : "unfollow"}`,
         {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${storedSession.accessToken}`,
+          },
           body: JSON.stringify({ accountIdentifier, strategyIdentifier }),
         }
       );
@@ -119,10 +138,18 @@ export default function StrategiesPage() {
 
   async function verifyStrategyAsAdmin() {
     setAdminStatusMessage(null);
+    const storedSession = loadSession();
+    if (!storedSession?.accessToken) {
+      setAdminStatusMessage("Log in first from the dashboard's Account panel to use this.");
+      return;
+    }
     try {
       const httpResponse = await fetch(`${omsGatewayBaseUrl}/strategies/admin/verify`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${storedSession.accessToken}`,
+        },
         body: JSON.stringify({
           strategyIdentifier: adminStrategyIdentifier,
           displayName: adminDisplayName,

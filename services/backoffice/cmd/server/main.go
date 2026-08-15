@@ -27,6 +27,7 @@ import (
 	"time"
 
 	"mercurius/backoffice/internal/accountcontrol"
+	"mercurius/backoffice/internal/authmiddleware"
 	"mercurius/backoffice/internal/familyaccountaccess"
 	"mercurius/backoffice/internal/httplogging"
 	"mercurius/backoffice/internal/ledgerclient"
@@ -51,6 +52,8 @@ func main() {
 		ledgerBaseUrl = "http://127.0.0.1:8082"
 	}
 
+	jwtSigningSecret := authmiddleware.SigningSecretFromEnv()
+
 	accountFreezeStateMachine := accountcontrol.NewAccountFreezeStateMachine()
 	omsGatewayClient := omsgatewayclient.NewOmsGatewayClient(omsGatewayBaseUrl)
 	ledgerClient := ledgerclient.NewLedgerClient(ledgerBaseUrl)
@@ -65,52 +68,135 @@ func main() {
 		responseWriter.WriteHeader(http.StatusOK)
 		_, _ = responseWriter.Write([]byte(`{"status":"ok","service":"backoffice"}`))
 	})
-	httpRequestMultiplexer.HandleFunc("/accounts/freeze", buildFreezeHandler(accountFreezeStateMachine))
-	httpRequestMultiplexer.HandleFunc("/accounts/unfreeze", buildUnfreezeHandler(accountFreezeStateMachine))
-	httpRequestMultiplexer.HandleFunc("/accounts/freeze-status", buildFreezeStatusHandler(accountFreezeStateMachine))
+	// Account freeze/unfreeze are operator (compliance/admin) actions —
+	// they act ON a customer's account, not the customer acting on their
+	// own, so they're role-gated rather than self-service. Freezing/
+	// unfreezing is the higher-stakes mutation (admin-only); checking
+	// freeze status is a read a support agent routinely needs while
+	// assisting a customer, so it's gated to RoleSupport instead.
+	httpRequestMultiplexer.HandleFunc("/accounts/freeze", authmiddleware.RequireRole(jwtSigningSecret, authmiddleware.RoleAdmin, buildFreezeHandler(accountFreezeStateMachine)))
+	httpRequestMultiplexer.HandleFunc("/accounts/unfreeze", authmiddleware.RequireRole(jwtSigningSecret, authmiddleware.RoleAdmin, buildUnfreezeHandler(accountFreezeStateMachine)))
+	httpRequestMultiplexer.HandleFunc("/accounts/freeze-status", authmiddleware.RequireRole(jwtSigningSecret, authmiddleware.RoleSupport, buildFreezeStatusHandler(accountFreezeStateMachine)))
 
-	httpRequestMultiplexer.HandleFunc("/strategy-leaderboard", buildStrategyLeaderboardHandler(strategyLeaderboardRanker))
+	// The leaderboard carries no account identifier at all (it's a
+	// global ranking, not account-scoped data) — any authenticated
+	// caller may view it, no ownership check applies.
+	httpRequestMultiplexer.HandleFunc("/strategy-leaderboard", authmiddleware.RequireAuth(jwtSigningSecret, buildStrategyLeaderboardHandler(strategyLeaderboardRanker)))
 
-	httpRequestMultiplexer.HandleFunc("/family-access/link", buildRegisterFamilyLinkHandler(familyAccountAccessRegistry))
-	httpRequestMultiplexer.HandleFunc("/family-access/revoke", buildRevokeFamilyLinkHandler(familyAccountAccessRegistry))
-	httpRequestMultiplexer.HandleFunc("/family-access/links", buildLinksForOwnerHandler(familyAccountAccessRegistry))
-	httpRequestMultiplexer.HandleFunc("/family-access/positions", buildFamilyAccessPositionsHandler(familyAccountAccessRegistry, omsGatewayClient))
+	httpRequestMultiplexer.HandleFunc("/family-access/link", authmiddleware.RequireAuth(jwtSigningSecret, buildRegisterFamilyLinkHandler(familyAccountAccessRegistry)))
+	httpRequestMultiplexer.HandleFunc("/family-access/revoke", authmiddleware.RequireAuth(jwtSigningSecret, buildRevokeFamilyLinkHandler(familyAccountAccessRegistry)))
+	httpRequestMultiplexer.HandleFunc("/family-access/links", authmiddleware.RequireAuth(jwtSigningSecret, buildLinksForOwnerHandler(familyAccountAccessRegistry)))
+	httpRequestMultiplexer.HandleFunc("/family-access/positions", authmiddleware.RequireAuth(jwtSigningSecret, buildFamilyAccessPositionsHandler(familyAccountAccessRegistry, omsGatewayClient)))
 
-	httpRequestMultiplexer.HandleFunc("/nominee-succession/register-nominee", buildRegisterNomineeHandler(nomineeSuccessionRegistry))
-	httpRequestMultiplexer.HandleFunc("/nominee-succession/nominee", buildGetNomineeHandler(nomineeSuccessionRegistry))
-	httpRequestMultiplexer.HandleFunc("/nominee-succession/submit", buildSubmitSuccessionRequestHandler(nomineeSuccessionRegistry))
-	httpRequestMultiplexer.HandleFunc("/nominee-succession/move-to-under-review", buildMoveToUnderReviewHandler(nomineeSuccessionRegistry))
-	httpRequestMultiplexer.HandleFunc("/nominee-succession/approve", buildApproveHandler(nomineeSuccessionRegistry))
-	httpRequestMultiplexer.HandleFunc("/nominee-succession/mark-transferred", buildMarkTransferredHandler(nomineeSuccessionRegistry))
-	httpRequestMultiplexer.HandleFunc("/nominee-succession/reject", buildRejectHandler(nomineeSuccessionRegistry))
-	httpRequestMultiplexer.HandleFunc("/nominee-succession/status", buildGetSuccessionRequestHandler(nomineeSuccessionRegistry))
-	httpRequestMultiplexer.HandleFunc("/nominee-succession/audit-trail", buildSuccessionAuditTrailHandler(nomineeSuccessionRegistry))
+	httpRequestMultiplexer.HandleFunc("/nominee-succession/register-nominee", authmiddleware.RequireAuth(jwtSigningSecret, buildRegisterNomineeHandler(nomineeSuccessionRegistry)))
+	httpRequestMultiplexer.HandleFunc("/nominee-succession/nominee", authmiddleware.RequireAuth(jwtSigningSecret, buildGetNomineeHandler(nomineeSuccessionRegistry)))
+	httpRequestMultiplexer.HandleFunc("/nominee-succession/submit", authmiddleware.RequireAuth(jwtSigningSecret, buildSubmitSuccessionRequestHandler(nomineeSuccessionRegistry)))
+	// The succession review/decision pipeline is operator-driven, not
+	// self-service: moving a request into review is routine support
+	// triage (RoleSupport); approving, marking transferred, and
+	// rejecting are the irreversible compliance decisions further down
+	// the pipeline, reserved for RoleAdmin. Status/audit-trail lookups
+	// are read-only operator tooling (RoleSupport).
+	httpRequestMultiplexer.HandleFunc("/nominee-succession/move-to-under-review", authmiddleware.RequireRole(jwtSigningSecret, authmiddleware.RoleSupport, buildMoveToUnderReviewHandler(nomineeSuccessionRegistry)))
+	httpRequestMultiplexer.HandleFunc("/nominee-succession/approve", authmiddleware.RequireRole(jwtSigningSecret, authmiddleware.RoleAdmin, buildApproveHandler(nomineeSuccessionRegistry)))
+	httpRequestMultiplexer.HandleFunc("/nominee-succession/mark-transferred", authmiddleware.RequireRole(jwtSigningSecret, authmiddleware.RoleAdmin, buildMarkTransferredHandler(nomineeSuccessionRegistry)))
+	httpRequestMultiplexer.HandleFunc("/nominee-succession/reject", authmiddleware.RequireRole(jwtSigningSecret, authmiddleware.RoleAdmin, buildRejectHandler(nomineeSuccessionRegistry)))
+	httpRequestMultiplexer.HandleFunc("/nominee-succession/status", authmiddleware.RequireRole(jwtSigningSecret, authmiddleware.RoleSupport, buildGetSuccessionRequestHandler(nomineeSuccessionRegistry)))
+	httpRequestMultiplexer.HandleFunc("/nominee-succession/audit-trail", authmiddleware.RequireRole(jwtSigningSecret, authmiddleware.RoleSupport, buildSuccessionAuditTrailHandler(nomineeSuccessionRegistry)))
 
-	httpRequestMultiplexer.HandleFunc("/support/tickets/create", buildCreateTicketHandler(supportTicketRegistry))
-	httpRequestMultiplexer.HandleFunc("/support/tickets/customer-message", buildAddCustomerMessageHandler(supportTicketRegistry))
-	httpRequestMultiplexer.HandleFunc("/support/tickets/agent-reply", buildAddAgentReplyHandler(supportTicketRegistry))
-	httpRequestMultiplexer.HandleFunc("/support/tickets/assign", buildAssignAgentHandler(supportTicketRegistry))
-	httpRequestMultiplexer.HandleFunc("/support/tickets/status", buildTransitionStatusHandler(supportTicketRegistry))
-	httpRequestMultiplexer.HandleFunc("/support/tickets/get", buildGetTicketHandler(supportTicketRegistry))
-	httpRequestMultiplexer.HandleFunc("/support/tickets/thread", buildGetMessageThreadHandler(supportTicketRegistry))
-	httpRequestMultiplexer.HandleFunc("/support/tickets/by-account", buildTicketsForAccountHandler(supportTicketRegistry))
-	httpRequestMultiplexer.HandleFunc("/support/tickets/by-agent", buildTicketsForAgentHandler(supportTicketRegistry))
-	httpRequestMultiplexer.HandleFunc("/support/tickets/queue", buildSupportQueueHandler(supportTicketRegistry))
+	httpRequestMultiplexer.HandleFunc("/support/tickets/create", authmiddleware.RequireAuth(jwtSigningSecret, buildCreateTicketHandler(supportTicketRegistry)))
+	httpRequestMultiplexer.HandleFunc("/support/tickets/customer-message", authmiddleware.RequireAuth(jwtSigningSecret, buildAddCustomerMessageHandler(supportTicketRegistry)))
+	// Agent-side ticket operations act on behalf of the support
+	// operator, not the customer — RoleSupport, no account-ownership
+	// check applies (there is no "own account" for an agent action).
+	httpRequestMultiplexer.HandleFunc("/support/tickets/agent-reply", authmiddleware.RequireRole(jwtSigningSecret, authmiddleware.RoleSupport, buildAddAgentReplyHandler(supportTicketRegistry)))
+	httpRequestMultiplexer.HandleFunc("/support/tickets/assign", authmiddleware.RequireRole(jwtSigningSecret, authmiddleware.RoleSupport, buildAssignAgentHandler(supportTicketRegistry)))
+	httpRequestMultiplexer.HandleFunc("/support/tickets/status", authmiddleware.RequireRole(jwtSigningSecret, authmiddleware.RoleSupport, buildTransitionStatusHandler(supportTicketRegistry)))
+	httpRequestMultiplexer.HandleFunc("/support/tickets/get", authmiddleware.RequireAuth(jwtSigningSecret, buildGetTicketHandler(supportTicketRegistry)))
+	httpRequestMultiplexer.HandleFunc("/support/tickets/thread", authmiddleware.RequireAuth(jwtSigningSecret, buildGetMessageThreadHandler(supportTicketRegistry)))
+	httpRequestMultiplexer.HandleFunc("/support/tickets/by-account", authmiddleware.RequireAuth(jwtSigningSecret, buildTicketsForAccountHandler(supportTicketRegistry)))
+	httpRequestMultiplexer.HandleFunc("/support/tickets/by-agent", authmiddleware.RequireRole(jwtSigningSecret, authmiddleware.RoleSupport, buildTicketsForAgentHandler(supportTicketRegistry)))
+	httpRequestMultiplexer.HandleFunc("/support/tickets/queue", authmiddleware.RequireRole(jwtSigningSecret, authmiddleware.RoleSupport, buildSupportQueueHandler(supportTicketRegistry)))
 
-	httpRequestMultiplexer.HandleFunc("/referral-rewards/generate-code", buildGenerateReferralCodeHandler(referralRewardsRegistry))
-	httpRequestMultiplexer.HandleFunc("/referral-rewards/record-referral", buildRecordReferralHandler(referralRewardsRegistry))
-	httpRequestMultiplexer.HandleFunc("/referral-rewards/status", buildReferralStatusHandler(referralRewardsRegistry))
-	httpRequestMultiplexer.HandleFunc("/referral-rewards/referrals", buildReferralsForReferrerHandler(referralRewardsRegistry))
-	httpRequestMultiplexer.HandleFunc("/referral-rewards/check-and-qualify", buildCheckAndQualifyReferralHandler(referralRewardsRegistry, omsGatewayClient, ledgerClient))
+	httpRequestMultiplexer.HandleFunc("/referral-rewards/generate-code", authmiddleware.RequireAuth(jwtSigningSecret, buildGenerateReferralCodeHandler(referralRewardsRegistry)))
+	httpRequestMultiplexer.HandleFunc("/referral-rewards/record-referral", authmiddleware.RequireAuth(jwtSigningSecret, buildRecordReferralHandler(referralRewardsRegistry)))
+	httpRequestMultiplexer.HandleFunc("/referral-rewards/status", authmiddleware.RequireAuth(jwtSigningSecret, buildReferralStatusHandler(referralRewardsRegistry)))
+	httpRequestMultiplexer.HandleFunc("/referral-rewards/referrals", authmiddleware.RequireAuth(jwtSigningSecret, buildReferralsForReferrerHandler(referralRewardsRegistry)))
+	httpRequestMultiplexer.HandleFunc("/referral-rewards/check-and-qualify", authmiddleware.RequireAuth(jwtSigningSecret, buildCheckAndQualifyReferralHandler(referralRewardsRegistry, omsGatewayClient, ledgerClient)))
 
+	// Genuinely public reference data — no account is ever involved.
 	httpRequestMultiplexer.HandleFunc("/localization/languages", buildLocalizationLanguagesHandler())
 	httpRequestMultiplexer.HandleFunc("/localization/", buildLocalizationCatalogHandler())
 
 	listenAddress := ":8084"
-	log.Printf("backoffice listening on %s\n", listenAddress)
-	if serverStartupError := http.ListenAndServe(listenAddress, httplogging.WithRequestLogging(httpRequestMultiplexer)); serverStartupError != nil {
+	log.Printf("backoffice listening on %s (CORS allow-listed via CORS_ALLOWED_ORIGINS)\n", listenAddress)
+	instrumentedHandler := withAllowListedCorsForDevelopment(httplogging.WithRequestLogging(httpRequestMultiplexer))
+	if serverStartupError := http.ListenAndServe(listenAddress, instrumentedHandler); serverStartupError != nil {
 		log.Fatalf("backoffice failed to start: %v", serverStartupError)
 	}
+}
+
+// ---------------------------------------------------------------------
+// CORS — allow-listed origin echo (not the wide-open `*` pattern this
+// build's other, still-unauthenticated services use). Now that this
+// service gates routes on bearer tokens and a browser client may send
+// credentials, `Access-Control-Allow-Origin: *` is actively wrong: the
+// CORS spec forbids `*` alongside credentialed requests and browsers
+// reject it outright. Instead, this echoes back the exact Origin header
+// when (and only when) it's in the allow-list, plus
+// Access-Control-Allow-Credentials: true; a non-matching Origin gets no
+// CORS headers at all, which the browser then correctly blocks.
+func withAllowListedCorsForDevelopment(nextHandler http.Handler) http.Handler {
+	allowedOrigins := allowedCorsOriginsFromEnv()
+	return http.HandlerFunc(func(responseWriter http.ResponseWriter, request *http.Request) {
+		requestOrigin := request.Header.Get("Origin")
+		if requestOrigin != "" && allowedOrigins[requestOrigin] {
+			responseWriter.Header().Set("Access-Control-Allow-Origin", requestOrigin)
+			responseWriter.Header().Set("Access-Control-Allow-Credentials", "true")
+			responseWriter.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+			responseWriter.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+		}
+
+		if request.Method == http.MethodOptions {
+			responseWriter.WriteHeader(http.StatusNoContent)
+			return
+		}
+
+		nextHandler.ServeHTTP(responseWriter, request)
+	})
+}
+
+// allowedCorsOriginsFromEnv reads CORS_ALLOWED_ORIGINS as a
+// comma-separated origin list, defaulting to the two ports apps/web runs
+// on in local development when unset.
+func allowedCorsOriginsFromEnv() map[string]bool {
+	rawOrigins := os.Getenv("CORS_ALLOWED_ORIGINS")
+	if rawOrigins == "" {
+		rawOrigins = "http://localhost:3000,http://localhost:3100"
+	}
+	allowedOrigins := make(map[string]bool)
+	for _, origin := range strings.Split(rawOrigins, ",") {
+		trimmedOrigin := strings.TrimSpace(origin)
+		if trimmedOrigin != "" {
+			allowedOrigins[trimmedOrigin] = true
+		}
+	}
+	return allowedOrigins
+}
+
+// requireOwnAccount is the standard self-service guard for every
+// authenticated-retail route in this service that carries an account
+// identifier: the caller may only ever act on the account their own
+// access token was issued for. On mismatch it writes the 403 this task
+// specifies and returns false; callers must stop handling the request
+// (return immediately) when this returns false.
+func requireOwnAccount(responseWriter http.ResponseWriter, request *http.Request, accountIdentifier string) bool {
+	authenticatedAccountIdentifier, _ := authmiddleware.AuthenticatedAccountIdentifier(request)
+	if authenticatedAccountIdentifier != accountIdentifier {
+		respondWithJson(responseWriter, http.StatusForbidden, map[string]any{"errorMessage": "you can only act on your own account"})
+		return false
+	}
+	return true
 }
 
 // ---------------------------------------------------------------------
@@ -128,9 +214,9 @@ type freezeActionWireRequest struct {
 }
 
 func buildFreezeHandler(accountFreezeStateMachine *accountcontrol.AccountFreezeStateMachine) http.HandlerFunc {
-	// TODO(real build): this endpoint has no auth/RBAC — anyone who can
-	// reach it can freeze any account. Fine for a skeleton exercised by
-	// developers; not fine for anything with real admin access controls.
+	// RBAC: gated to authmiddleware.RoleAdmin at the mux registration
+	// site in main() — only an authenticated admin caller can reach this
+	// handler at all.
 	return func(responseWriter http.ResponseWriter, request *http.Request) {
 		if request.Method != http.MethodPost {
 			http.Error(responseWriter, "only POST is supported", http.StatusMethodNotAllowed)
@@ -219,9 +305,10 @@ func buildStrategyLeaderboardHandler(ranker *strategyleaderboard.Ranker) http.Ha
 
 // ---------------------------------------------------------------------
 // FEATURES.md §21 family/joint account view-only access —
-// internal/familyaccountaccess. TODO(real build): no auth/RBAC on any
-// of these endpoints — same gap the freeze endpoints above already
-// document.
+// internal/familyaccountaccess. Every endpoint below requires a valid
+// access token (authmiddleware.RequireAuth) and enforces that the
+// caller only ever acts as their own account (requireOwnAccount) —
+// self-service, not admin-only.
 
 type familyLinkWireRequest struct {
 	OwnerAccountIdentifier  string `json:"ownerAccountIdentifier"`
@@ -238,6 +325,9 @@ func buildRegisterFamilyLinkHandler(registry *familyaccountaccess.Registry) http
 		var wireRequest familyLinkWireRequest
 		if decodeError := json.NewDecoder(request.Body).Decode(&wireRequest); decodeError != nil {
 			http.Error(responseWriter, "malformed family-link request payload", http.StatusBadRequest)
+			return
+		}
+		if !requireOwnAccount(responseWriter, request, wireRequest.OwnerAccountIdentifier) {
 			return
 		}
 		linkError := registry.RegisterFamilyLink(
@@ -269,6 +359,9 @@ func buildRevokeFamilyLinkHandler(registry *familyaccountaccess.Registry) http.H
 			http.Error(responseWriter, "malformed family-link revoke payload", http.StatusBadRequest)
 			return
 		}
+		if !requireOwnAccount(responseWriter, request, wireRequest.OwnerAccountIdentifier) {
+			return
+		}
 		registry.RevokeFamilyLink(wireRequest.OwnerAccountIdentifier, wireRequest.ViewerAccountIdentifier)
 		log.Printf("FAMILY_LINK_REVOKED: viewer=%s owner=%s", wireRequest.ViewerAccountIdentifier, wireRequest.OwnerAccountIdentifier)
 		respondWithJson(responseWriter, http.StatusOK, map[string]any{"wasRevoked": true})
@@ -280,6 +373,9 @@ func buildLinksForOwnerHandler(registry *familyaccountaccess.Registry) http.Hand
 		ownerAccountIdentifier := request.URL.Query().Get("ownerAccountId")
 		if ownerAccountIdentifier == "" {
 			http.Error(responseWriter, "missing ownerAccountId query parameter", http.StatusBadRequest)
+			return
+		}
+		if !requireOwnAccount(responseWriter, request, ownerAccountIdentifier) {
 			return
 		}
 		respondWithJson(responseWriter, http.StatusOK, map[string]any{
@@ -306,6 +402,14 @@ func buildFamilyAccessPositionsHandler(registry *familyaccountaccess.Registry, o
 			http.Error(responseWriter, "ownerAccountId and viewerAccountId query parameters are both required", http.StatusBadRequest)
 			return
 		}
+		// The caller here is the viewer (a family member looking at the
+		// owner's positions under a granted permission), not the owner —
+		// self-service means the caller can only ever present themself as
+		// the viewerAccountId; whether that viewer may actually see this
+		// owner's data is then AuthorizeViewOnlyAccess's job below.
+		if !requireOwnAccount(responseWriter, request, viewerAccountIdentifier) {
+			return
+		}
 
 		if authorizeError := registry.AuthorizeViewOnlyAccess(ownerAccountIdentifier, viewerAccountIdentifier); authorizeError != nil {
 			respondWithJson(responseWriter, http.StatusForbidden, map[string]any{"errorMessage": authorizeError.Error()})
@@ -329,8 +433,12 @@ func buildFamilyAccessPositionsHandler(registry *familyaccountaccess.Registry, o
 
 // ---------------------------------------------------------------------
 // FEATURES.md §21 nominee succession workflow —
-// internal/nomineesuccession. TODO(real build): no auth/RBAC on any of
-// these endpoints, same gap as above.
+// internal/nomineesuccession. The account-holder-facing endpoints
+// (register-nominee, nominee, submit) require self-service auth
+// (RequireAuth + requireOwnAccount); the operator review/decision
+// pipeline (move-to-under-review, approve, mark-transferred, reject,
+// status, audit-trail) is role-gated instead — see the reasoning
+// comment at the mux registration sites in main().
 
 type registerNomineeWireRequest struct {
 	AccountIdentifier          string `json:"accountIdentifier"`
@@ -349,6 +457,9 @@ func buildRegisterNomineeHandler(registry *nomineesuccession.Registry) http.Hand
 		var wireRequest registerNomineeWireRequest
 		if decodeError := json.NewDecoder(request.Body).Decode(&wireRequest); decodeError != nil {
 			http.Error(responseWriter, "malformed register-nominee payload", http.StatusBadRequest)
+			return
+		}
+		if !requireOwnAccount(responseWriter, request, wireRequest.AccountIdentifier) {
 			return
 		}
 		registerError := registry.RegisterNominee(
@@ -372,6 +483,9 @@ func buildGetNomineeHandler(registry *nomineesuccession.Registry) http.HandlerFu
 		accountIdentifier := request.URL.Query().Get("accountId")
 		if accountIdentifier == "" {
 			http.Error(responseWriter, "missing accountId query parameter", http.StatusBadRequest)
+			return
+		}
+		if !requireOwnAccount(responseWriter, request, accountIdentifier) {
 			return
 		}
 		nominee, exists := registry.GetNominee(accountIdentifier)
@@ -398,6 +512,9 @@ func buildSubmitSuccessionRequestHandler(registry *nomineesuccession.Registry) h
 		var wireRequest submitSuccessionWireRequest
 		if decodeError := json.NewDecoder(request.Body).Decode(&wireRequest); decodeError != nil {
 			http.Error(responseWriter, "malformed succession-submit payload", http.StatusBadRequest)
+			return
+		}
+		if !requireOwnAccount(responseWriter, request, wireRequest.AccountIdentifier) {
 			return
 		}
 		successionRequest, submitError := registry.SubmitSuccessionRequest(
@@ -497,8 +614,11 @@ func buildSuccessionAuditTrailHandler(registry *nomineesuccession.Registry) http
 
 // ---------------------------------------------------------------------
 // FEATURES.md §14 in-app support chat / ticketing —
-// internal/supportticketing. TODO(real build): no auth/RBAC on any of
-// these endpoints, same documented gap as every other handler above.
+// internal/supportticketing. Customer-facing endpoints (create,
+// customer-message, get, thread, by-account) require self-service auth
+// (RequireAuth + requireOwnAccount); agent-facing endpoints
+// (agent-reply, assign, status, by-agent, queue) are gated to
+// authmiddleware.RoleSupport instead.
 
 type createTicketWireRequest struct {
 	AccountIdentifier  string `json:"accountIdentifier"`
@@ -515,6 +635,9 @@ func buildCreateTicketHandler(registry *supportticketing.Registry) http.HandlerF
 		var wireRequest createTicketWireRequest
 		if decodeError := json.NewDecoder(request.Body).Decode(&wireRequest); decodeError != nil {
 			http.Error(responseWriter, "malformed create-ticket payload", http.StatusBadRequest)
+			return
+		}
+		if !requireOwnAccount(responseWriter, request, wireRequest.AccountIdentifier) {
 			return
 		}
 		ticket, createError := registry.CreateTicket(wireRequest.AccountIdentifier, wireRequest.Subject, wireRequest.InitialMessageBody, time.Now())
@@ -543,6 +666,9 @@ func buildAddCustomerMessageHandler(registry *supportticketing.Registry) http.Ha
 		var wireRequest ticketMessageWireRequest
 		if decodeError := json.NewDecoder(request.Body).Decode(&wireRequest); decodeError != nil {
 			http.Error(responseWriter, "malformed customer-message payload", http.StatusBadRequest)
+			return
+		}
+		if !requireOwnAccount(responseWriter, request, wireRequest.AccountIdentifier) {
 			return
 		}
 		message, messageError := registry.AddCustomerMessage(wireRequest.TicketIdentifier, wireRequest.AccountIdentifier, wireRequest.MessageBody, time.Now())
@@ -639,6 +765,12 @@ func buildGetTicketHandler(registry *supportticketing.Registry) http.HandlerFunc
 			respondWithJson(responseWriter, http.StatusNotFound, map[string]any{"errorMessage": "no ticket found for this id"})
 			return
 		}
+		// The request only carries ticketId, not an account identifier —
+		// self-service ownership has to be checked against the fetched
+		// ticket's own AccountIdentifier instead of a request field.
+		if !requireOwnAccount(responseWriter, request, ticket.AccountIdentifier) {
+			return
+		}
 		respondWithJson(responseWriter, http.StatusOK, ticket)
 	}
 }
@@ -648,6 +780,17 @@ func buildGetMessageThreadHandler(registry *supportticketing.Registry) http.Hand
 		ticketIdentifier := request.URL.Query().Get("ticketId")
 		if ticketIdentifier == "" {
 			http.Error(responseWriter, "missing ticketId query parameter", http.StatusBadRequest)
+			return
+		}
+		// Same fetch-then-check-ownership shape as buildGetTicketHandler
+		// above: a thread's messages are only for the ticket's own
+		// account holder to read.
+		ticket, exists := registry.GetTicket(ticketIdentifier)
+		if !exists {
+			respondWithJson(responseWriter, http.StatusNotFound, map[string]any{"errorMessage": supportticketing.ErrTicketNotFound.Error()})
+			return
+		}
+		if !requireOwnAccount(responseWriter, request, ticket.AccountIdentifier) {
 			return
 		}
 		thread, threadError := registry.MessageThread(ticketIdentifier)
@@ -664,6 +807,9 @@ func buildTicketsForAccountHandler(registry *supportticketing.Registry) http.Han
 		accountIdentifier := request.URL.Query().Get("accountId")
 		if accountIdentifier == "" {
 			http.Error(responseWriter, "missing accountId query parameter", http.StatusBadRequest)
+			return
+		}
+		if !requireOwnAccount(responseWriter, request, accountIdentifier) {
 			return
 		}
 		respondWithJson(responseWriter, http.StatusOK, map[string]any{
@@ -703,8 +849,12 @@ func buildSupportQueueHandler(registry *supportticketing.Registry) http.HandlerF
 
 // ---------------------------------------------------------------------
 // FEATURES.md §14 referral & rewards program —
-// internal/referralrewards. TODO(real build): no auth/RBAC on any of
-// these endpoints, same documented gap as every other handler above.
+// internal/referralrewards. Every endpoint requires self-service auth
+// (RequireAuth + requireOwnAccount), matched against whichever account
+// identifier the caller is meant to be presenting themself as (referrer
+// for generate-code/status/referrals, referred account for
+// record-referral/check-and-qualify — see the reasoning comments on
+// each handler).
 
 type generateReferralCodeWireRequest struct {
 	AccountIdentifier string `json:"accountIdentifier"`
@@ -719,6 +869,9 @@ func buildGenerateReferralCodeHandler(registry *referralrewards.Registry) http.H
 		var wireRequest generateReferralCodeWireRequest
 		if decodeError := json.NewDecoder(request.Body).Decode(&wireRequest); decodeError != nil {
 			http.Error(responseWriter, "malformed generate-code payload", http.StatusBadRequest)
+			return
+		}
+		if !requireOwnAccount(responseWriter, request, wireRequest.AccountIdentifier) {
 			return
 		}
 		code, generateError := registry.GenerateReferralCode(wireRequest.AccountIdentifier)
@@ -749,6 +902,12 @@ func buildRecordReferralHandler(registry *referralrewards.Registry) http.Handler
 			http.Error(responseWriter, "malformed record-referral payload", http.StatusBadRequest)
 			return
 		}
+		// The caller here is the newly-referred account confirming their
+		// own signup against someone else's referral code — self-service
+		// means matching the REFERRED account, not the referrer.
+		if !requireOwnAccount(responseWriter, request, wireRequest.ReferredAccountIdentifier) {
+			return
+		}
 		link, recordError := registry.RecordReferral(wireRequest.ReferralCode, wireRequest.ReferredAccountIdentifier, time.Now())
 		if recordError != nil {
 			respondWithJson(responseWriter, http.StatusBadRequest, map[string]any{"errorMessage": recordError.Error()})
@@ -766,6 +925,9 @@ func buildReferralStatusHandler(registry *referralrewards.Registry) http.Handler
 			http.Error(responseWriter, "missing accountId query parameter", http.StatusBadRequest)
 			return
 		}
+		if !requireOwnAccount(responseWriter, request, accountIdentifier) {
+			return
+		}
 		link, exists := registry.GetReferralLink(accountIdentifier)
 		if !exists {
 			respondWithJson(responseWriter, http.StatusNotFound, map[string]any{"errorMessage": "no referral link found for this account"})
@@ -780,6 +942,9 @@ func buildReferralsForReferrerHandler(registry *referralrewards.Registry) http.H
 		accountIdentifier := request.URL.Query().Get("accountId")
 		if accountIdentifier == "" {
 			http.Error(responseWriter, "missing accountId query parameter", http.StatusBadRequest)
+			return
+		}
+		if !requireOwnAccount(responseWriter, request, accountIdentifier) {
 			return
 		}
 		respondWithJson(responseWriter, http.StatusOK, map[string]any{
@@ -817,6 +982,9 @@ func buildCheckAndQualifyReferralHandler(
 		var wireRequest checkAndQualifyReferralWireRequest
 		if decodeError := json.NewDecoder(request.Body).Decode(&wireRequest); decodeError != nil {
 			http.Error(responseWriter, "malformed check-and-qualify payload", http.StatusBadRequest)
+			return
+		}
+		if !requireOwnAccount(responseWriter, request, wireRequest.ReferredAccountIdentifier) {
 			return
 		}
 

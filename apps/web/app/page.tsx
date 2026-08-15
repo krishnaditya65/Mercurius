@@ -28,6 +28,7 @@ import NotificationCenterSection from "./notificationCenter/notificationCenterSe
 import LanguageSwitcher from "./localization/languageSwitcher";
 import { useLocalization } from "./localization/localizationContext";
 import HomeScreenLivePnlWidget from "./homeScreenLivePnlWidget";
+import { clearSession, loadSession, saveSession, type StoredSession } from "./session/authSession";
 
 const omsGatewayBaseUrl = process.env.NEXT_PUBLIC_OMS_GATEWAY_BASE_URL ?? "http://localhost:8081";
 const marketDataBaseUrl = process.env.NEXT_PUBLIC_MARKET_DATA_BASE_URL ?? "http://localhost:9103";
@@ -97,6 +98,9 @@ export default function RetailTradingDashboardPage() {
           <Link href="/portfolioHealth">Portfolio health</Link>
           <Link href="/taxLossHarvesting">Tax-loss harvesting</Link>
           <Link href="/quantResearchTools">Alt-data / P&amp;L / index builder</Link>
+          <Link href="/portfolioGreeks">Portfolio Greeks</Link>
+          <Link href="/ivRank">IV Rank / Percentile</Link>
+          <Link href="/developerApi">Developer API keys</Link>
         </nav>
       </div>
 
@@ -132,6 +136,16 @@ function AccountSection() {
   const [session, setSession] = useState<AuthTokenResponse | null>(null);
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
   const [isBusy, setIsBusy] = useState(false);
+
+  // Rehydrate from localStorage on mount so a page refresh doesn't
+  // silently lose the logged-in state.
+  useEffect(() => {
+    const storedSession = loadSession();
+    if (storedSession) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect
+      setSession(storedSession);
+    }
+  }, []);
 
   async function callAuthEndpoint(path: string, body: unknown): Promise<AuthTokenResponse> {
     const httpResponse = await fetch(`${authBaseUrl}${path}`, {
@@ -170,6 +184,12 @@ function AccountSection() {
       const response = await callAuthEndpoint("/auth/login", { email, password });
       if (response.accessToken) {
         setSession(response);
+        saveSession({
+          accountIdentifier: response.accountIdentifier,
+          accessToken: response.accessToken,
+          refreshToken: response.refreshToken,
+          expiresInSeconds: response.expiresInSeconds,
+        } satisfies StoredSession);
         setStatusMessage(null);
       } else {
         setStatusMessage(response.errorMessage ?? "Login failed.");
@@ -192,6 +212,7 @@ function AccountSection() {
       await callAuthEndpoint("/auth/logout", { refreshToken: session.refreshToken });
     } finally {
       setSession(null);
+      clearSession();
       setStatusMessage("Logged out.");
       setIsBusy(false);
     }
@@ -285,16 +306,23 @@ function OrderTicketSection() {
 
   async function handleOrderTicketSubmit(formSubmitEvent: React.FormEvent<HTMLFormElement>) {
     formSubmitEvent.preventDefault();
-    setIsSubmittingOrder(true);
     setSubmissionErrorMessage(null);
     setLatestAcknowledgement(null);
     setLatestCoverOrderResponse(null);
 
+    const storedSession = loadSession();
+    if (!storedSession?.accessToken) {
+      setSubmissionErrorMessage("Log in first (see the Account panel above).");
+      return;
+    }
+    const authorizationHeaders: Record<string, string> = { Authorization: `Bearer ${storedSession.accessToken}` };
+
+    setIsSubmittingOrder(true);
     try {
       if (isCoverOrder) {
         const httpResponse = await fetch(`${omsGatewayBaseUrl}/orders/cover-submit`, {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: { "Content-Type": "application/json", ...authorizationHeaders },
           body: JSON.stringify({
             clientAccountIdentifier,
             instrumentSymbol,
@@ -313,7 +341,7 @@ function OrderTicketSection() {
       } else {
         const httpResponse = await fetch(`${omsGatewayBaseUrl}/orders/submit`, {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: { "Content-Type": "application/json", ...authorizationHeaders },
           body: JSON.stringify({
             clientAccountIdentifier,
             instrumentSymbol,
@@ -721,8 +749,15 @@ function MarketSessionSection() {
 
   async function refreshStatus() {
     setStatusErrorMessage(null);
+    const storedSession = loadSession();
+    if (!storedSession?.accessToken) {
+      setStatusErrorMessage("Log in first (see the Account panel above).");
+      return;
+    }
     try {
-      const httpResponse = await fetch(`${omsGatewayBaseUrl}/market-session/status`);
+      const httpResponse = await fetch(`${omsGatewayBaseUrl}/market-session/status`, {
+        headers: { Authorization: `Bearer ${storedSession.accessToken}` },
+      });
       const parsed = await httpResponse.json();
       setIsMarketOpen(parsed.isMarketOpen);
       setQueuedAfterMarketOrders(parsed.queuedAfterMarketOrders);
@@ -733,8 +768,16 @@ function MarketSessionSection() {
 
   async function toggleMarketSession(shouldOpen: boolean) {
     setStatusErrorMessage(null);
+    const storedSession = loadSession();
+    if (!storedSession?.accessToken) {
+      setStatusErrorMessage("Log in first (see the Account panel above).");
+      return;
+    }
     try {
-      await fetch(`${omsGatewayBaseUrl}/market-session/${shouldOpen ? "open" : "close"}`, { method: "POST" });
+      await fetch(`${omsGatewayBaseUrl}/market-session/${shouldOpen ? "open" : "close"}`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${storedSession.accessToken}` },
+      });
       await refreshStatus();
     } catch (thrownError) {
       setStatusErrorMessage(thrownError instanceof Error ? thrownError.message : "Failed to change market session.");
@@ -783,8 +826,15 @@ function PositionsSection() {
   async function fetchPositions() {
     setErrorMessage(null);
     setNetQuantityByInstrumentSymbol(null);
+    const storedSession = loadSession();
+    if (!storedSession?.accessToken) {
+      setErrorMessage("Log in first (see the Account panel above).");
+      return;
+    }
     try {
-      const httpResponse = await fetch(`${omsGatewayBaseUrl}/positions?accountId=${encodeURIComponent(accountIdentifier)}`);
+      const httpResponse = await fetch(`${omsGatewayBaseUrl}/positions?accountId=${encodeURIComponent(accountIdentifier)}`, {
+        headers: { Authorization: `Bearer ${storedSession.accessToken}` },
+      });
       if (!httpResponse.ok) throw new Error(`HTTP ${httpResponse.status}`);
       const parsed = await httpResponse.json();
       setNetQuantityByInstrumentSymbol(parsed.netQuantityByInstrumentSymbol ?? {});
@@ -835,9 +885,15 @@ function OrderLookupSection() {
   async function checkStatus() {
     setErrorMessage(null);
     setCancelResult(null);
+    const storedSession = loadSession();
+    if (!storedSession?.accessToken) {
+      setErrorMessage("Log in first (see the Account panel above).");
+      return;
+    }
     try {
       const httpResponse = await fetch(
-        `${omsGatewayBaseUrl}/orders/status?instrumentSymbol=${encodeURIComponent(instrumentSymbol)}&matchingEngineOrderSequenceNumber=${matchingEngineOrderSequenceNumber}`
+        `${omsGatewayBaseUrl}/orders/status?instrumentSymbol=${encodeURIComponent(instrumentSymbol)}&matchingEngineOrderSequenceNumber=${matchingEngineOrderSequenceNumber}`,
+        { headers: { Authorization: `Bearer ${storedSession.accessToken}` } }
       );
       if (!httpResponse.ok) throw new Error(`HTTP ${httpResponse.status}`);
       setStatusResult(await httpResponse.json());
@@ -849,10 +905,15 @@ function OrderLookupSection() {
   async function cancelOrder() {
     setErrorMessage(null);
     setStatusResult(null);
+    const storedSession = loadSession();
+    if (!storedSession?.accessToken) {
+      setErrorMessage("Log in first (see the Account panel above).");
+      return;
+    }
     try {
       const httpResponse = await fetch(`${omsGatewayBaseUrl}/orders/cancel`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${storedSession.accessToken}` },
         body: JSON.stringify({ instrumentSymbol, matchingEngineOrderSequenceNumber }),
       });
       if (!httpResponse.ok) throw new Error(`HTTP ${httpResponse.status}`);

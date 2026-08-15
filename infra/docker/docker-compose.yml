@@ -2,6 +2,24 @@
 # see ARCHITECTURE.md §7 (Deployment Topology) for that. In particular:
 # the matching engine never runs against this compose file's Redpanda
 # in a latency-sensitive way; this is for Tier 1/2 development only.
+#
+# RESOURCE CAPS: every service below is capped on CPU, memory, and log/PID
+# growth so a runaway container can't choke the host (this happened before —
+# ClickHouse + Redpanda with no caps under `docker compose up` will happily
+# eat all available RAM/CPU). Notes:
+#   - `mem_limit`/`cpus`/`pids_limit` are plain Compose v2 keys — no Swarm
+#     `deploy:` stanza needed, they apply directly to `docker compose up`.
+#   - `logging.options` caps *log-file* disk growth (the #1 way a long-running
+#     dev stack silently fills a disk), rotating at 10MB x 3 files/service.
+#   - True *data-volume* disk quotas aren't portable via Compose (need
+#     `storage_opt: {size: ...}` which only works on specific storage drivers
+#     like `overlay2` with a dedicated XFS/ext4 backing fs — most Docker
+#     Desktop installs don't qualify). Practical substitute: `docker system df`
+#     to check usage and `docker compose down -v` to reclaim the bind-mounted
+#     ./volumes/* directories below when you're done with a session.
+
+x-resource-defaults: &pid-cap
+  pids_limit: 512
 
 services:
   # Ledger / user state — see ARCHITECTURE.md §6
@@ -12,7 +30,17 @@ services:
       POSTGRES_PASSWORD: trading
       POSTGRES_DB: ledger
     ports:
-      - "5432:5432"
+      # Host port intentionally NOT 5432: on at least one real dev machine
+      # this project was built on, a pre-existing system-level PostgreSQL 18
+      # LaunchDaemon already owns 5432 (unstoppable without an interactive
+      # sudo password) — remapped to 5433 on the host side so `make infra-up`
+      # actually succeeds instead of failing on a bind conflict. Container-
+      # internal port is untouched. Every service's POSTGRES_DSN-style env
+      # var still *defaults* to the conventional 5432 in code (matching this
+      # repo's existing env-var documentation convention); point it at 5433
+      # via the env var on machines with this same conflict. See
+      # docs/BUILD_LOG.md (Postgres persistence entry) for the full story.
+      - "5433:5432"
     volumes:
       - ./volumes/postgres:/var/lib/postgresql/data
     healthcheck:
@@ -20,6 +48,15 @@ services:
       interval: 5s
       timeout: 5s
       retries: 10
+    mem_limit: 1g
+    mem_reservation: 256m
+    cpus: 1.0
+    <<: *pid-cap
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 
   # Event backbone (Tier 1→2): market data + trade events fan-out
   redpanda:
@@ -38,6 +75,19 @@ services:
       - "9644:9644" # admin API
     volumes:
       - ./volumes/redpanda:/var/lib/redpanda/data
+    # Hard cap slightly above the --memory 512M the process itself is told to
+    # use, so the container gets OOM-killed with room for the JVM-style
+    # off-heap overhead redpanda's C++ runtime still has, instead of the cap
+    # being so tight it never starts.
+    mem_limit: 1g
+    mem_reservation: 512m
+    cpus: 1.0
+    <<: *pid-cap
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 
   # Tick data / OHLCV storage — see ARCHITECTURE.md §6
   clickhouse:
@@ -55,3 +105,16 @@ services:
       nofile:
         soft: 262144
         hard: 262144
+    # ClickHouse is the single biggest risk of the three — it's happy to use
+    # all cores and cache aggressively in RAM unless told otherwise. This cap
+    # plus max_server_memory_usage below keep it inside the container limit
+    # rather than letting the OOM killer be the only backstop.
+    mem_limit: 2g
+    mem_reservation: 512m
+    cpus: 2.0
+    pids_limit: 1024
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

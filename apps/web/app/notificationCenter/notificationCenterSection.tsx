@@ -59,6 +59,7 @@
 // per project convention.
 
 import { useEffect, useRef, useState } from "react";
+import { loadSession } from "../session/authSession";
 
 const omsGatewayBaseUrl = process.env.NEXT_PUBLIC_OMS_GATEWAY_BASE_URL ?? "http://localhost:8081";
 const marketDataBaseUrl = process.env.NEXT_PUBLIC_MARKET_DATA_BASE_URL ?? "http://localhost:9103";
@@ -118,6 +119,7 @@ export default function NotificationCenterSection() {
   // read.
   const seenAuditEntryIdentities = useRef<Set<string>>(new Set());
   const seenTriggeredAlertIds = useRef<Set<number>>(new Set());
+  const hasWarnedAboutMissingSessionForAuditTrail = useRef(false);
 
   useEffect(() => {
     // eslint-disable-next-line react-hooks/set-state-in-effect
@@ -144,9 +146,19 @@ export default function NotificationCenterSection() {
     if (!isOrderFillWatchEnabled && !isMarginCallWatchEnabled) return;
 
     async function pollAuditTrailOnce() {
+      const storedSession = loadSession();
+      if (!storedSession?.accessToken) {
+        if (!hasWarnedAboutMissingSessionForAuditTrail.current) {
+          hasWarnedAboutMissingSessionForAuditTrail.current = true;
+          appendToNotificationLog("Log in first from the dashboard's Account panel to watch order fills / margin rejections.");
+        }
+        return;
+      }
+      hasWarnedAboutMissingSessionForAuditTrail.current = false;
       try {
         const httpResponse = await fetch(
-          `${omsGatewayBaseUrl}/audit-trail?accountId=${encodeURIComponent(accountIdentifier)}`
+          `${omsGatewayBaseUrl}/audit-trail?accountId=${encodeURIComponent(accountIdentifier)}`,
+          { headers: { Authorization: `Bearer ${storedSession.accessToken}` } }
         );
         if (!httpResponse.ok) return;
         const entries: AuditTrailEntry[] = await httpResponse.json();

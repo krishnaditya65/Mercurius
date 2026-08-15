@@ -51,6 +51,26 @@ func (journalEntry JournalEntry) sumOfCreditLinesInMinorUnits() int64 {
 	return total
 }
 
+// LedgerBook is the public surface every consumer in this service
+// (internal/fundsegregation, internal/withdrawalworkflow,
+// internal/multicurrencywallet, cmd/server/main.go's admin
+// snapshot/restore handlers) actually depends on. It exists so
+// cmd/server/main.go can construct EITHER InMemoryDoubleEntryLedgerBook
+// (this file) OR internal/pgstore's real Postgres-backed implementation
+// and hand either one to every consumer unchanged — the
+// interface-preserving persistence swap described in
+// docs/BUILD_LOG.md's Postgres-persistence entry. InMemoryDoubleEntryLedgerBook
+// satisfies this interface using the exact same method signatures it
+// already had before this interface existed; nothing about its own
+// behavior changed to conform to it.
+type LedgerBook interface {
+	PostJournalEntry(journalEntry JournalEntry) error
+	RegisterAccountIfAbsent(accountIdentifier string) bool
+	CurrentBalanceInMinorUnits(accountIdentifier string) (int64, error)
+	CaptureSnapshot() LedgerBookSnapshot
+	RestoreFromSnapshot(snapshot LedgerBookSnapshot)
+}
+
 // InMemoryDoubleEntryLedgerBook is the skeleton's stand-in for the real
 // Postgres-backed ledger. It enforces the one rule that actually matters:
 // no journal entry is ever posted unless it balances.

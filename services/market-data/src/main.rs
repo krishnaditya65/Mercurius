@@ -30,6 +30,7 @@ mod l1QuoteWireProtocol;
 mod livePnlWidget;
 mod marketDataEventTypes;
 mod orderFlowFootprintAggregator;
+mod pgBacking;
 mod pricealerts;
 mod simulatedExchangeFeedGenerator;
 mod udpMulticastPublisher;
@@ -101,8 +102,42 @@ fn main() {
         "market-data listening on {MARKET_DATA_INGESTION_TCP_LISTEN_ADDRESS} for depth publishes from matching-engine"
     );
 
-    let sharedState = Arc::new(SharedMarketDataState::newEmptyStateWithOmsGatewayAddress(
+    // Real Postgres persistence for watchlist.rs's WatchlistStore and
+    // pricealerts.rs's PriceAlertStore (docs/BUILD_LOG.md's
+    // Postgres-persistence entry) — defaults to
+    // postgres://trading:trading@localhost:5432/marketdata, same
+    // hardcoded-dev-default pattern as ledger's POSTGRES_DSN and
+    // oms-gateway's OMS_POSTGRES_DSN. candleAggregator/columnarTickStore
+    // deliberately stay in-memory (hot-path performance tradeoff, not an
+    // oversight — see docs/DOCUMENTATION.md). Same fail-OPEN-to-in-memory
+    // choice as the Go services if Postgres is unreachable at startup.
+    let marketDataPostgresDsn = readStringEnvVar(
+        "MARKET_DATA_POSTGRES_DSN",
+        "postgres://trading:trading@localhost:5432/marketdata",
+    );
+    let (watchlistStore, priceAlertStore) = match (
+        watchlist::WatchlistStore::newPostgresBackedStore(&marketDataPostgresDsn),
+        pricealerts::PriceAlertStore::newPostgresBackedStore(&marketDataPostgresDsn),
+    ) {
+        (Ok(watchlistStore), Ok(priceAlertStore)) => {
+            println!("watchlists/priceAlerts connected to Postgres at {marketDataPostgresDsn} — durable across restarts");
+            (watchlistStore, priceAlertStore)
+        }
+        (watchlistResult, priceAlertResult) => {
+            eprintln!(
+                "WARNING: could not connect watchlists/priceAlerts to Postgres (watchlist: {:?}, priceAlerts: {:?}) — \
+                 falling back to IN-MEMORY stores, data will NOT survive a restart",
+                watchlistResult.as_ref().err(),
+                priceAlertResult.as_ref().err(),
+            );
+            (watchlist::WatchlistStore::newEmptyStore(), pricealerts::PriceAlertStore::newEmptyStore())
+        }
+    };
+
+    let sharedState = Arc::new(SharedMarketDataState::newStateWithStores(
         &omsGatewayHttpAddress,
+        watchlistStore,
+        priceAlertStore,
     ));
 
     // The HTTP query server runs on its own thread — it only ever touches

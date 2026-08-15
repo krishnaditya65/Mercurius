@@ -30,6 +30,21 @@ var ErrTokenExpired = errors.New("token has expired")
 var ErrTokenSignatureInvalid = errors.New("token signature is invalid")
 var ErrTokenMalformed = errors.New("token is malformed")
 
+// Roles: a small closed set. Assignment beyond the default RoleRetail
+// (e.g. granting RoleAdmin) is out of scope for this build — nothing
+// currently mints an admin/support/compliance account; the constants
+// exist so RBAC middleware across services has a single, shared
+// vocabulary of role strings to check against. Any service copying
+// internal/authmiddleware (see that package) re-declares these same
+// string values rather than importing this package cross-service, per
+// this repo's existing internal-package convention.
+const (
+	RoleRetail     = "retail"
+	RoleAdmin      = "admin"
+	RoleSupport    = "support"
+	RoleCompliance = "compliance"
+)
+
 type jwtHeader struct {
 	Algorithm string `json:"alg"`
 	TokenType string `json:"typ"`
@@ -43,16 +58,21 @@ type jwtHeader struct {
 // with any standard JWT tooling/library depends on that exact key.
 type AccessTokenClaims struct {
 	Subject       string `json:"sub"`
+	Role          string `json:"role"`
 	IssuedAtUnix  int64  `json:"iat"`
 	ExpiresAtUnix int64  `json:"exp"`
 }
 
-// IssueAccessToken builds and signs a JWT for accountIdentifier, valid
-// for tokenLifetime from now.
-func IssueAccessToken(accountIdentifier string, signingSecret []byte, tokenLifetime time.Duration, issuedAt time.Time) (string, error) {
+// IssueAccessToken builds and signs a JWT for accountIdentifier carrying
+// role (one of the Role* constants above — callers own validating that;
+// this function does not reject an unrecognized role string, since a
+// forward-compatible new role should never cause a hard failure here),
+// valid for tokenLifetime from now.
+func IssueAccessToken(accountIdentifier string, role string, signingSecret []byte, tokenLifetime time.Duration, issuedAt time.Time) (string, error) {
 	header := jwtHeader{Algorithm: "HS256", TokenType: "JWT"}
 	claims := AccessTokenClaims{
 		Subject:       accountIdentifier,
+		Role:          role,
 		IssuedAtUnix:  issuedAt.Unix(),
 		ExpiresAtUnix: issuedAt.Add(tokenLifetime).Unix(),
 	}

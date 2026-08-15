@@ -15,14 +15,18 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"log/slog"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
+	"mercurius/kycOnboarding/internal/authmiddleware"
 	"mercurius/kycOnboarding/internal/bankverification"
 	"mercurius/kycOnboarding/internal/httplogging"
 	"mercurius/kycOnboarding/internal/jointholding"
@@ -40,37 +44,185 @@ func main() {
 	nomineeDesignationRegistry := nomineedesignation.NewNomineeDesignationRegistry()
 	jointHoldingRegistry := jointholding.NewHoldingRegistry()
 
+	signingSecret := authmiddleware.SigningSecretFromEnv()
+
 	httpRequestMultiplexer := http.NewServeMux()
+	// Public — no account data, nothing to gate.
 	httpRequestMultiplexer.HandleFunc("/health", func(responseWriter http.ResponseWriter, _ *http.Request) {
 		responseWriter.WriteHeader(http.StatusOK)
 		_, _ = responseWriter.Write([]byte(`{"status":"ok","service":"kyc-onboarding"}`))
 	})
-	httpRequestMultiplexer.HandleFunc("/kyc/status", buildKycStatusHandler(kycVerificationStateMachine))
-	httpRequestMultiplexer.HandleFunc("/kyc/submit", buildKycSubmitHandler(kycVerificationStateMachine))
-	httpRequestMultiplexer.HandleFunc("/bank-verification/initiate", buildBankVerificationInitiateHandler(bankAccountVerifier))
-	httpRequestMultiplexer.HandleFunc("/bank-verification/confirm", buildBankVerificationConfirmHandler(bankAccountVerifier))
-	httpRequestMultiplexer.HandleFunc("/bank-verification/status", buildBankVerificationStatusHandler(bankAccountVerifier))
-	httpRequestMultiplexer.HandleFunc("/bank-verification/debug-peek", buildBankVerificationDebugPeekHandler(bankAccountVerifier))
+	// Public — the static questionnaire template, identical for every
+	// account; no account data is read or returned.
 	httpRequestMultiplexer.HandleFunc("/risk-profile/questionnaire", buildRiskProfileQuestionnaireHandler())
-	httpRequestMultiplexer.HandleFunc("/risk-profile/submit", buildRiskProfileSubmitHandler(riskProfiler))
-	httpRequestMultiplexer.HandleFunc("/risk-profile", buildRiskProfileStatusHandler(riskProfiler))
-	httpRequestMultiplexer.HandleFunc("/kyc/review-queue", buildKycReviewQueueHandler(kycVerificationStateMachine))
-	httpRequestMultiplexer.HandleFunc("/kyc/review-queue/override", buildKycReviewOverrideHandler(kycVerificationStateMachine))
-	httpRequestMultiplexer.HandleFunc("/nominees/submit", buildNomineeSubmitHandler(nomineeDesignationRegistry))
-	httpRequestMultiplexer.HandleFunc("/nominees/add", buildNomineeAddHandler(nomineeDesignationRegistry))
-	httpRequestMultiplexer.HandleFunc("/nominees/update", buildNomineeUpdateHandler(nomineeDesignationRegistry))
-	httpRequestMultiplexer.HandleFunc("/nominees/remove", buildNomineeRemoveHandler(nomineeDesignationRegistry))
-	httpRequestMultiplexer.HandleFunc("/nominees", buildNomineeQueryHandler(nomineeDesignationRegistry))
-	httpRequestMultiplexer.HandleFunc("/joint-holding/register-individual", buildRegisterIndividualAccountHandler(jointHoldingRegistry))
-	httpRequestMultiplexer.HandleFunc("/joint-holding/register-joint", buildRegisterJointAccountHandler(jointHoldingRegistry))
-	httpRequestMultiplexer.HandleFunc("/joint-holding/authorize-operation", buildAuthorizeOperationHandler(jointHoldingRegistry))
-	httpRequestMultiplexer.HandleFunc("/joint-holding", buildJointHoldingQueryHandler(jointHoldingRegistry))
+
+	// Authenticated, owner-only self-service — each of these acts on a
+	// single account's own KYC/bank/nominee/joint-holding data. Where the
+	// wire request carries an account identifier, requireOwnAccountFromJsonBody/
+	// requireOwnAccountFromQueryParam additionally 403s a mismatch between
+	// the authenticated caller and the account the request targets.
+	httpRequestMultiplexer.HandleFunc("/kyc/status", requireOwnAccountFromQueryParam("accountId", signingSecret, buildKycStatusHandler(kycVerificationStateMachine)))
+	httpRequestMultiplexer.HandleFunc("/kyc/submit", requireOwnAccountFromJsonBody(signingSecret, buildKycSubmitHandler(kycVerificationStateMachine)))
+	httpRequestMultiplexer.HandleFunc("/bank-verification/initiate", requireOwnAccountFromJsonBody(signingSecret, buildBankVerificationInitiateHandler(bankAccountVerifier)))
+	// /bank-verification/confirm and /status are keyed by verificationId,
+	// not accountId — the wire request carries no account identifier
+	// field to compare against the authenticated caller, so these are
+	// authenticated-only (any logged-in caller who knows/guesses a
+	// verificationId can confirm/check it). See report for why this is
+	// flagged as worth tightening in a real build.
+	httpRequestMultiplexer.HandleFunc("/bank-verification/confirm", authmiddleware.RequireAuth(signingSecret, buildBankVerificationConfirmHandler(bankAccountVerifier)))
+	httpRequestMultiplexer.HandleFunc("/bank-verification/status", authmiddleware.RequireAuth(signingSecret, buildBankVerificationStatusHandler(bankAccountVerifier)))
+	// Explicitly a debug-only endpoint (see its handler doc comment) that
+	// exposes an internal micro-deposit amount that a real bank-verification
+	// flow would never return to the account holder themselves (that
+	// would defeat the point of the deposit-amount challenge). Gated
+	// admin-only rather than owner-only self-service.
+	httpRequestMultiplexer.HandleFunc("/bank-verification/debug-peek", authmiddleware.RequireRole(signingSecret, authmiddleware.RoleAdmin, buildBankVerificationDebugPeekHandler(bankAccountVerifier)))
+	httpRequestMultiplexer.HandleFunc("/risk-profile/submit", requireOwnAccountFromJsonBody(signingSecret, buildRiskProfileSubmitHandler(riskProfiler)))
+	httpRequestMultiplexer.HandleFunc("/risk-profile", requireOwnAccountFromQueryParam("accountId", signingSecret, buildRiskProfileStatusHandler(riskProfiler)))
+	httpRequestMultiplexer.HandleFunc("/nominees/submit", requireOwnAccountFromJsonBody(signingSecret, buildNomineeSubmitHandler(nomineeDesignationRegistry)))
+	httpRequestMultiplexer.HandleFunc("/nominees/add", requireOwnAccountFromJsonBody(signingSecret, buildNomineeAddHandler(nomineeDesignationRegistry)))
+	httpRequestMultiplexer.HandleFunc("/nominees/update", requireOwnAccountFromJsonBody(signingSecret, buildNomineeUpdateHandler(nomineeDesignationRegistry)))
+	httpRequestMultiplexer.HandleFunc("/nominees/remove", requireOwnAccountFromJsonBody(signingSecret, buildNomineeRemoveHandler(nomineeDesignationRegistry)))
+	httpRequestMultiplexer.HandleFunc("/nominees", requireOwnAccountFromQueryParam("accountId", signingSecret, buildNomineeQueryHandler(nomineeDesignationRegistry)))
+	httpRequestMultiplexer.HandleFunc("/joint-holding/register-individual", requireOwnAccountFromJsonBody(signingSecret, buildRegisterIndividualAccountHandler(jointHoldingRegistry)))
+	httpRequestMultiplexer.HandleFunc("/joint-holding/register-joint", requireOwnAccountFromJsonBody(signingSecret, buildRegisterJointAccountHandler(jointHoldingRegistry)))
+	httpRequestMultiplexer.HandleFunc("/joint-holding/authorize-operation", requireOwnAccountFromJsonBody(signingSecret, buildAuthorizeOperationHandler(jointHoldingRegistry)))
+	httpRequestMultiplexer.HandleFunc("/joint-holding", requireOwnAccountFromQueryParam("accountId", signingSecret, buildJointHoldingQueryHandler(jointHoldingRegistry)))
+
+	// Admin-only — the compliance review-queue workflow. RoleCompliance
+	// (not RoleAdmin) is used deliberately: this is specifically the KYC
+	// compliance review/override workflow FEATURES.md §14 describes, and
+	// jwtauth's role set carries a dedicated RoleCompliance for exactly
+	// this domain rather than lumping it under general RoleAdmin. See
+	// report for the tradeoff this implies (a general RoleAdmin account
+	// cannot reach these routes under this build; a real build may want
+	// an "any of these roles" helper instead of RequireRole's single-role
+	// match).
+	httpRequestMultiplexer.HandleFunc("/kyc/review-queue", authmiddleware.RequireRole(signingSecret, authmiddleware.RoleCompliance, buildKycReviewQueueHandler(kycVerificationStateMachine)))
+	httpRequestMultiplexer.HandleFunc("/kyc/review-queue/override", authmiddleware.RequireRole(signingSecret, authmiddleware.RoleCompliance, buildKycReviewOverrideHandler(kycVerificationStateMachine)))
 
 	listenAddress := ":8083"
 	log.Printf("kyc-onboarding listening on %s\n", listenAddress)
-	if serverStartupError := http.ListenAndServe(listenAddress, httplogging.WithRequestLogging(httpRequestMultiplexer)); serverStartupError != nil {
+	if serverStartupError := http.ListenAndServe(listenAddress, withAllowListedCors(httplogging.WithRequestLogging(httpRequestMultiplexer))); serverStartupError != nil {
 		log.Fatalf("kyc-onboarding failed to start: %v", serverStartupError)
 	}
+}
+
+// accountIdentifierWireEnvelope is the minimal shape shared by every
+// mutating request below that carries an account identifier — used only
+// to peek at that one field before the real handler runs its own full
+// decode.
+type accountIdentifierWireEnvelope struct {
+	AccountIdentifier string `json:"accountIdentifier"`
+}
+
+// ownAccountMismatchErrorWireResponse matches this repo's dominant JSON
+// error-response shape (`errorMessage`), same as authmiddleware's own
+// error responses.
+type ownAccountMismatchErrorWireResponse struct {
+	ErrorMessage string `json:"errorMessage"`
+}
+
+func respondWithOwnAccountMismatch(responseWriter http.ResponseWriter) {
+	responseWriter.Header().Set("Content-Type", "application/json")
+	responseWriter.WriteHeader(http.StatusForbidden)
+	_ = json.NewEncoder(responseWriter).Encode(ownAccountMismatchErrorWireResponse{ErrorMessage: "you can only act on your own account"})
+}
+
+// requireOwnAccountFromQueryParam is RequireAuth plus an ownership check
+// for GET-style routes that identify the target account via a query
+// parameter (?accountId=...).
+func requireOwnAccountFromQueryParam(queryParamName string, signingSecret []byte, next http.HandlerFunc) http.HandlerFunc {
+	return authmiddleware.RequireAuth(signingSecret, func(responseWriter http.ResponseWriter, request *http.Request) {
+		targetAccountIdentifier := request.URL.Query().Get(queryParamName)
+		authenticatedAccountIdentifier, _ := authmiddleware.AuthenticatedAccountIdentifier(request)
+		if targetAccountIdentifier != "" && targetAccountIdentifier != authenticatedAccountIdentifier {
+			respondWithOwnAccountMismatch(responseWriter)
+			return
+		}
+		next(responseWriter, request)
+	})
+}
+
+// requireOwnAccountFromJsonBody is RequireAuth plus an ownership check
+// for POST-style routes that identify the target account via an
+// "accountIdentifier" field in the JSON body. It peeks the body just far
+// enough to read that one field, then rewinds request.Body so the wrapped
+// handler's own decode sees the exact same bytes it always has. A body
+// that fails to decode even that far is passed through untouched — the
+// wrapped handler's own decode will produce its normal "malformed
+// payload" 400, rather than this wrapper masking that with a different
+// error.
+func requireOwnAccountFromJsonBody(signingSecret []byte, next http.HandlerFunc) http.HandlerFunc {
+	return authmiddleware.RequireAuth(signingSecret, func(responseWriter http.ResponseWriter, request *http.Request) {
+		bodyBytes, readError := io.ReadAll(request.Body)
+		if readError != nil {
+			http.Error(responseWriter, "failed to read request body", http.StatusBadRequest)
+			return
+		}
+		_ = request.Body.Close()
+		request.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+
+		var envelope accountIdentifierWireEnvelope
+		if decodeError := json.Unmarshal(bodyBytes, &envelope); decodeError != nil {
+			next(responseWriter, request)
+			return
+		}
+
+		authenticatedAccountIdentifier, _ := authmiddleware.AuthenticatedAccountIdentifier(request)
+		if envelope.AccountIdentifier != "" && envelope.AccountIdentifier != authenticatedAccountIdentifier {
+			respondWithOwnAccountMismatch(responseWriter)
+			return
+		}
+		next(responseWriter, request)
+	})
+}
+
+// corsAllowedOriginsFromEnv reads a comma-separated CORS_ALLOWED_ORIGINS
+// env var, defaulting to the two local frontend dev ports this repo's
+// apps/web has historically run on when the env var is unset.
+func corsAllowedOriginsFromEnv() map[string]bool {
+	rawOrigins := os.Getenv("CORS_ALLOWED_ORIGINS")
+	if rawOrigins == "" {
+		rawOrigins = "http://localhost:3000,http://localhost:3100"
+	}
+	allowedOrigins := make(map[string]bool)
+	for _, origin := range strings.Split(rawOrigins, ",") {
+		trimmedOrigin := strings.TrimSpace(origin)
+		if trimmedOrigin != "" {
+			allowedOrigins[trimmedOrigin] = true
+		}
+	}
+	return allowedOrigins
+}
+
+// withAllowListedCors echoes back Access-Control-Allow-Origin only for a
+// request whose Origin header is on the CORS_ALLOWED_ORIGINS allow-list
+// (defaulting to the two local frontend dev ports), paired with
+// Access-Control-Allow-Credentials: true — never `*`, since this service
+// now gates routes on a real bearer token and a wildcard origin has no
+// business being paired with real auth. A request from an origin NOT on
+// the allow-list gets no CORS headers at all (the browser then blocks the
+// response from being read cross-origin, same effective result as a
+// same-origin request from a plain non-browser client, which never sends
+// an Origin header and is unaffected either way).
+func withAllowListedCors(nextHandler http.Handler) http.Handler {
+	allowedOrigins := corsAllowedOriginsFromEnv()
+	return http.HandlerFunc(func(responseWriter http.ResponseWriter, request *http.Request) {
+		requestOrigin := request.Header.Get("Origin")
+		if requestOrigin != "" && allowedOrigins[requestOrigin] {
+			responseWriter.Header().Set("Access-Control-Allow-Origin", requestOrigin)
+			responseWriter.Header().Set("Access-Control-Allow-Credentials", "true")
+			responseWriter.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+			responseWriter.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+		}
+		if request.Method == http.MethodOptions {
+			responseWriter.WriteHeader(http.StatusNoContent)
+			return
+		}
+		nextHandler.ServeHTTP(responseWriter, request)
+	})
 }
 
 type kycStatusWireResponse struct {

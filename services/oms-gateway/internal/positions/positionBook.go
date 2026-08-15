@@ -15,9 +15,18 @@ import "sync"
 
 // PositionBook tracks net signed quantity per (account, instrument).
 // Positive = long, negative = short, zero/absent = flat.
+//
+// Real Postgres persistence (docs/BUILD_LOG.md's Postgres-persistence
+// entry): when constructed via NewPostgresBackedPositionBook
+// (postgresBacking.go, same package), `postgres` is set and every
+// method below reads/writes real Postgres instead of the in-memory map
+// — Postgres becomes the sole source of truth, not a mirror. The
+// original NewPositionBook() constructor (used for paperPositionBook,
+// milliSharePaperPositionBook, and tests) is completely unaffected.
 type PositionBook struct {
 	mutexGuardingPositions            sync.RWMutex
 	netQuantityByAccountAndInstrument map[string]map[string]int64
+	postgres                          *postgresBacking
 }
 
 func NewPositionBook() *PositionBook {
@@ -36,6 +45,12 @@ func (positionBook *PositionBook) ApplyFill(
 	instrumentSymbol string,
 	executedQuantity uint64,
 ) {
+	if positionBook.postgres != nil {
+		positionBook.adjustPositionInPostgres(buyingClientAccountId, instrumentSymbol, int64(executedQuantity))
+		positionBook.adjustPositionInPostgres(sellingClientAccountId, instrumentSymbol, -int64(executedQuantity))
+		return
+	}
+
 	positionBook.mutexGuardingPositions.Lock()
 	defer positionBook.mutexGuardingPositions.Unlock()
 
@@ -59,6 +74,11 @@ func (positionBook *PositionBook) adjustPositionLocked(accountIdentifier string,
 // are responsible for computing the correct new quantity themselves;
 // this method performs no corporate-action math of its own.
 func (positionBook *PositionBook) SetPositionDirectly(accountIdentifier string, instrumentSymbol string, newQuantity int64) {
+	if positionBook.postgres != nil {
+		positionBook.setPositionInPostgres(accountIdentifier, instrumentSymbol, newQuantity)
+		return
+	}
+
 	positionBook.mutexGuardingPositions.Lock()
 	defer positionBook.mutexGuardingPositions.Unlock()
 
@@ -72,6 +92,10 @@ func (positionBook *PositionBook) SetPositionDirectly(accountIdentifier string, 
 // (instrument -> net signed quantity). Instruments with a net-zero
 // position are omitted rather than returned as an explicit zero.
 func (positionBook *PositionBook) PositionsForAccount(accountIdentifier string) map[string]int64 {
+	if positionBook.postgres != nil {
+		return positionBook.positionsForAccountFromPostgres(accountIdentifier)
+	}
+
 	positionBook.mutexGuardingPositions.RLock()
 	defer positionBook.mutexGuardingPositions.RUnlock()
 

@@ -49,13 +49,22 @@ type claimedKeyEntry struct {
 // by maximumClaimWaitDuration so an owner that never completes can't hang
 // waiters forever.
 //
-// TODO(real build): in-memory only, unbounded, never expires. A real
-// build needs a TTL (idempotency keys are only meaningful for a bounded
-// retry window, e.g. 24h) and persistence that survives a restart.
+// Real Postgres persistence (docs/BUILD_LOG.md's Postgres-persistence
+// entry): when constructed via NewPostgresBackedIdempotencyStore
+// (postgresBacking.go, same package), `postgres` is set and every
+// COMPLETED response is additionally durably cached in Postgres with a
+// real expires_at TTL (idempotencyResponseTtl, postgresBacking.go) —
+// closing both the "in-memory only" and "unbounded, never expires"
+// halves of this comment's old TODO at once. The in-process
+// claim/await mechanism below (entriesByKey/claimedKeyEntry/
+// doneChannel) is intentionally UNCHANGED — see postgresBacking.go's
+// header comment for why concurrent-duplicate collapsing stays a
+// single-process, in-memory-only concern even in Postgres-backed mode.
 type IdempotencyStore struct {
 	mutexGuardingEntries     sync.Mutex
 	entriesByKey             map[string]*claimedKeyEntry
 	maximumClaimWaitDuration time.Duration
+	postgres                 *postgresBacking
 }
 
 func NewIdempotencyStore() *IdempotencyStore {
@@ -98,8 +107,33 @@ func (store *IdempotencyStore) ClaimKeyOrAwaitExistingResponse(
 	store.mutexGuardingEntries.Lock()
 	existingEntry, alreadyClaimed := store.entriesByKey[idempotencyKey]
 	if !alreadyClaimed {
-		store.entriesByKey[idempotencyKey] = &claimedKeyEntry{doneChannel: make(chan struct{})}
+		newEntry := &claimedKeyEntry{doneChannel: make(chan struct{})}
+		store.entriesByKey[idempotencyKey] = newEntry
 		store.mutexGuardingEntries.Unlock()
+
+		// Postgres-backed mode only: this caller just became the
+		// in-memory owner (nothing else in THIS process had claimed the
+		// key), but a PRIOR process instance may have already durably
+		// completed it — e.g. oms-gateway just restarted and the
+		// in-memory entriesByKey map lost every claim, while the client
+		// is legitimately replaying a request whose original answer is
+		// still valid. Deliberately done OUTSIDE mutexGuardingEntries (a
+		// network round-trip must never happen while holding a mutex
+		// every other idempotency operation in this process needs) —
+		// any other concurrent caller with the SAME key that arrives in
+		// the meantime correctly sees newEntry already claimed and waits
+		// on its doneChannel below, so no double-claim race is possible
+		// even though the lock was released. Found -> complete this
+		// entry immediately with the persisted response and return it as
+		// a non-owner response (isThisCallTheOwner: false), so the
+		// caller does NOT redo the real work.
+		if store.postgres != nil {
+			if persistedResponse, found := store.responseFromPostgres(idempotencyKey); found {
+				newEntry.response = persistedResponse
+				close(newEntry.doneChannel)
+				return persistedResponse, false
+			}
+		}
 		return orders.OrderAcknowledgementResponse{}, true
 	}
 	store.mutexGuardingEntries.Unlock()
@@ -139,4 +173,12 @@ func (store *IdempotencyStore) CompleteClaimedKey(idempotencyKey string, respons
 
 	entry.response = response
 	close(entry.doneChannel)
+
+	// Real Postgres persistence: durably cache the completed response
+	// (with a TTL) so it survives a restart — see postgresBacking.go's
+	// header comment. Done AFTER waking in-memory waiters, since none of
+	// them need to wait on a network round-trip to get their answer.
+	if store.postgres != nil {
+		store.persistCompletedResponse(idempotencyKey, response)
+	}
 }

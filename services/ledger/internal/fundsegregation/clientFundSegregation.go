@@ -45,11 +45,11 @@ var ErrUnclassifiedAccount = errors.New("account is not classified as a CLIENT a
 var ErrInvalidMovementAmount = errors.New("movement amount must be positive")
 
 // SegregationGuard classifies accounts and enforces the ring-fencing
-// invariant on top of a shared *doubleentry.InMemoryDoubleEntryLedgerBook.
+// invariant on top of a shared doubleentry.LedgerBook.
 // It holds no balances of its own — internal/doubleentry remains the one
 // system of record.
 type SegregationGuard struct {
-	ledgerBook                    *doubleentry.InMemoryDoubleEntryLedgerBook
+	ledgerBook                    doubleentry.LedgerBook
 	custodyPoolAccountId          string
 	externalCashSuspenseAccountId string
 	accountKindByIdentifier       map[string]AccountKind
@@ -68,7 +68,7 @@ type SegregationGuard struct {
 // that's normal for a suspense/clearing account and is not itself part
 // of the segregation invariant.
 func NewSegregationGuard(
-	ledgerBook *doubleentry.InMemoryDoubleEntryLedgerBook,
+	ledgerBook doubleentry.LedgerBook,
 	custodyPoolAccountId string,
 	externalCashSuspenseAccountId string,
 	clientAccountIdentifiers []string,

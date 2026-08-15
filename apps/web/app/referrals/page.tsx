@@ -20,8 +20,10 @@
 
 import { useState } from "react";
 import Link from "next/link";
+import { loadSession } from "../session/authSession";
 
 const backofficeBaseUrl = process.env.NEXT_PUBLIC_BACKOFFICE_BASE_URL ?? "http://localhost:8084";
+const LOG_IN_FIRST_MESSAGE = "Log in first from the dashboard's Account panel to use this.";
 
 type ReferralLink = {
   referralCode: string;
@@ -49,12 +51,20 @@ export default function ReferralsPage() {
   const [myReferralStatus, setMyReferralStatus] = useState<{ found: boolean; link?: ReferralLink } | null>(null);
 
   async function generateMyReferralCode() {
-    setIsGeneratingCode(true);
     setErrorMessage(null);
+    const storedSession = loadSession();
+    if (!storedSession?.accessToken) {
+      setErrorMessage(LOG_IN_FIRST_MESSAGE);
+      return;
+    }
+    setIsGeneratingCode(true);
     try {
       const httpResponse = await fetch(`${backofficeBaseUrl}/referral-rewards/generate-code`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${storedSession.accessToken}`,
+        },
         body: JSON.stringify({ accountIdentifier }),
       });
       if (!httpResponse.ok) throw new Error(`HTTP ${httpResponse.status}`);
@@ -72,9 +82,15 @@ export default function ReferralsPage() {
   }
 
   async function refreshMyReferrals() {
+    const storedSession = loadSession();
+    if (!storedSession?.accessToken) {
+      setErrorMessage(LOG_IN_FIRST_MESSAGE);
+      return;
+    }
     try {
       const httpResponse = await fetch(
-        `${backofficeBaseUrl}/referral-rewards/referrals?accountId=${encodeURIComponent(accountIdentifier)}`
+        `${backofficeBaseUrl}/referral-rewards/referrals?accountId=${encodeURIComponent(accountIdentifier)}`,
+        { headers: { Authorization: `Bearer ${storedSession.accessToken}` } }
       );
       if (!httpResponse.ok) throw new Error(`HTTP ${httpResponse.status}`);
       const parsed: { accountIdentifier: string; referrals: ReferralLink[] | null } = await httpResponse.json();
@@ -85,9 +101,15 @@ export default function ReferralsPage() {
   }
 
   async function refreshMyReferralStatus() {
+    const storedSession = loadSession();
+    if (!storedSession?.accessToken) {
+      setErrorMessage(LOG_IN_FIRST_MESSAGE);
+      return;
+    }
     try {
       const httpResponse = await fetch(
-        `${backofficeBaseUrl}/referral-rewards/status?accountId=${encodeURIComponent(qualifyAccountIdentifier)}`
+        `${backofficeBaseUrl}/referral-rewards/status?accountId=${encodeURIComponent(qualifyAccountIdentifier)}`,
+        { headers: { Authorization: `Bearer ${storedSession.accessToken}` } }
       );
       const bodyText = await httpResponse.text();
       if (!httpResponse.ok) {
@@ -104,10 +126,18 @@ export default function ReferralsPage() {
 
   async function recordReferral() {
     setRecordStatusMessage(null);
+    const storedSession = loadSession();
+    if (!storedSession?.accessToken) {
+      setRecordStatusMessage(LOG_IN_FIRST_MESSAGE);
+      return;
+    }
     try {
       const httpResponse = await fetch(`${backofficeBaseUrl}/referral-rewards/record-referral`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${storedSession.accessToken}`,
+        },
         body: JSON.stringify({ referralCode: codeToRedeem, referredAccountIdentifier }),
       });
       const bodyText = await httpResponse.text();
@@ -124,10 +154,18 @@ export default function ReferralsPage() {
 
   async function checkAndQualify() {
     setQualifyResultMessage(null);
+    const storedSession = loadSession();
+    if (!storedSession?.accessToken) {
+      setQualifyResultMessage(LOG_IN_FIRST_MESSAGE);
+      return;
+    }
     try {
       const httpResponse = await fetch(`${backofficeBaseUrl}/referral-rewards/check-and-qualify`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${storedSession.accessToken}`,
+        },
         body: JSON.stringify({ referredAccountIdentifier: qualifyAccountIdentifier }),
       });
       const bodyText = await httpResponse.text();

@@ -3114,4 +3114,1023 @@ closes out every remaining unchecked item anywhere in FEATURES.md
 sections 1-22 — the ~250-item backlog is now fully marked 🚧
 end to end.
 
-<!-- Append new entries below this line as work continues. -->
+## Entry 82 — infra/docker resource caps + Makefile guardrails (not a FEATURES.md item — operational hardening)
+
+Prompted by a real prior incident: `docker compose up` on
+`infra/docker/docker-compose.yml` (Postgres, Redpanda, ClickHouse) had
+no resource ceiling and choked the host machine. Added `mem_limit`
+(1g/1g/2g), `mem_reservation`, `cpus` (1.0/1.0/2.0 — ClickHouse
+highest, since it's the one that caches aggressively and otherwise
+happily uses all available RAM/CPU), `pids_limit` (512/512/1024 via a
+shared `&pid-cap` YAML anchor for the two smaller services), and
+`json-file` log rotation (`max-size: 10m`, `max-file: 3`) to all three
+services. Honestly documented in the file itself: these are plain
+Compose v2 keys (no Swarm `deploy:` needed) and they cap CPU/memory/
+PIDs/log growth, but NOT the bind-mounted data-volume disk growth
+under `./volumes/*` — portable per-container disk quotas
+(`storage_opt: {size: ...}`) need a storage-driver/filesystem
+combination most Docker Desktop installs don't have. The real disk
+backstop on macOS is Docker Desktop's own VM disk-image-size setting
+(Settings → Resources), which is outside any file in this repo's
+reach — a one-time manual setting, not something `docker-compose.yml`
+or the `Makefile` can enforce.
+
+Also extended the existing `Makefile` `infra-up`/`infra-down`/
+`infra-logs` targets: `infra-up` now warns (never blocks) if `docker
+system df` already reports ≥20GB in use before starting more;
+`infra-down-clean` (new) does `docker compose down -v`, actually
+removing the bind-mounted volume data that plain `infra-down` leaves
+behind indefinitely; `infra-status` (new) runs `docker stats
+--no-stream` scoped to just this project's containers to check real
+usage against the new caps; `infra-disk` (new) runs `docker system
+df -v` plus `du -sh` on the volume directories specifically.
+
+Validated with `docker compose config` (parses clean, every cap
+present in the resolved config) and `make -n infra-status infra-disk
+infra-down-clean` (recipes resolve correctly, no tab/whitespace
+Makefile errors). **Not** validated against a live `docker compose
+up` — Docker daemon still unavailable in this build environment (same
+constraint noted in entry 16); the caps and Makefile targets are
+correct by inspection and dry-run, not live-verified end-to-end.
+
+## Entry 83 — apps/web: Portfolio Greeks, IV Rank/Percentile, and Developer API key management pages
+
+Three new frontend pages, no dependencies on other in-flight work
+("Plan C" from prior planning). Followed the existing per-page
+conventions exactly (`portfolioHealth/page.tsx`/`optionsChain/page.tsx`
+as the nearest siblings): inlined `fetch`, module-scope
+`const xBaseUrl = process.env.NEXT_PUBLIC_X_BASE_URL ?? "http://localhost:PORT"`,
+hand-rolled Tailwind, no component kit.
+
+- **`apps/web/app/portfolioGreeks/page.tsx`** — calls quant-engine's real
+  `POST /portfolio/greeks` (`_handlePortfolioGreeksRequest` in
+  `httpServer.py`, backed by `portfolioGreeksAggregator.py`). Read the
+  handler source before coding rather than assuming the shape — confirmed
+  exactly: request `{positions: [{identifier, quantity, delta, gamma,
+  vegaPerOnePercentVolatilityChange, thetaPerCalendarDay}, ...]}`,
+  response `{netDelta, netGamma, netVegaPerOnePercentVolatilityChange,
+  netThetaPerCalendarDay, positionCount}`. Add/remove position rows, a
+  table of entered per-position Greeks, and a results panel after
+  submit. An empty positions list is legitimate (all-zero result, not a
+  422) per the handler's own doc comment — this page allows submitting
+  zero rows.
+- **`apps/web/app/ivRank/page.tsx`** — calls quant-engine's real
+  `POST /volatility/iv-rank` (`_handleIvRankRequest`, backed by
+  `ivRankCalculator.py`). Confirmed shape: request
+  `{currentImpliedVolatility, historicalImpliedVolatilitySeries: number[]}`,
+  response `{currentImpliedVolatility, historicalMinimumImpliedVolatility,
+  historicalMaximumImpliedVolatility, impliedVolatilityRank,
+  impliedVolatilityPercentile}` (rank/percentile are fractions, e.g.
+  0.714, displayed as a percentage). Historical series entered as a
+  comma-or-newline-separated textarea, parsed client-side to
+  `number[]`. The documented 422-on-`ValueError` case (a degenerate
+  series with zero range, e.g. every historical value identical) is
+  handled distinctly from a network/connection failure — the page shows
+  the real `errorMessage` quant-engine returns, not a generic error.
+- **`apps/web/app/developerApi/page.tsx`** — calls api-gateway's real
+  `internal/apikeymanager` endpoints (confirmed against
+  `cmd/server/main.go` and `apiKeyManager.go`): `POST
+  /developer/api-keys` (body `{accountIdentifier, tenantIdentifier?,
+  rateLimitTier, isSandboxKey}` → 201 `IssuedApiKey`), `GET
+  /developer/api-keys?accountIdentifier=...` → `IssuedApiKey[]`, `POST
+  /developer/api-keys/revoke` (body `{apiKeyValue}` → `{wasRevoked:
+  true}` or 404). api-gateway had no existing `NEXT_PUBLIC_*_BASE_URL`
+  env var in this app — added `NEXT_PUBLIC_API_GATEWAY_BASE_URL`
+  (default `http://localhost:8089`, matching `envOrDefault
+  ("API_GATEWAY_LISTEN_ADDRESS", ":8089")` in api-gateway's own
+  `main.go`), following the exact same pattern as every other
+  `NEXT_PUBLIC_*_BASE_URL` in this app. Account-identifier field
+  defaults to `acct-001`, matching this app's existing convention
+  elsewhere (order ticket, positions panel). Issue-key form (rate-limit
+  tier selector, sandbox checkbox), a table of the account's existing
+  keys with a per-row revoke button, and the newly-issued key's raw
+  value shown prominently once — **explicitly documented in the page's
+  own file-header comment and on-screen copy that this "shown once" UX
+  is a UI-only convention, NOT enforced server-side**: `apiKeyManager.go`
+  stores (and `GET /developer/api-keys` keeps returning) the full raw
+  key value indefinitely, which its own doc comment already flags as a
+  TODO for a real build (should store only a hash).
+
+**A real, undocumented-until-now gap found while building the
+Developer API keys page:** `services/api-gateway/cmd/server/main.go`
+has NO CORS middleware anywhere — confirmed by grepping the whole
+`services/api-gateway` tree for `Access-Control`/`Cors`/`CORS`: zero
+matches, unlike oms-gateway's `withPermissiveCorsForDevelopment` or
+quant-engine's permissive `Access-Control-Allow-Origin: *` header (both
+already documented elsewhere in this repo). Verified live: a real
+`OPTIONS /developer/api-keys` preflight against the running api-gateway
+returned `405 Method Not Allowed`, not a `204` with CORS headers; a real
+cross-origin `GET /developer/api-keys?accountIdentifier=...` with an
+`Origin: http://localhost:3000` header came back with no
+`Access-Control-Allow-Origin` header at all. This means a real browser
+running the new Developer API keys page against a real api-gateway on a
+different origin/port (the normal `apps/web` dev setup) will have every
+fetch on that page blocked by the browser's own CORS policy, even
+though the server itself is fully reachable via curl/server-to-server
+calls. Documented honestly in the page's own file-header comment,
+on-screen copy, and `apps/web/README.md` rather than silently shipping
+a page that looks done but won't actually work from a real browser
+against a real (CORS-unpatched) api-gateway — NOT fixed here, since the
+task scope was frontend-only (no edits outside `apps/web/`,
+`docs/BUILD_LOG.md`, `docs/DOCUMENTATION.md`).
+
+**Navigation:** added three links (`Portfolio Greeks`, `IV Rank /
+Percentile`, `Developer API keys`) to the existing nav list in
+`apps/web/app/page.tsx`, in the same `<nav>` block and `<Link>` pattern
+already used for every other page.
+
+**Verified:**
+- `npx tsc --noEmit` — clean.
+- `npm run lint` (ESLint) — clean.
+- `npm run build` — succeeds; all three new routes (`/portfolioGreeks`,
+  `/ivRank`, `/developerApi`) appear as static-prerendered routes in the
+  build output alongside every existing page.
+- **Real live verification, not assumed:** started the actual
+  `quant-engine` HTTP server (`.venv/bin/python -m
+  quantengine.httpServer`, real `.venv` already present) on :8085 and
+  the actual `api-gateway` (`go run ./cmd/server`) on :8089, confirmed
+  both `/health`. `curl`'d the exact endpoints/payloads these three
+  pages send: `POST /portfolio/greeks` with the two-position fixture the
+  page ships by default (`netDelta: 7.05`, `netGamma: 0.07`,
+  `netVegaPerOnePercentVolatilityChange: 10.5`,
+  `netThetaPerCalendarDay: -2.45`, `positionCount: 2` — matches hand
+  arithmetic) and with an empty positions list (all-zero, 200 not 422);
+  `POST /volatility/iv-rank` with the page's default series (IV Rank
+  71.4%, IV Percentile 75% — matches hand arithmetic against min 0.18/
+  max 0.32) and with a degenerate all-identical series (real `422` with
+  the real `ValueError` message surfaced); the full `POST
+  /developer/api-keys` → `GET /developer/api-keys?accountIdentifier=`
+  → `POST /developer/api-keys/revoke` → re-`GET` cycle against a real
+  running api-gateway, confirming the revoked key still shows up in the
+  list with `isRevoked:true` (not removed), and that revoking an unknown
+  key returns a real `404`. Also started `next dev` on :3100 against
+  these two real running backends and confirmed all three new routes
+  return `200` and render their real headings server-side
+  (`curl`-checked, not a headless-browser click-through — no
+  browser-automation tool was available in this session, stated
+  honestly rather than claimed). Confirmed the homepage nav links
+  (`href="/portfolioGreeks"`, `href="/ivRank"`, `href="/developerApi"`)
+  are present in the rendered HTML. All backend/dev-server processes
+  were stopped and ports confirmed free before finishing.
+- **NOT verified:** an actual browser click-through of the Developer API
+  keys page's fetches against the real, CORS-unpatched api-gateway (see
+  the gap above — this would demonstrably fail in a real browser, which
+  is exactly why it's documented rather than silently glossed over).
+  `oms-gateway`, `ledger`, `market-data`, and `matching-engine` were not
+  started this round — not needed by any of the three new pages, which
+  only ever call quant-engine and api-gateway.
+
+**Item(s) completed:** three new frontend pages
+(`apps/web/app/portfolioGreeks/page.tsx`, `apps/web/app/ivRank/page.tsx`,
+`apps/web/app/developerApi/page.tsx`), one new env var
+(`NEXT_PUBLIC_API_GATEWAY_BASE_URL`), homepage navigation updated, and a
+real, previously-undocumented api-gateway CORS gap found and recorded.
+
+## Entry 84 — real auth/RBAC ("Plan A") across auth, oms-gateway, backoffice, kyc-onboarding, api-gateway, apps/web
+
+The single largest gap this repo's own docs have flagged repeatedly
+since entry 32 — "the resulting JWT/account identifier are NOT yet
+wired into anything that actually gates access" — is now closed for
+five services and the frontend. Ledger, matching-engine, market-data,
+mutual-funds, reporting, quant-engine, and apps/terminal were
+explicitly out of scope and untouched.
+
+### Step 0 — the account-identifier namespace decision
+
+`services/auth/internal/accountstore/accountStore.go`'s
+`RegisterAccount` gained two new parameters:
+`requestedAccountIdentifier` (optional — `""` keeps the existing
+`acct-<8-byte-hex>` auto-generation for real new users; a non-empty
+value registers under that EXACT identifier instead, still validated
+for uniqueness against a new `accountsByIdentifier` map,
+`ErrAccountIdentifierAlreadyExists` on collision) and `role` (defaults
+to `jwtauth.RoleRetail`). `AuthenticateWithPassword` now also returns
+the account's role. `services/auth/cmd/server/main.go`'s `main()` calls
+a new `seedDemoAccounts`, registering `acct-001`/`acct-002` — the SAME
+identifiers oms-gateway's `demoTrackedAccountIdentifiers` and ledger's
+seeded accounts already use — under `<accountId>@demo.mercurius.local`
+with `AUTH_DEMO_ACCOUNT_PASSWORD` (falls back to a loudly-logged
+insecure dev default, identical pattern to `AUTH_JWT_SIGNING_SECRET`).
+This means the existing demo flows across every other service now go
+through a REAL login instead of being bypassed — `curl`'d and
+confirmed below. New/updated tests in `accountStore_test.go` cover the
+optional-identifier path (honored, duplicate-rejected, omitted-still-
+autogenerates) and role defaulting/assignment.
+
+### Step 1 — role claim
+
+`services/auth/internal/jwtauth/jwtToken.go`'s `AccessTokenClaims`
+gained `Role string` (`json:"role"`); `IssueAccessToken` takes a role
+parameter. Four role constants: `RoleRetail`/`RoleAdmin`/
+`RoleSupport`/`RoleCompliance`. `buildLoginHandler` and
+`buildRefreshHandler` in `cmd/server/main.go` now thread the account's
+REAL role through (`AuthenticateWithPassword`'s new second return
+value on login; a new `accountstore.RoleForAccountIdentifier` lookup
+on refresh, since the refresh token itself only carries an account id).
+Admin/support/compliance-role assignment has no self-service or
+admin-facing provisioning path in this build — only direct Go code
+(`RegisterAccount`'s `role` parameter) can mint a non-retail account;
+the two seeded demo accounts stay `RoleRetail`.
+
+### Step 2 — the copy-pasted `internal/authmiddleware` package
+
+Verified this repo's existing convention first (`internal/httplogging`
+is independently duplicated, not shared, across every Go service) before
+assuming the same pattern applied here — it does. Wrote one canonical
+`internal/authmiddleware` in `services/oms-gateway`
+(`authMiddleware.go` + full unit tests: valid token passes with correct
+injected context, missing header 401s, malformed token 401s, expired
+token 401s, wrong-secret 401s, wrong-role 403s, missing-token-on-a-
+role-gated-route still 401s-not-403s), then copied it byte-identical
+into `services/backoffice`, `services/kyc-onboarding`, and
+`services/api-gateway` (the fifth service, added specifically because
+entry 83 found api-gateway had zero CORS middleware — while touching
+CORS across the other three, it needed the same auth+CORS pass too).
+It re-implements JUST HS256 verify (not issuance) with stdlib
+`crypto/hmac`/`crypto/sha256` — cannot import `services/auth`'s
+`internal/jwtauth` cross-service, and this repo has no shared Go module
+root to import from even if package-privacy weren't the blocker.
+Exports `RequireAuth`, `RequireRole`, `AuthenticatedAccountIdentifier`/
+`AuthenticatedRole` (context-key-based), and `SigningSecretFromEnv`
+(same `AUTH_JWT_SIGNING_SECRET` env var + insecure dev default every
+service now shares). Error responses are `{"errorMessage": "..."}` —
+matched against this repo's actual dominant JSON error-field
+convention (48+ existing occurrences of `errorMessage` across the Go
+services at the time this was written), not the `{"error": "..."}`
+shape sketched in the original task description. All four copies
+independently build/vet/test clean — confirmed identical behavior via
+their own copies of the canonical test file.
+
+### Steps 3-4 — route classification, account-match enforcement, CORS
+
+Delegated per-service (in parallel, since each service's classification
+is independent of the others) to four sub-agents, then **independently
+re-verified every result myself** rather than trusting each agent's
+self-report: re-ran `gofmt -l .`, `go build ./...`, `go vet ./...`, and
+`go test -race -count=1 ./...` fresh in all five Go services (auth was
+already verified in steps 0-1); read the actual route-wiring diffs in
+`oms-gateway` and `backoffice` specifically (the two flagged as having
+made judgment calls) rather than only running their tests.
+
+- **oms-gateway** (~65 routes): `GET /health` and `POST
+  /orders/estimate-charges` stay public. Every other route requires
+  `authmiddleware.RequireAuth`, wrapped further with
+  `authmiddleware.RequireRole(..., RoleAdmin)` for operationally-
+  privileged routes (`/market-session/open`/`close`/`set-phase`,
+  `/audit-trail`, `/compliance/surveillance`,
+  `/connectivity-kill-switch/*`, `/algo-limits/configure`,
+  `/strategies/admin/verify`, `/strategies/followers`,
+  `/exposure-limits/configure`, corporate-action admin routes,
+  `/mark-to-market/price`, `/auto-liquidation/evaluate`,
+  `/drip/process-dividend`). A new shared `authenticatedAccountMatches`
+  helper (39 call sites, confirmed by grep) enforces "you can only act
+  on your own account" everywhere a `clientAccountIdentifier`/
+  `accountId`-shaped field appears. `withPermissiveCorsForDevelopment`
+  replaced with `withAllowListedCorsOrigin` (`CORS_ALLOWED_ORIGINS`,
+  default `http://localhost:3000,http://localhost:3100`, exact-origin
+  echo + `Access-Control-Allow-Credentials: true` when allow-listed,
+  no headers otherwise).
+- **backoffice** (~28 routes): `GET /health`,
+  `GET /localization/languages`, `GET /localization/{lang}` stay
+  public. `/accounts/freeze`/`/unfreeze` and three
+  `/nominee-succession/*` decision routes are `RoleAdmin`;
+  `/accounts/freeze-status`, `/nominee-succession/move-to-under-
+  review`/`/status`/`/audit-trail`, and five agent-facing
+  `/support/tickets/*` routes are `RoleSupport`; the rest are owner-
+  only self-service via a shared `requireOwnAccount` helper. **A real,
+  pre-existing ownership bug was found and fixed**: `GET
+  /support/tickets/get` and `GET /support/tickets/thread` only ever
+  took a `ticketId`, never an account id, so before this pass there was
+  no field to check ownership against at all — any caller could read
+  any ticket by guessing/enumerating ids. Fixed by fetching the ticket
+  FIRST and checking `requireOwnAccount` against the ticket's OWN
+  `AccountIdentifier` field rather than a (nonexistent) request field —
+  confirmed by reading the actual handler code, not just the agent's
+  self-report. Same allow-listed CORS pattern as oms-gateway.
+- **kyc-onboarding** (~20 routes): `GET /health` and `GET
+  /risk-profile/questionnaire` stay public. Self-service routes use two
+  new small wrappers, `requireOwnAccountFromJsonBody`/
+  `requireOwnAccountFromQueryParam`. `/bank-verification/debug-peek`
+  is `RoleAdmin` (it exposes the internal micro-deposit challenge
+  amount a real verification flow exists specifically to keep from the
+  account holder — owner-self-service would defeat the point).
+  `/kyc/review-queue` and `/kyc/review-queue/override` use the
+  dedicated `RoleCompliance` constant rather than `RoleAdmin`. Same
+  allow-listed CORS pattern.
+- **api-gateway** (real CORS for the first time — closes the entry-83
+  gap): `GET /health` public; `/developer/api-keys` (issue+list),
+  `/developer/api-keys/revoke`, `/webhooks/subscribe`, `/tca/report`,
+  `/account-aggregator/net-worth` are `RequireAuth` + account-match
+  (the revoke handler has no account field on its own request, so it
+  looks the key record up FIRST via `ValidateApiKey` and checks THAT
+  record's account before revoking — confirmed by reading the code);
+  `/alerts`, `/tenants`, `/webhooks/deliveries` are `RoleAdmin`
+  (`/webhooks/deliveries` specifically because `DeliveryHistory()` has
+  no per-account filter yet — admin-only until that exists, not
+  permanent). The pre-existing reverse-proxy catch-all
+  (`Handle("/", backendProxy)`) is untouched — it already has its own
+  separate API-key + rate-limit gate, a different auth model, correctly
+  left alone.
+
+Every existing test suite that called a now-gated handler directly was
+updated to attach a real, hand-constructed HS256 test JWT (same
+technique as `authmiddleware`'s own `issueTestToken` test helper) —
+none were skipped, commented out, or weakened. `gofmt`/`go build`/
+`go vet`/`go test -race -count=1` all clean across all five Go
+services, independently re-confirmed by me, not just self-reported by
+the sub-agents that did the wiring.
+
+### Step 5 — apps/web
+
+New `app/session/authSession.ts`: `saveSession`/`loadSession`/
+`clearSession` against one `localStorage` key
+(`mercuriusAuthSession`), mirroring `app/watchlist/page.tsx`'s existing
+device-identifier localStorage convention exactly. This is the one
+explicitly-allowed exception to "no new shared abstraction" — a shared
+localStorage accessor, not a shared fetch client; every page still
+inlines its own `fetch` calls per this app's existing convention.
+`AccountSection` (`app/page.tsx`) now persists the session after a real
+login and rehydrates on mount. `Authorization: Bearer <token>` was
+added per-call-site to every fetch hitting oms-gateway, backoffice,
+kyc-onboarding, or api-gateway across `app/page.tsx`,
+`app/corporateActions/page.tsx`, `app/developerApi/page.tsx`,
+`app/referrals/page.tsx`, `app/strategies/page.tsx`,
+`app/support/page.tsx`, `app/optionsChain/page.tsx`, and
+`app/notificationCenter/notificationCenterSection.tsx` — confirmed by
+diffing every file that references one of those four services'
+`NEXT_PUBLIC_*_BASE_URL` constants against every file that now imports
+`loadSession`; the one legitimate gap (`app/localization/
+localizationContext.tsx`, which calls backoffice's intentionally-public
+`/localization/*`) needed no header. Logged-out gated actions show an
+inline "log in first" message rather than firing an unauthenticated
+request. `npx tsc --noEmit`, `npm run lint`, `npm run build` all clean
+— independently re-run, not just self-reported — 19 page routes
+present, unchanged in count (wiring-only pass, no new pages).
+
+### Real live end-to-end verification
+
+Started `auth` (:8086), `oms-gateway` (:8081), `backoffice` (:8084),
+`kyc-onboarding` (:8083), and `api-gateway` (:8089) as real local
+`go run` processes (ports confirmed free beforehand, confirmed cleanly
+killed and free again afterward; no panics/fatals in any log):
+
+- `POST /auth/login` with the seeded `acct-001@demo.mercurius.local` /
+  the dev-default demo password returned a real JWT
+  (`{"sub":"acct-001","role":"retail",...}`, decoded) and refresh
+  token; same for `acct-002`.
+- The `acct-001` token successfully hit a real gated endpoint on **all
+  four** services: `GET /positions?accountId=acct-001` (oms-gateway,
+  200), `GET /family-access/links?ownerAccountId=acct-001`
+  (backoffice, 200), `GET /kyc/status?accountId=acct-001`
+  (kyc-onboarding, 200), `GET
+  /developer/api-keys?accountIdentifier=acct-001` (api-gateway, 200).
+- **(a) No token** on the same four routes → `401
+  {"errorMessage":"missing or malformed Authorization header"}` on all
+  four.
+- **(b) Wrong-account token**: `acct-002`'s real token against
+  `acct-001`'s data on all four routes → `403
+  {"errorMessage":"you can only act on your own account"}` on all
+  four.
+- **(c) Non-admin token on admin-only routes**: `acct-001`'s
+  (`RoleRetail`) token against `POST /market-session/open`
+  (oms-gateway) and `POST /accounts/freeze` (backoffice) → `403
+  {"errorMessage":"this action requires the \"admin\" role"}` on both;
+  the SAME two routes with NO token at all → `401` (not `403`),
+  confirming auth is checked strictly before role.
+- A real `POST /orders/submit` with a valid `acct-001` token passed
+  auth and reached real downstream business logic (rejected by
+  oms-gateway's connectivity kill switch, auto-engaged because
+  matching-engine wasn't running this round — unrelated to auth,
+  confirms the pipeline still functions end-to-end under the new
+  gating rather than auth silently swallowing all requests).
+- `POST /auth/refresh` correctly reissued a role-bearing access token
+  (`"role":"retail"` present in the new token).
+- api-gateway's new CORS: a real `OPTIONS` preflight from `Origin:
+  http://localhost:3000` against `/developer/api-keys` returned `204`
+  with the correct allow-listed headers (closing the entry-83 gap); the
+  same preflight from `Origin: http://evil.example.com` returned `204`
+  with NO CORS headers.
+
+### Bugs found and fixed this round
+
+1. `backoffice`'s `GET /support/tickets/get`/`GET
+   /support/tickets/thread` had no account field to check ownership
+   against at all before this pass — any caller could read any
+   ticket's contents by id. Fixed by checking ownership against the
+   fetched ticket's own account field.
+2. `api-gateway`'s `POST /developer/api-keys/revoke` had the same
+   shape of gap (no account field on the request) — fixed the same way,
+   by looking the key record up first and checking its account before
+   revoking.
+
+### Judgment calls flagged for product/reviewer decision (consolidated)
+
+1. **oms-gateway `/strategies/followers` → admin-only.** Lists every
+   follower of a strategy (exposes other accounts' identities); no
+   "strategy leader" ownership concept exists yet to scope it to a
+   caller instead. Product question: should a verified strategy leader
+   get an owner-scoped view of their own followers rather than being
+   blocked out entirely?
+2. **backoffice `/nominee-succession/submit` ownership model.** The
+   route checks the AUTHENTICATED caller's account against the
+   request's `accountIdentifier` field — but that field names the
+   DECEASED account holder, and the real actor filing a death claim is
+   typically a nominee, not the deceased person logging in as
+   themselves. Needs a product decision on the correct ownership check
+   for this specific workflow (e.g. checking against a registered
+   nominee record once `kyc-onboarding`'s `nomineedesignation` and this
+   service's claim workflow are cross-referenced) rather than the
+   mechanical "caller == subject account" check that's correct
+   everywhere else.
+3. **kyc-onboarding `RoleCompliance` vs. `RoleAdmin` on the review
+   queue.** `RequireRole` does an exact single-role match with no
+   hierarchy — a `RoleAdmin` token is currently REJECTED from
+   `/kyc/review-queue` and `/override`. Product question: should
+   `RoleAdmin` implicitly satisfy any more-specific role check, or is
+   requiring the specific `RoleCompliance` grant correct compliance
+   segregation-of-duties?
+4. **kyc-onboarding `/bank-verification/debug-peek` → `RoleAdmin`
+   instead of owner-self-service** (correct by construction — it would
+   defeat the verification challenge otherwise — flagged only for
+   confirmation, not because it's ambiguous).
+5. **api-gateway `/webhooks/deliveries` → `RoleAdmin`**, purely because
+   `internal/webhookdelivery.DeliveryHistory()` has no per-account
+   filter yet. Likely a temporary state — once account filtering is
+   added there, this should probably move to owner-only self-service
+   like `/webhooks/subscribe` already is.
+6. **api-gateway `/alerts` and `/tenants` → `RoleAdmin`** (SLO alerts
+   and the tenant registry, both operator-facing, not account-scoped —
+   flagged only for confirmation, no explicit spec existed to check
+   against).
+
+### Known limitations left in place
+
+- **`internal/authmiddleware` is copy-pasted five times, not shared.**
+  A change to the JWT claim shape or verification logic in
+  `services/auth`'s `internal/jwtauth` must be manually re-applied to
+  all five copies, with nothing but developer discipline keeping them
+  in sync — the same tradeoff this repo already accepts for
+  `internal/httplogging` and similar packages, now at a larger, more
+  security-sensitive scale.
+- **No secret rotation.** `AUTH_JWT_SIGNING_SECRET` is one shared env
+  var (with an insecure hardcoded dev default) that every one of the
+  six services must hold identically. Rotating it today means
+  restarting every service simultaneously with the new value,
+  invalidating every live session with no graceful overlap/dual-secret
+  window.
+- **`RequireRole` has no hierarchy** — a `RoleAdmin` token cannot pass
+  a `RoleCompliance`- or `RoleSupport`-gated check (see judgment call
+  #3 above). A real build likely wants an "any of these roles" or
+  role-inheritance helper.
+- **No provisioning path for non-retail roles.** Only direct Go code
+  (`RegisterAccount`'s `role` parameter) can mint a `RoleAdmin`/
+  `RoleSupport`/`RoleCompliance` account; there is no admin console,
+  invite flow, or self-service upgrade path. Every admin/support/
+  compliance-gated route in this build is therefore only reachable by
+  an operator who edits seeding code.
+- **Refresh-token flow re-derives role fresh from `accountstore` on
+  every refresh** (`RoleForAccountIdentifier`), rather than trusting
+  a cached value — correct behavior (a role change would take effect
+  on the very next refresh), but never live-tested with an actual role
+  CHANGE in this round, since no seeded account changes role after
+  creation.
+- **`services/auth`'s own CORS is unchanged** (still wildcard
+  `Access-Control-Allow-Origin: *`) — out of scope for this pass, and
+  arguably fine since its own endpoints don't require a credentialed
+  request, but it's now the one inconsistent service alongside the
+  other four's allow-listed CORS.
+- **`internal/idempotency`'s pre-existing concurrent-claim race
+  mitigation (entry 30) is untouched and orthogonal** — auth answers
+  "who is this and do they own this account", not "is this request
+  otherwise safe under concurrency"; a client could still legitimately
+  retry a request with the same idempotency key under a completely
+  valid, correctly-scoped token.
+- **`ledger`, `matching-engine`, `market-data`, `mutual-funds`,
+  `reporting`, `quant-engine`, and `apps/terminal`** remain entirely
+  unauthenticated — explicitly out of scope for this pass, not an
+  oversight.
+- Consolidated judgment-call list above is real product/reviewer input
+  needed, not resolved by this entry.
+
+**Verification summary:** `gofmt`/`go build ./...`/`go vet ./...`/
+`go test -race -count=1 ./...` clean across `auth`, `oms-gateway`,
+`backoffice`, `kyc-onboarding`, `api-gateway` (independently re-run by
+the orchestrating session, not only by the sub-agents that did the
+wiring); `npx tsc --noEmit`/`npm run lint`/`npm run build` clean for
+`apps/web`; full real live end-to-end verification against five real
+running processes as detailed above, with exact `curl` commands and
+responses; all backend processes and ports confirmed cleanly stopped
+afterward.
+
+## Entry 85 — real Postgres persistence (Plan B) across ledger, oms-gateway, market-data
+
+Everything in `infra/docker/docker-compose.yml` had been provisioned
+since early in this project's history but nothing ever connected to
+it — `docs/DOCUMENTATION.md`'s cross-cutting summary said so
+explicitly. This entry wires real `github.com/jackc/pgx/v5` (Go) and
+`tokio-postgres` (Rust) persistence into the six stores FEATURES.md
+and this repo's own docs called out as most needing it: ledger's
+double-entry book, oms-gateway's audit trail/positions/idempotency
+cache, and market-data's watchlist/price-alert stores.
+Matching-engine, backoffice, kyc-onboarding, api-gateway, auth,
+quant-engine, mutual-funds, reporting, apps/web, and apps/terminal
+were explicitly out of scope and untouched.
+
+### Environment note, reported up front as instructed
+
+Docker was genuinely available in this build environment
+(`docker version`, `docker compose` both real) — this is NOT a repeat
+of an earlier entry's "Docker unavailable" finding. One real,
+environment-specific wrinkle: this dev machine has a pre-existing
+system-level PostgreSQL 18 `launchd` daemon already bound to port
+5432, which a non-interactive session cannot stop (no sudo password
+available). `infra/docker/docker-compose.yml`'s `postgres` service
+host port was remapped `5433:5432` (container-internal port
+untouched) so `make infra-up` could actually succeed — documented
+inline in the compose file itself. Every application-level DSN default
+in code below still reads `...@localhost:5432/...` (the correct
+default for a normal machine without this specific conflict); all
+verification in THIS session used `POSTGRES_DSN`/`OMS_POSTGRES_DSN`/
+`MARKET_DATA_POSTGRES_DSN` overridden to port 5433. This is a real,
+honestly-reported environment quirk, not a fabricated one.
+
+### No ORM, no migration framework — the shared convention
+
+Every one of the three services gained exactly one new dependency
+(`pgx/v5` or `tokio-postgres`) and a `migrations/*.sql` directory of
+hand-written, embedded (`embed.FS` / `include_str!`), idempotent
+(`CREATE TABLE/INDEX IF NOT EXISTS`) files applied in filename order at
+every process startup — no `schema_migrations` tracking table, since
+idempotent DDL makes one unnecessary for a file set this small. Same
+convention in all three services and both languages.
+
+### Step 1 — services/ledger
+
+`internal/doubleentry` gained a `LedgerBook` interface (`PostJournalEntry`,
+`RegisterAccountIfAbsent`, `CurrentBalanceInMinorUnits`,
+`CaptureSnapshot`, `RestoreFromSnapshot`) that
+`InMemoryDoubleEntryLedgerBook` already satisfied without any change to
+its own methods. New `internal/pgstore.PostgresLedgerBook` implements
+the same interface against real Postgres (`services/ledger/migrations/
+0001_journal_entries.sql`: `ledger_accounts` balance projection +
+append-only `journal_entries`/`journal_entry_lines`, one real
+transaction per `PostJournalEntry` — every referenced account is
+`SELECT ... FOR UPDATE`-locked before any line is applied, so a
+concurrent post against the same accounts serializes correctly rather
+than racing). `internal/fundsegregation`, `internal/withdrawalworkflow`,
+and `internal/multicurrencywallet` — the three packages that held a
+`*doubleentry.InMemoryDoubleEntryLedgerBook` — had that ONE field/
+parameter type widened to `doubleentry.LedgerBook`; zero logic changes,
+confirmed by their pre-existing test suites passing unmodified.
+`cmd/server/main.go` now constructs `pgstore.NewPostgresLedgerBook`
+first, falling back to the in-memory constructor (logged loudly) only
+if Postgres is unreachable at startup — a deliberate fail-OPEN choice,
+documented in `main.go` itself, matching this repo's existing
+"degrade, don't crash" convention for other optional startup
+dependencies (e.g. oms-gateway's `syncRiskEngineBalancesFromLedger`).
+`POSTGRES_DSN` defaults to
+`postgres://trading:trading@localhost:5432/ledger` (the compose
+Postgres's `POSTGRES_DB` already provisions this database — no
+create-database step needed here, unlike Step 2/3 below).
+
+`internal/fundsegregation.SegregationGuard` was checked, not assumed:
+its own doc comment already says "It holds no balances of its own —
+internal/doubleentry remains the one system of record," and its
+`accountKindByIdentifier` classification map is rebuilt fresh from
+`cmd/server/main.go`'s hardcoded constructor arguments on every
+startup regardless of persistence backend — there is genuinely nothing
+in this package that needs its own persistence.
+
+7 new real tests in `internal/pgstore` (register/idempotent,
+unknown-account error, balanced-entry-updates-both-accounts,
+rejects-unbalanced, rejects-unknown-account, persists-across-a-fresh-
+connection, capture/restore-snapshot round trip) — all run against the
+real local Postgres, not mocks. Every pre-existing test in every other
+`services/ledger` package passed unmodified.
+
+### Step 2 — services/oms-gateway
+
+`internal/audittrail`, `internal/positions`, and `internal/idempotency`
+each gained an optional Postgres backing on the SAME concrete struct
+(`postgres *postgresBacking` field) rather than a separate interface +
+implementing type — a deliberately different, lower-blast-radius
+mechanism than ledger's `pgstore` package, appropriate here because
+every consumer across `cmd/server/main.go`'s ~40 other internal
+packages already held a concrete `*AuditTrail`/`*PositionBook`/
+`*IdempotencyStore` pointer and none of them needed to change at all;
+only the ONE construction call site per store does. When Postgres-
+backed, Postgres is the sole source of truth (never a mirror of the
+in-memory state) — every method transparently branches on whether
+`postgres` is set.
+
+- **`internal/audittrail`** (highest priority — its own doc comment
+  already called in-memory-only "disqualifying for anything actually
+  regulated"): `migrations/0001_audit_trail.sql`'s `audit_trail_entries`
+  table mirrors every field of `Entry` 1:1. `Append`/`AllEntries`/
+  `EntriesForAccount` all branch cleanly. A genuinely NEW field,
+  `AuthenticatedActorAccountIdentifier`, was added to `Entry` — see
+  "actor enrichment" below.
+- **`internal/positions`**: `migrations/0002_positions.sql`'s
+  `positions` table, one row per (account, instrument), `ApplyFill`/
+  `SetPositionDirectly` are real atomic `INSERT ... ON CONFLICT DO
+  UPDATE` upserts (no read-then-write race). Only the REAL
+  `positionBook` is Postgres-backed — `paperPositionBook` (paper
+  trading) and `milliSharePaperPositionBook` (fractional shares) stay
+  in-memory, unchanged: a simulated position was never real
+  money/holdings, out of scope for this pass.
+- **`internal/idempotency`**: closes TWO previously-documented gaps at
+  once (in-memory-only AND unbounded/never-expiring) via
+  `migrations/0003_idempotency.sql`'s `idempotency_responses` table
+  with a real `expires_at` (`idempotencyResponseTtl`, 24h, matching
+  this package's own pre-existing doc-comment suggestion) and a new
+  `DeleteExpiredResponses()` — NOT run automatically on a timer,
+  matching this repo's existing "sweep due X is an explicit operator/
+  scheduled-job call" convention (`ProcessDueWithdrawals`,
+  `SweepDueMandates`). The in-process claim/await concurrent-duplicate-
+  collapsing mechanism (`claimedKeyEntry`/`doneChannel`) is deliberately
+  UNCHANGED and stays purely in-memory — it's a single-process Go
+  channel primitive that cannot be meaningfully distributed across
+  processes via a Postgres row without a much larger redesign
+  (listen/notify or polling), explicitly out of scope here. What
+  Postgres adds is durability of the FINAL answer for an
+  already-completed key: `ClaimKeyOrAwaitExistingResponse`, on a
+  same-process cache miss, now also checks the durable Postgres cache
+  (releasing the in-memory mutex before the network round-trip — a
+  real, deliberate fix to avoid holding a process-wide lock across a
+  DB call) before deciding a caller must redo the work.
+
+`OMS_POSTGRES_DSN` defaults to
+`postgres://trading:trading@localhost:5432/omsgateway`. Unlike
+`ledger`, this database does NOT exist on a fresh compose stack
+(`POSTGRES_DB` only provisions `ledger`) — Postgres has no
+`CREATE DATABASE IF NOT EXISTS`, so a new `ensureTargetDatabaseExists`
+in `cmd/server/main.go` connects to the same server's admin `postgres`
+database first, checks `pg_database`, and issues a real
+`CREATE DATABASE` if missing, handled for real rather than documented
+as a manual step. Same fail-open-to-in-memory startup behavior as
+ledger, independently for each of the three stores (logged per-store).
+
+**Actor enrichment, done for real, not assumed** (the task explicitly
+asked this be verified, not assumed, given entry 84 landed
+immediately before this one): checked `cmd/server/main.go`'s actual
+31 `auditTrail.Append` call sites first — every single one populated
+`ClientAccountIdentifier` from the REQUEST BODY, none from
+`authmiddleware.AuthenticatedAccountIdentifier(request)`, confirming
+this was genuinely new work, not already covered. Added
+`AuthenticatedActorAccountIdentifier` (additive, `omitempty`) to
+`audittrail.Entry`; threaded a new `authenticatedActorAccountIdentifier
+string` parameter through `processOrderSubmission` (9 call sites: the
+direct HTTP handler, DMA gateway, auto-liquidation engine,
+cover-order entry leg, AMO drain, conversational-order confirm,
+multi-leg options, basket orders, dividend reinvestment — each passes
+either the real authenticated caller via a new
+`authenticatedActorAccountIdentifierOrEmpty(request)` helper, or an
+honestly-empty `""` for the two callers with no per-request auth model
+at all: the DMA/FIX-inspired TCP gateway and the auto-liquidation
+engine's internally-triggered SELL). The AMO-drain case records the
+ADMIN who triggered the drain, not each queued order's original
+submitter (that information isn't retained by `afterMarketOrderQueue`)
+— documented inline as an honest distinction, not a guess.
+
+**A real bug was caught and fixed during this pass, by ME, not
+self-reported**: a first pass at this actor-threading missed 4 of the
+20 in-`processOrderSubmission` `audittrail.Entry{...}` struct literals
+and all 5 outside it (cancel-not-found, both cover-order-protective-leg
+failure paths, cover-order-protective-leg-placed, multi-leg-options'
+own submission entry) — `gofmt`'s column-alignment of struct literals
+made a naive single-space substring match silently skip literals whose
+longest field name differed. Caught by writing a small Python
+completeness checker (parses every `audittrail.Entry{...}` block,
+flags any missing the new field) rather than trusting the initial
+line-count match — re-ran until it reported zero missing, then
+verified LIVE (see below) that a real submitted order's audit rows
+actually carried the authenticated actor before calling this closed.
+
+13 new real Postgres tests (4 audittrail, 6 positions, 3 idempotency,
+all run against the real local Postgres). Every pre-existing test
+across all ~45 `services/oms-gateway` packages passed unmodified.
+
+### Step 3 — services/market-data (Rust)
+
+New `src/pgBacking.rs`: a shared connection helper. The one genuinely
+awkward design point of this whole entry — every existing
+`WatchlistStore`/`PriceAlertStore` method is a plain SYNCHRONOUS
+`fn(&self, ...)`, callable from `httpQueryServer.rs`'s hand-rolled,
+thread-per-connection (NOT async) HTTP server and from `main.rs`'s
+synchronous ingestion loop, while `tokio-postgres` is necessarily
+async. Rather than rewriting the HTTP layer onto a real async
+framework (separate, much larger, explicitly out-of-scope work), each
+Postgres-backed store owns a small dedicated `tokio::runtime::Runtime`
+and every method calls `runtime.block_on(...)` around the real async
+query — preserves every existing method's signature byte-for-byte, at
+the cost of one blocking hop per call. Documented as a known
+limitation, not hidden.
+
+`watchlist.rs`'s `WatchlistStore` and `pricealerts.rs`'s
+`PriceAlertStore` each gained an optional `postgres: Option<PgBacking>`
+field (same "extend the concrete struct" pattern as oms-gateway's Go
+side) and a `newPostgresBackedStore(dsn)` constructor; every existing
+method branches transparently. `migrations/0001_watchlist_and_
+pricealerts.sql`: `watchlist_symbols` (presence table) +
+`watchlist_changes` (append-only delta-sync log, `lastModifiedAtEpoch
+MillisForAccount` now a real `MAX(epoch_millis)` query) +
+`price_alerts` (`checkAndTriggerAlertsForTrade` is a single atomic
+`UPDATE ... RETURNING`, closing the read-then-write race the in-memory
+version's `for alert in alerts.iter_mut()` loop never had to worry
+about but a naive read-then-write Postgres port would have introduced).
+`MARKET_DATA_POSTGRES_DSN` defaults to `postgres://trading:trading@
+localhost:5432/marketdata`; same `marketdata`-database-doesn't-exist-
+by-default gap as oms-gateway, same real fix (`ensureTargetDatabase
+Exists` in `pgBacking.rs`, connects to the admin `postgres` database
+via `tokio_postgres::Config`, `CREATE DATABASE` if `pg_database` shows
+it missing). Same fail-open-to-in-memory startup behavior, logged.
+
+`candleAggregator.rs`'s trade tape/candles and `columnarTickStore.rs`'s
+tick store deliberately STAY in-memory this pass — a hot-path
+performance tradeoff (every real trade tick touches both on the
+ingestion thread), not an oversight; ClickHouse is explicitly a later,
+separate concern per the original task scope.
+
+5 new real Postgres tests (3 watchlist, 2 pricealerts — add/remove
+round trip, changes-since + last-modified, persists-across-a-fresh-
+connection for both, plus a trigger round trip for pricealerts). All
+135 pre-existing tests passed unmodified; 140 total.
+
+### Verification — real, not simulated
+
+`make infra-up` brought up a REAL Postgres container (`pg_isready`
+confirmed, plus a real `psql \l` listing databases) before a single
+line of persistence code was written, per the task's own instruction —
+the port-5432-conflict wrinkle above was discovered and worked around
+at this exact step, before any code existed to fake success with.
+
+For all three services: `go build ./...`/`go vet ./...`/`go test ./...`
+(ledger, oms-gateway) and `cargo build`/`cargo test` (market-data) all
+clean, zero regressions, real Postgres-backed tests run against the
+actual local container (via a `*_TEST_DSN` env var override, since this
+machine's remapped port meant the in-code default couldn't be used
+directly for tests either) — not skipped, not mocked.
+
+**Restart-survival tests — the actual point of this entry, all three
+services, with exact evidence:**
+
+- **ledger**: `POST /journal-entries` credited `acct-001` 50000 minor
+  units; `GET /accounts/balance?accountId=acct-001` confirmed
+  `currentBalanceInMinorUnits: 50000`; the real `go run ./cmd/server`
+  process was `kill -9`'d (both the `go run` wrapper and its spawned
+  `server` binary — confirmed via `lsof -iTCP:8082` showing nothing
+  listening); restarted fresh; the SAME `GET /accounts/balance` call
+  returned `currentBalanceInMinorUnits: 50000` again, read back through
+  the real HTTP API, not inspected via `psql`.
+- **oms-gateway**: with real `auth` (`:8086`), `ledger` (`:8082`), and
+  `matching-engine` (`:9101`) also running as real processes, logged in
+  as `acct-001`/`acct-002` via real `POST /auth/login` (real JWTs),
+  funded both accounts via real ledger journal entries, submitted a
+  real resting SELL (`acct-002`) and a real crossing BUY (`acct-001`)
+  through `POST /orders/submit` — a genuine fill
+  (`buyingClientAccountId: acct-001, sellingClientAccountId: acct-002,
+  executedQuantity: 3`) came back. `GET /positions?accountId=acct-001`
+  confirmed `{"DEMO-EQ": 3}` before restart. oms-gateway was `kill -9`'d
+  (`lsof -iTCP:8081` confirmed nothing listening) and restarted fresh —
+  `GET /positions?accountId=acct-001` returned `{"DEMO-EQ": 3}` again
+  (later `{"DEMO-EQ": 5}` after a second real trade + restart cycle,
+  confirming accumulation survives too). Audit trail verified via
+  direct `psql` read of `audit_trail_entries` (a `RoleAdmin`-gated
+  route this build has no seeded admin account for — see Known
+  Limitations) both before and after the SAME kill/restart: 19 rows
+  present after restart, matching the pre-restart count exactly, with
+  `authenticated_actor_account_identifier` correctly populated as
+  `acct-001`/`acct-002` on the real submitted-order rows (after the bug
+  fix above — the FIRST restart-survival pass caught this actor field
+  silently empty, which is what led to writing the completeness checker
+  and re-verifying).
+- **market-data**: real `POST /watchlist/add` for `acct-001`/`DEMO-EQ`
+  (`{"wasAdded":true}`) and real `POST /alerts/create`
+  (`{"alertId":2}`) against the live running process; `GET /watchlist`
+  and `GET /alerts` confirmed both present. The real `market_data`
+  process was `kill -9`'d (`lsof -iTCP:9103` confirmed nothing
+  listening) and restarted — the SAME `GET /watchlist` and `GET
+  /alerts` calls returned byte-identical results (same symbol, same
+  `alertId`, same `lastModifiedAtEpochMillis`).
+
+`make infra-down-clean` run at the end (confirmed via `docker compose
+... down -v` output: postgres/redpanda/clickhouse containers and the
+`docker_default` network all removed) — resources released per this
+repo's own recently-documented guardrail convention.
+
+### Bugs found and fixed this round
+
+1. The audit-trail actor-enrichment gap described above (4 + 5 = 9 of
+   31 `audittrail.Entry{...}` call sites silently missing the new
+   field due to a `gofmt`-alignment-sensitive naive text match) — found
+   via a written completeness checker, not assumed fixed after the
+   first pass, and independently re-confirmed live before this entry
+   was written.
+2. (Design decision, not a bug, but recorded because it was a real
+   correctness consideration during implementation): the Postgres-
+   backed `IdempotencyStore.ClaimKeyOrAwaitExistingResponse` initially
+   held `mutexGuardingEntries` across the Postgres round-trip in a
+   first draft — rewritten to release the lock before the network call
+   and complete the already-claimed in-memory entry with the persisted
+   response if found, so no per-process-wide mutex is ever held across
+   I/O.
+
+### Known limitations left in place
+
+- **No connection-pool tuning** anywhere (`pgxpool`/`tokio-postgres`
+  defaults throughout) and **no read replicas** — single-node Postgres
+  in all three services.
+- **No retry/backoff if Postgres is down at startup** — all three
+  services fail OPEN to an in-memory store (loudly logged) rather than
+  retrying or crashing; a real production deployment likely wants the
+  opposite for money-relevant stores (ledger, audit trail) specifically.
+- **No backup/restore drill run in THIS pass** — covered separately by
+  `DR_RUNBOOK.md`/ledger's existing JSON-snapshot admin endpoints; this
+  entry only adds the durable store itself, not a tested restore
+  procedure for the new Postgres-backed data.
+- **`internal/idempotency`'s concurrent-duplicate-collapsing stays
+  single-process/in-memory-only** — a second oms-gateway instance
+  behind a load balancer would NOT see another instance's in-flight
+  (not-yet-completed) claim, only its completed responses once durably
+  persisted; documented in `postgresBacking.go`, not silently assumed
+  away.
+- **`DeleteExpiredResponses()` is not run on any timer** — an operator/
+  scheduled job must call it; unlike `idempotencyResponseTtl` itself
+  (which correctly stops an expired row from being SERVED), nothing yet
+  reclaims the disk space of an unbounded number of expired-but-
+  undeleted rows on its own.
+- **market-data's Postgres calls block the calling thread** via each
+  store's dedicated `tokio::runtime::Runtime` — real, but not free;
+  under real load this is a worse latency profile than a fully async
+  HTTP layer would give, explicitly flagged in `pgBacking.rs`'s doc
+  comment as a "good enough for this skeleton's traffic" tradeoff, not
+  a permanent design.
+- **`candleAggregator.rs`/`columnarTickStore.rs` remain in-memory** —
+  deliberate hot-path scope boundary for this pass, not an oversight;
+  ClickHouse is the intended real backing store per ARCHITECTURE.md §6
+  and ​is separate, later work.
+- **The port-5432 remap in `infra/docker/docker-compose.yml` is a
+  real, machine-specific workaround**, not a permanent topology
+  decision — a dev machine without a competing system Postgres would
+  work fine with the original `5432:5432` mapping; this was changed
+  because the ACTUAL machine this session ran on had the conflict, and
+  changing it back would have made `make infra-up` fail again on this
+  same machine.
+- **oms-gateway's/market-data's target databases (`omsgateway`,
+  `marketdata`) are created by application code at startup
+  (`ensureTargetDatabaseExists`), not by `infra/docker/docker-
+  compose.yml`'s `POSTGRES_DB`** (which only provisions `ledger`) — a
+  real, working fix, but it does mean the FIRST startup against a
+  brand-new Postgres instance does slightly more work (an extra
+  connect-check-maybe-create round trip) than every subsequent one.
+
+**Verification summary:** `make infra-up` confirmed real
+(`pg_isready`, `psql \l`) before any code was written; `go build`/
+`go vet`/`go test` clean for ledger and oms-gateway, `cargo build`/
+`cargo test` clean for market-data, zero regressions across all
+pre-existing tests in all three services; 25 new real
+Postgres-backed tests (7 ledger + 13 oms-gateway + 5 market-data),
+none mocked, none skipped in this environment; real kill-and-restart
+survival proven for all three
+services with exact before/after evidence above; `make
+infra-down-clean` confirmed containers and volumes removed.
+
+## Entry 86 — `docs/SETUP.md` (consolidated run guide) + Makefile gaps fixed
+
+Closed a real, previously-flagged-nowhere gap: this repo had no single "how
+do I run this" document — commands were scattered across each service's own
+`README.md` and a Makefile that hadn't kept up with the last several
+services added (`auth`, `backoffice`'s `dev-*`, `kyc-onboarding`'s `dev-*`,
+`api-gateway`, `services/reporting`, `services/mutual-funds`, `apps/terminal`'s
+test target). Fixed the Makefile first so the new doc could reference real,
+working commands, then wrote `docs/SETUP.md` and verified it end-to-end.
+
+**Makefile fixes** (`Makefile`):
+- New `dev-auth`, `dev-backoffice`, `dev-kyc-onboarding`, `dev-api-gateway`,
+  `dev-reporting`, `dev-mutual-funds`, `dev-quant-engine` targets, mirroring
+  the pre-existing `dev-oms-gateway`/`dev-ledger` pattern.
+- `build-go` extended to also build `auth`, `api-gateway`, `reporting`,
+  `mutual-funds` (`kyc-onboarding`/`backoffice` were already covered).
+- `test` extended to also run `go test ./...` for `auth`, `backoffice`,
+  `kyc-onboarding`, `api-gateway`, `reporting`, `mutual-funds`, plus
+  `apps/terminal`'s `npm run test` (`vitest run`, confirmed real — see
+  `apps/terminal/package.json`). Did NOT add `apps/web` — it has no `test`
+  script (`dev`/`build`/`start`/`lint` only), and `make test` deliberately
+  doesn't fail on a nonexistent script; documented as an honest gap in
+  `docs/SETUP.md` §8 rather than papering over it.
+- `fmt` extended to `gofmt -w .` the same newly-added Go services.
+- Deliberately did NOT add a `dev-all`/tmux-aggregation target — no such
+  convenience existed in this Makefile before and nothing else in the repo
+  assumes one; `docs/SETUP.md` §4 documents a manual multi-pane layout
+  instead.
+- Every new/changed target verified with `make -n <target>` (dry run) for
+  syntax correctness before any live verification.
+
+**`docs/SETUP.md`** — new file, 10 sections (prerequisites; Docker-infra +
+native-process quickstart; fully-in-memory/no-Docker path; full-stack
+reference table with every real port/env-var default; a live smoke test;
+apps/web; apps/terminal; running tests; a clearly-labeled-as-untested
+"deployed environment" conceptual sketch; troubleshooting). Every port and
+env-var default in it was verified directly against source (file:line),
+not copied from the (stale-in-places) existing READMEs — three real
+corrections surfaced doing this:
+- `market-data`'s three ports (9102 ingestion / 9103 HTTP query / 9104 L1
+  WS) are **hardcoded consts with no env-var override at all**
+  (`services/market-data/src/main.rs:53-55`) — some prior doc language
+  implied these were configurable the same way other services' ports are;
+  they are not.
+- `quant-engine` (`services/quant-engine/src/quantengine/httpServer.py`)
+  has **zero `os.environ`/`os.getenv` calls anywhere** — its `127.0.0.1:8085`
+  bind address is not overridable by any means short of editing source.
+- `oms-gateway`'s main HTTP port (`:8081`) and `ledger`'s (`:8082`) are
+  likewise hardcoded with no override env var — only the DMA/FIX gateway
+  sub-listener (`:8088`, via `DMA_GATEWAY_LISTEN_ADDRESS`) is configurable
+  on oms-gateway's side.
+
+**Live verification actually run** (not just written and assumed correct):
+1. `make infra-up` — confirmed via `docker exec docker-postgres-1 pg_isready
+   -U trading` → `accepting connections`. Separately, with the compose stack
+   torn down, confirmed a raw connection attempt to the conventional
+   `localhost:5432` on this build machine hits a **different, real, already-
+   running system Postgres** that responds with a full TLS-then-SASL
+   handshake and then rejects `trading`/`trading` (`FATAL: password
+   authentication failed for user "trading" (SQLSTATE 28P01)`) — this is the
+   same port-5432 conflict entry 85 first documented, reproduced independently
+   on this session's machine too, and it's a more specific/confusing failure
+   mode than plain "connection refused" (worth knowing when troubleshooting).
+2. Brought up `matching-engine`, `market-data` (with `MARKET_DATA_POSTGRES_DSN`
+   pointed at port 5433), `ledger` (`POSTGRES_DSN` at 5433), `auth`, and
+   `oms-gateway` (`OMS_POSTGRES_DSN` at 5433) using the exact `make dev-*`
+   commands `docs/SETUP.md` documents. All connected to Postgres for real
+   (`positions connected to Postgres...`, `audit trail connected to
+   Postgres...`, `idempotency store connected to Postgres...`, `ledger
+   connected to Postgres...`, `watchlists/priceAlerts connected to
+   Postgres...`).
+3. **Found and documented, not a bug**: `matching-engine`'s default WAL file
+   (`services/matching-engine/matchingEngineWriteAheadLog.jsonl`) is tracked
+   in git and gets replayed on every startup — a stock checkout's order book
+   is therefore NOT empty (confirmed: a from-git-history run recovered over
+   ten thousand historical events and a crossing order filled against old
+   resting liquidity at an old price instead of the newly-submitted resting
+   order, which was surprising until traced back to this). Re-ran the smoke
+   test with `MATCHING_ENGINE_WAL_FILE_PATH` pointed at a scratch path for a
+   clean, deterministic result and documented the scratch-path workaround
+   plus the underlying cause in `docs/SETUP.md`'s smoke test and
+   Troubleshooting sections. Also noted as a real, mildly annoying
+   consequence: simply running matching-engine at all grows this tracked
+   file — no `.gitignore` entry or reset step exists for it yet.
+4. Ran the full smoke test for real against the fresh-WAL setup: logged in
+   as both `acct-001` and `acct-002` via `POST /auth/login`
+   (`acct-00N@demo.mercurius.local` / the dev-default
+   `AUTH_DEMO_ACCOUNT_PASSWORD` value), got real JWTs; submitted a real
+   resting sell (`acct-002`, qty 5 @ 5000) then a real crossing buy
+   (`acct-001`, qty 5 @ 5000) via `oms-gateway`'s `/orders/submit` with
+   `Authorization: Bearer <token>` — got back a real
+   `tradeExecutionEvents` fill at price 5000, qty 5; confirmed via
+   `GET /positions` that both accounts' `DEMO-EQ` positions moved by
+   exactly ±5; confirmed via `GET /accounts/balance` on `ledger` that the
+   real settlement moved exactly `5000 × 5 = 25000` minor units between the
+   two accounts.
+5. Proved Postgres persistence survives a real restart, not just a
+   process staying up: killed `oms-gateway` (had to `lsof -tiTCP:8081
+   -sTCP:LISTEN | xargs kill -9` — a plain `kill` on the `go run` PID
+   didn't reach its compiled child process, itself worth the
+   Troubleshooting-section note it got), restarted it against the same
+   `OMS_POSTGRES_DSN`, re-logged in (JWTs from before the restart are
+   still valid — auth verification is local/stateless via the shared HMAC
+   secret, not a call back to `auth`), and confirmed `GET /positions` for
+   `acct-001` returned the exact same `{"DEMO-EQ":5}` as before the
+   restart. Startup log also showed oms-gateway's risk-engine balance sync
+   pulling the POST-settlement ledger balance, independently confirming
+   ledger's own Postgres persistence in the same pass.
+6. Confirmed the fully-in-memory/no-Docker fail-open claim for real, not
+   just by reading code: started `ledger` alone with no compose stack
+   running at all — it logged `WARNING: could not connect ledger to
+   Postgres (...) — falling back to IN-MEMORY ledger` and then served
+   `GET /health` normally (`postgresBacked=false`) rather than crashing.
+   Cross-checked the equivalent fail-open code path (a `log.Printf`
+   `WARNING`, never `log.Fatalf`) directly in `oms-gateway`'s
+   `ensureTargetDatabaseExists` call site and `market-data`'s `pgBacking.rs`
+   to confirm the same non-fatal pattern holds for all three
+   Postgres-backed services, not just the one live-tested.
+7. Brought up `apps/web` (`npm run dev`) — confirmed `http://localhost:3000`
+   returns `200` with real rendered content, and confirmed by grep (not
+   guesswork) that every `NEXT_PUBLIC_*_BASE_URL` var documented in
+   `docs/SETUP.md` §6 is exactly what the page source files read
+   (`apps/web/app/*.tsx`, `??` fallback defaults), including the
+   entry-83-added `NEXT_PUBLIC_API_GATEWAY_BASE_URL`.
+8. Cleaned up fully afterward: killed every started process (`matching-
+   engine`, `market-data`, `ledger`, `auth`, `oms-gateway`, `apps/web`'s
+   `next dev`), confirmed via `lsof`/`ps` that ports 8081/8082/8086/9101-
+   9104/9106/3000 were all free again, then ran `make infra-down-clean` and
+   confirmed the containers and the compose network were removed.
+
+**Known limitation of this pass, stated honestly in `docs/SETUP.md` §9**:
+the "deployed environment" section is a conceptual sketch, explicitly
+labeled as untested — no Dockerfile exists for any service, no
+`infra/k8s/`/`infra/terraform/` directory exists, and nothing in this
+entry changes that. `DR_RUNBOOK.md`'s own real, already-run failover drill
+is scoped to a single machine and does not prove cross-region failover
+either — `docs/SETUP.md` §9(b) says this explicitly rather than implying
+otherwise.
+

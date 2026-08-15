@@ -55,7 +55,7 @@ type WithdrawalRequest struct {
 // `doubleentry.InMemoryDoubleEntryLedgerBook`, not a separate parallel
 // bookkeeping system.
 type WithdrawalWorkflow struct {
-	ledgerBook                              *doubleentry.InMemoryDoubleEntryLedgerBook
+	ledgerBook                              doubleentry.LedgerBook
 	firmWithdrawalClearingAccountIdentifier string
 	settlementHoldDuration                  time.Duration
 
@@ -64,7 +64,7 @@ type WithdrawalWorkflow struct {
 }
 
 func NewWithdrawalWorkflow(
-	ledgerBook *doubleentry.InMemoryDoubleEntryLedgerBook,
+	ledgerBook doubleentry.LedgerBook,
 	firmWithdrawalClearingAccountIdentifier string,
 	settlementHoldDuration time.Duration,
 ) *WithdrawalWorkflow {

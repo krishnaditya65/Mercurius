@@ -40,6 +40,8 @@ use std::sync::Mutex;
 
 use serde::Serialize;
 
+use crate::pgBacking::PgBacking;
+
 /// One real mutation to an account's watchlist — the unit a delta/since
 /// query returns. `deviceIdentifier` is caller-supplied and purely
 /// informational (never used for access control or partitioning — the
@@ -71,15 +73,36 @@ impl AccountWatchlistState {
     }
 }
 
+/// Real Postgres persistence (docs/BUILD_LOG.md's Postgres-persistence
+/// entry): when constructed via `newPostgresBackedStore`, `postgres` is
+/// set and every method below reads/writes real Postgres instead of
+/// `stateByAccount` — Postgres becomes the sole source of truth in that
+/// mode, not a mirror. `newEmptyStore()` (unchanged) leaves `postgres`
+/// `None` and behaves exactly as it always did.
 pub struct WatchlistStore {
     stateByAccount: Mutex<HashMap<String, AccountWatchlistState>>,
+    postgres: Option<PgBacking>,
 }
 
 impl WatchlistStore {
     pub fn newEmptyStore() -> Self {
         WatchlistStore {
             stateByAccount: Mutex::new(HashMap::new()),
+            postgres: None,
         }
+    }
+
+    /// Connects to postgresDsn, applies migrations, and returns a real,
+    /// durable WatchlistStore. See pgBacking.rs's module doc for why
+    /// every method below still has the exact same synchronous
+    /// signature it always did (a dedicated background tokio runtime
+    /// absorbs the async tokio-postgres calls).
+    pub fn newPostgresBackedStore(postgresDsn: &str) -> Result<Self, String> {
+        let postgres = PgBacking::connect(postgresDsn)?;
+        Ok(WatchlistStore {
+            stateByAccount: Mutex::new(HashMap::new()),
+            postgres: Some(postgres),
+        })
     }
 
     /// Returns true if the symbol was newly added, false if it was
@@ -94,6 +117,10 @@ impl WatchlistStore {
         deviceIdentifier: Option<&str>,
         nowEpochMillis: u64,
     ) -> bool {
+        if let Some(postgres) = &self.postgres {
+            return self.addSymbolInPostgres(postgres, accountIdentifier, instrumentSymbol, deviceIdentifier, nowEpochMillis);
+        }
+
         let mut stateByAccount = self.stateByAccount.lock().expect("watchlist mutex poisoned");
         let accountState = stateByAccount
             .entry(accountIdentifier.to_string())
@@ -112,6 +139,37 @@ impl WatchlistStore {
         wasAdded
     }
 
+    fn addSymbolInPostgres(
+        &self,
+        postgres: &PgBacking,
+        accountIdentifier: &str,
+        instrumentSymbol: &str,
+        deviceIdentifier: Option<&str>,
+        nowEpochMillis: u64,
+    ) -> bool {
+        postgres.blockOn(async {
+            let insertResult = postgres
+                .client()
+                .execute(
+                    "INSERT INTO watchlist_symbols (account_identifier, instrument_symbol) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+                    &[&accountIdentifier, &instrumentSymbol],
+                )
+                .await;
+            let wasAdded = matches!(insertResult, Ok(rowsAffected) if rowsAffected == 1);
+            if wasAdded {
+                let epochMillisAsI64 = nowEpochMillis as i64;
+                let _ = postgres
+                    .client()
+                    .execute(
+                        "INSERT INTO watchlist_changes (account_identifier, instrument_symbol, epoch_millis, was_added, device_identifier) VALUES ($1, $2, $3, true, $4)",
+                        &[&accountIdentifier, &instrumentSymbol, &epochMillisAsI64, &deviceIdentifier],
+                    )
+                    .await;
+            }
+            wasAdded
+        })
+    }
+
     /// Returns true if the symbol was present and removed, false if it
     /// wasn't on the watchlist to begin with. Same no-op-doesn't-log
     /// rule as `addSymbol`.
@@ -122,6 +180,10 @@ impl WatchlistStore {
         deviceIdentifier: Option<&str>,
         nowEpochMillis: u64,
     ) -> bool {
+        if let Some(postgres) = &self.postgres {
+            return self.removeSymbolInPostgres(postgres, accountIdentifier, instrumentSymbol, deviceIdentifier, nowEpochMillis);
+        }
+
         let mut stateByAccount = self.stateByAccount.lock().expect("watchlist mutex poisoned");
         let Some(accountState) = stateByAccount.get_mut(accountIdentifier) else {
             return false;
@@ -140,9 +202,56 @@ impl WatchlistStore {
         wasRemoved
     }
 
+    fn removeSymbolInPostgres(
+        &self,
+        postgres: &PgBacking,
+        accountIdentifier: &str,
+        instrumentSymbol: &str,
+        deviceIdentifier: Option<&str>,
+        nowEpochMillis: u64,
+    ) -> bool {
+        postgres.blockOn(async {
+            let deleteResult = postgres
+                .client()
+                .execute(
+                    "DELETE FROM watchlist_symbols WHERE account_identifier = $1 AND instrument_symbol = $2",
+                    &[&accountIdentifier, &instrumentSymbol],
+                )
+                .await;
+            let wasRemoved = matches!(deleteResult, Ok(rowsAffected) if rowsAffected == 1);
+            if wasRemoved {
+                let epochMillisAsI64 = nowEpochMillis as i64;
+                let _ = postgres
+                    .client()
+                    .execute(
+                        "INSERT INTO watchlist_changes (account_identifier, instrument_symbol, epoch_millis, was_added, device_identifier) VALUES ($1, $2, $3, false, $4)",
+                        &[&accountIdentifier, &instrumentSymbol, &epochMillisAsI64, &deviceIdentifier],
+                    )
+                    .await;
+            }
+            wasRemoved
+        })
+    }
+
     /// Symbols on accountIdentifier's watchlist, sorted for a stable,
     /// deterministic response (a HashSet has no defined iteration order).
     pub fn symbolsForAccount(&self, accountIdentifier: &str) -> Vec<String> {
+        if let Some(postgres) = &self.postgres {
+            let mut symbols: Vec<String> = postgres.blockOn(async {
+                postgres
+                    .client()
+                    .query(
+                        "SELECT instrument_symbol FROM watchlist_symbols WHERE account_identifier = $1",
+                        &[&accountIdentifier],
+                    )
+                    .await
+                    .map(|rows| rows.iter().map(|row| row.get::<_, String>(0)).collect())
+                    .unwrap_or_default()
+            });
+            symbols.sort();
+            return symbols;
+        }
+
         let stateByAccount = self.stateByAccount.lock().expect("watchlist mutex poisoned");
         let mut symbols: Vec<String> = stateByAccount
             .get(accountIdentifier)
@@ -157,6 +266,23 @@ impl WatchlistStore {
     /// what a client stamps as its own "last synced at" marker after a
     /// full fetch, to pass back into `changesForAccountSince` next time.
     pub fn lastModifiedAtEpochMillisForAccount(&self, accountIdentifier: &str) -> u64 {
+        if let Some(postgres) = &self.postgres {
+            return postgres.blockOn(async {
+                postgres
+                    .client()
+                    .query_opt(
+                        "SELECT MAX(epoch_millis) FROM watchlist_changes WHERE account_identifier = $1",
+                        &[&accountIdentifier],
+                    )
+                    .await
+                    .ok()
+                    .flatten()
+                    .and_then(|row| row.get::<_, Option<i64>>(0))
+                    .map(|value| value as u64)
+                    .unwrap_or(0)
+            });
+        }
+
         let stateByAccount = self.stateByAccount.lock().expect("watchlist mutex poisoned");
         stateByAccount
             .get(accountIdentifier)
@@ -173,6 +299,31 @@ impl WatchlistStore {
     /// the newly-returned `lastModifiedAtEpochMillis` as the next
     /// `since` never re-delivers the same change twice.
     pub fn changesForAccountSince(&self, accountIdentifier: &str, sinceEpochMillis: u64) -> Vec<WatchlistChangeEvent> {
+        if let Some(postgres) = &self.postgres {
+            let sinceAsI64 = sinceEpochMillis as i64;
+            return postgres.blockOn(async {
+                postgres
+                    .client()
+                    .query(
+                        "SELECT epoch_millis, instrument_symbol, was_added, device_identifier FROM watchlist_changes \
+                         WHERE account_identifier = $1 AND epoch_millis > $2 ORDER BY id",
+                        &[&accountIdentifier, &sinceAsI64],
+                    )
+                    .await
+                    .map(|rows| {
+                        rows.iter()
+                            .map(|row| WatchlistChangeEvent {
+                                epochMillis: row.get::<_, i64>(0) as u64,
+                                instrumentSymbol: row.get(1),
+                                wasAdded: row.get(2),
+                                deviceIdentifier: row.get(3),
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            });
+        }
+
         let stateByAccount = self.stateByAccount.lock().expect("watchlist mutex poisoned");
         stateByAccount
             .get(accountIdentifier)
@@ -345,5 +496,76 @@ mod tests {
         let store = WatchlistStore::newEmptyStore();
         assert!(store.changesForAccountSince("never-touched-acct", 0).is_empty());
         assert_eq!(store.lastModifiedAtEpochMillisForAccount("never-touched-acct"), 0);
+    }
+
+    // -------------------------------------------------------------
+    // Real tests against a real, locally-running Postgres — no mocks.
+    // See docs/BUILD_LOG.md's Postgres-persistence entry: run against
+    // the actual `make infra-up` container (host port remapped to 5433
+    // on this build's dev machine). Skipped (not failed) if Postgres
+    // genuinely isn't reachable, matching this repo's Go-side
+    // equivalent tests' skip-not-fail convention.
+    // -------------------------------------------------------------
+
+    fn testMarketDataPostgresDsn() -> String {
+        std::env::var("MARKET_DATA_PGSTORE_TEST_DSN")
+            .unwrap_or_else(|_| "postgres://trading:trading@localhost:5432/marketdata".to_string())
+    }
+
+    fn openTestPostgresBackedStoreOrSkip() -> Option<WatchlistStore> {
+        match WatchlistStore::newPostgresBackedStore(&testMarketDataPostgresDsn()) {
+            Ok(store) => {
+                store.postgres.as_ref().unwrap().blockOn(async {
+                    store
+                        .postgres
+                        .as_ref()
+                        .unwrap()
+                        .client()
+                        .batch_execute("TRUNCATE watchlist_symbols, watchlist_changes")
+                        .await
+                        .expect("truncate watchlist tables");
+                });
+                Some(store)
+            }
+            Err(connectError) => {
+                eprintln!("skipping Postgres-backed watchlist test: {connectError}");
+                None
+            }
+        }
+    }
+
+    #[test]
+    fn postgresBacked_addAndRemoveRoundTrip() {
+        let Some(store) = openTestPostgresBackedStoreOrSkip() else { return };
+
+        assert!(store.addSymbol("acct-001", "DEMO-EQ", Some("device-phone"), 1_000));
+        assert!(!store.addSymbol("acct-001", "DEMO-EQ", Some("device-phone"), 2_000)); // idempotent
+        assert_eq!(store.symbolsForAccount("acct-001"), vec!["DEMO-EQ".to_string()]);
+
+        assert!(store.removeSymbol("acct-001", "DEMO-EQ", None, 3_000));
+        assert!(store.symbolsForAccount("acct-001").is_empty());
+    }
+
+    #[test]
+    fn postgresBacked_changesForAccountSinceAndLastModified() {
+        let Some(store) = openTestPostgresBackedStoreOrSkip() else { return };
+
+        store.addSymbol("acct-002", "AAPL", Some("device-A"), 1_000);
+        store.addSymbol("acct-002", "MSFT", Some("device-B"), 2_000);
+        assert_eq!(store.lastModifiedAtEpochMillisForAccount("acct-002"), 2_000);
+
+        let changesSince1000 = store.changesForAccountSince("acct-002", 1_000);
+        assert_eq!(changesSince1000.len(), 1);
+        assert_eq!(changesSince1000[0].instrumentSymbol, "MSFT");
+    }
+
+    #[test]
+    fn postgresBacked_persistsAcrossFreshConnection() {
+        let Some(firstStore) = openTestPostgresBackedStoreOrSkip() else { return };
+        firstStore.addSymbol("acct-restart-test", "DEMO-EQ", None, 1_000);
+
+        let secondStore =
+            WatchlistStore::newPostgresBackedStore(&testMarketDataPostgresDsn()).expect("second connection should succeed");
+        assert_eq!(secondStore.symbolsForAccount("acct-restart-test"), vec!["DEMO-EQ".to_string()]);
     }
 }

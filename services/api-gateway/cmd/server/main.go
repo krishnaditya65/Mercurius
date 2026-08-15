@@ -13,14 +13,17 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"log"
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"mercurius/apiGateway/internal/accountaggregator"
 	"mercurius/apiGateway/internal/apikeymanager"
+	"mercurius/apiGateway/internal/authmiddleware"
 	"mercurius/apiGateway/internal/ratelimiter"
 	"mercurius/apiGateway/internal/reverseproxy"
 	"mercurius/apiGateway/internal/sloalerting"
@@ -29,11 +32,69 @@ import (
 	"mercurius/apiGateway/internal/webhookdelivery"
 )
 
+// errYouCanOnlyActOnYourOwnAccount is the standard 403 body for every
+// account-scoped route below whose request carries an account
+// identifier that doesn't match the authenticated caller's own account.
+const errYouCanOnlyActOnYourOwnAccount = `{"errorMessage":"you can only act on your own account"}`
+
+// respondForbiddenOwnAccountOnly writes the standard 403 for an
+// account-ownership mismatch — checked before a handler does anything
+// else with the request.
+func respondForbiddenOwnAccountOnly(responseWriter http.ResponseWriter) {
+	responseWriter.Header().Set("Content-Type", "application/json")
+	responseWriter.WriteHeader(http.StatusForbidden)
+	_, _ = responseWriter.Write([]byte(errYouCanOnlyActOnYourOwnAccount))
+}
+
 func envOrDefault(envVarName, defaultValue string) string {
 	if value := os.Getenv(envVarName); value != "" {
 		return value
 	}
 	return defaultValue
+}
+
+// withAllowListedCorsForDevelopment is api-gateway's first-ever CORS
+// middleware (previously there was none at all — see docs/BUILD_LOG.md
+// entry 83, which flagged the gap by grepping the whole tree for
+// Access-Control/Cors/CORS and finding zero matches in this service).
+// It reads a comma-separated CORS_ALLOWED_ORIGINS env var (defaulting to
+// the two local dev frontends below when unset) and only ever echoes
+// back an exact allow-listed Origin — never `*` — because this gateway
+// now issues Access-Control-Allow-Credentials: true, and the CORS spec
+// forbids pairing a wildcard origin with credentialed requests. A
+// request whose Origin doesn't match anything on the allow-list gets no
+// CORS headers at all, same as this pattern in oms-gateway/backoffice/
+// kyc-onboarding.
+func withAllowListedCorsForDevelopment(nextHandler http.Handler) http.Handler {
+	allowedOrigins := parseCommaSeparatedOrigins(envOrDefault("CORS_ALLOWED_ORIGINS", "http://localhost:3000,http://localhost:3100"))
+
+	return http.HandlerFunc(func(responseWriter http.ResponseWriter, request *http.Request) {
+		requestOrigin := request.Header.Get("Origin")
+		if requestOrigin != "" && allowedOrigins[requestOrigin] {
+			responseWriter.Header().Set("Access-Control-Allow-Origin", requestOrigin)
+			responseWriter.Header().Set("Access-Control-Allow-Credentials", "true")
+			responseWriter.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+			responseWriter.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+		}
+
+		if request.Method == http.MethodOptions {
+			responseWriter.WriteHeader(http.StatusNoContent)
+			return
+		}
+
+		nextHandler.ServeHTTP(responseWriter, request)
+	})
+}
+
+func parseCommaSeparatedOrigins(commaSeparated string) map[string]bool {
+	origins := make(map[string]bool)
+	for _, origin := range strings.Split(commaSeparated, ",") {
+		trimmed := strings.TrimSpace(origin)
+		if trimmed != "" {
+			origins[trimmed] = true
+		}
+	}
+	return origins
 }
 
 func main() {
@@ -75,6 +136,8 @@ func main() {
 		{PathPrefix: "/quant-engine", BackendBaseUrl: quantEngineBaseUrl},
 	})
 
+	signingSecret := authmiddleware.SigningSecretFromEnv()
+
 	httpRequestMultiplexer := http.NewServeMux()
 
 	httpRequestMultiplexer.HandleFunc("/health", func(responseWriter http.ResponseWriter, _ *http.Request) {
@@ -82,25 +145,47 @@ func main() {
 		_, _ = responseWriter.Write([]byte(`{"status":"ok","service":"api-gateway"}`))
 	})
 
-	// FEATURES.md §13 item 1: SLO alerting — GET /alerts
-	httpRequestMultiplexer.HandleFunc("/alerts", buildListAlertsHandler(sloEvaluator))
+	// FEATURES.md §13 item 1: SLO alerting — GET /alerts. Operator-facing
+	// (no account identifier anywhere in the request/response — it's a
+	// platform-wide ops view of SLO breaches), so this is admin-only
+	// rather than account-scoped.
+	httpRequestMultiplexer.HandleFunc("/alerts", authmiddleware.RequireRole(signingSecret, authmiddleware.RoleAdmin, buildListAlertsHandler(sloEvaluator)))
 
-	// FEATURES.md §18 item 8: developer API-key management
-	httpRequestMultiplexer.HandleFunc("/developer/api-keys", buildApiKeysHandler(apiKeyManager))
-	httpRequestMultiplexer.HandleFunc("/developer/api-keys/revoke", buildRevokeApiKeyHandler(apiKeyManager))
+	// FEATURES.md §18 item 8: developer API-key management. Both the
+	// POST-issue and GET-list cases carry an accountIdentifier
+	// (body/query respectively) — account-owner only, any authenticated
+	// role, ownership verified inside the handler before doing anything
+	// else.
+	httpRequestMultiplexer.HandleFunc("/developer/api-keys", authmiddleware.RequireAuth(signingSecret, buildApiKeysHandler(apiKeyManager)))
+	// The revoke request body only carries apiKeyValue, not an account
+	// id directly — but the key record itself (looked up via
+	// ValidateApiKey) carries the owning AccountIdentifier, so ownership
+	// IS structurally verifiable here; see buildRevokeApiKeyHandler.
+	httpRequestMultiplexer.HandleFunc("/developer/api-keys/revoke", authmiddleware.RequireAuth(signingSecret, buildRevokeApiKeyHandler(apiKeyManager)))
 
-	// FEATURES.md §18 item 10: white-label tenant config
-	httpRequestMultiplexer.HandleFunc("/tenants", buildTenantsHandler(tenantRegistry))
+	// FEATURES.md §18 item 10: white-label tenant config — registering/
+	// listing tenants is a platform/operator-admin action, not scoped to
+	// any one account, so admin-only.
+	httpRequestMultiplexer.HandleFunc("/tenants", authmiddleware.RequireRole(signingSecret, authmiddleware.RoleAdmin, buildTenantsHandler(tenantRegistry)))
 
-	// FEATURES.md §18 item 9: webhooks
-	httpRequestMultiplexer.HandleFunc("/webhooks/subscribe", buildWebhookSubscribeHandler(webhookManager))
-	httpRequestMultiplexer.HandleFunc("/webhooks/deliveries", buildWebhookDeliveriesHandler(webhookManager))
+	// FEATURES.md §18 item 9: webhooks. /subscribe carries an
+	// accountIdentifier field, so it's account-scoped: account-owner
+	// only. /deliveries, by contrast, has no account filter at all —
+	// manager.DeliveryHistory() returns EVERY account's delivery history
+	// with no way to scope it to the caller — so until that filtering
+	// exists, treating it as account-scoped would leak other accounts'
+	// webhook history; admin-only instead.
+	httpRequestMultiplexer.HandleFunc("/webhooks/subscribe", authmiddleware.RequireAuth(signingSecret, buildWebhookSubscribeHandler(webhookManager)))
+	httpRequestMultiplexer.HandleFunc("/webhooks/deliveries", authmiddleware.RequireRole(signingSecret, authmiddleware.RoleAdmin, buildWebhookDeliveriesHandler(webhookManager)))
 
-	// FEATURES.md §18 item 12: TCA reporting
-	httpRequestMultiplexer.HandleFunc("/tca/report", buildTcaReportHandler())
+	// FEATURES.md §18 item 12: TCA reporting — scoped to a single
+	// account via the accountId query parameter, so account-owner only.
+	httpRequestMultiplexer.HandleFunc("/tca/report", authmiddleware.RequireAuth(signingSecret, buildTcaReportHandler()))
 
-	// FEATURES.md §18 item 13: illustrative Account Aggregator merge
-	httpRequestMultiplexer.HandleFunc("/account-aggregator/net-worth", buildAccountAggregatorHandler(omsGatewayBaseUrl, mutualFundsBaseUrl))
+	// FEATURES.md §18 item 13: illustrative Account Aggregator merge —
+	// scoped to a single account via the accountId query parameter, so
+	// account-owner only.
+	httpRequestMultiplexer.HandleFunc("/account-aggregator/net-worth", authmiddleware.RequireAuth(signingSecret, buildAccountAggregatorHandler(omsGatewayBaseUrl, mutualFundsBaseUrl)))
 
 	// Everything else (any path not matched above) is proxied through
 	// to the real backend services, gated by rate limiting + API-key
@@ -108,11 +193,12 @@ func main() {
 	httpRequestMultiplexer.Handle("/", backendProxy)
 
 	rateLimitedHandler := buildRateLimitingMiddleware(globalRateLimiter, apiKeyManager, httpRequestMultiplexer)
+	corsWrappedHandler := withAllowListedCorsForDevelopment(rateLimitedHandler)
 
 	listenAddress := envOrDefault("API_GATEWAY_LISTEN_ADDRESS", ":8089")
 	log.Printf("api-gateway listening on %s (proxying ledger=%s oms-gateway=%s mutual-funds=%s market-data=%s quant-engine=%s)",
 		listenAddress, ledgerBaseUrl, omsGatewayBaseUrl, mutualFundsBaseUrl, marketDataBaseUrl, quantEngineBaseUrl)
-	if serverStartupError := http.ListenAndServe(listenAddress, rateLimitedHandler); serverStartupError != nil {
+	if serverStartupError := http.ListenAndServe(listenAddress, corsWrappedHandler); serverStartupError != nil {
 		log.Fatalf("api-gateway failed to start: %v", serverStartupError)
 	}
 	close(stopChannel)
@@ -186,6 +272,10 @@ func buildApiKeysHandler(manager *apikeymanager.ApiKeyManager) http.HandlerFunc 
 				http.Error(responseWriter, `{"error":"invalid JSON body"}`, http.StatusBadRequest)
 				return
 			}
+			if authenticatedAccountIdentifier, _ := authmiddleware.AuthenticatedAccountIdentifier(request); authenticatedAccountIdentifier != wireRequest.AccountIdentifier {
+				respondForbiddenOwnAccountOnly(responseWriter)
+				return
+			}
 			issued, issueErr := manager.IssueApiKey(apikeymanager.ApiKeyIssuanceRequest{
 				AccountIdentifier: wireRequest.AccountIdentifier,
 				TenantIdentifier:  wireRequest.TenantIdentifier,
@@ -199,6 +289,10 @@ func buildApiKeysHandler(manager *apikeymanager.ApiKeyManager) http.HandlerFunc 
 			writeJson(responseWriter, http.StatusCreated, issued)
 		case http.MethodGet:
 			accountIdentifier := request.URL.Query().Get("accountIdentifier")
+			if authenticatedAccountIdentifier, _ := authmiddleware.AuthenticatedAccountIdentifier(request); authenticatedAccountIdentifier != accountIdentifier {
+				respondForbiddenOwnAccountOnly(responseWriter)
+				return
+			}
 			writeJson(responseWriter, http.StatusOK, manager.ListApiKeysForAccount(accountIdentifier))
 		default:
 			http.Error(responseWriter, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
@@ -217,6 +311,22 @@ func buildRevokeApiKeyHandler(manager *apikeymanager.ApiKeyManager) http.Handler
 		}
 		if decodeErr := json.NewDecoder(request.Body).Decode(&wireRequest); decodeErr != nil {
 			http.Error(responseWriter, `{"error":"invalid JSON body"}`, http.StatusBadRequest)
+			return
+		}
+		// The wire request only carries apiKeyValue, not an account id —
+		// but the key record itself knows who owns it, so look that up
+		// FIRST and verify ownership before revoking anything.
+		// ValidateApiKey still returns the record (with ErrApiKeyRevoked)
+		// for an already-revoked key, which is fine for an ownership
+		// check; only ErrApiKeyNotFound means there's no record to check
+		// ownership against at all.
+		existingRecord, lookupErr := manager.ValidateApiKey(wireRequest.ApiKeyValue)
+		if lookupErr != nil && !errors.Is(lookupErr, apikeymanager.ErrApiKeyRevoked) {
+			http.Error(responseWriter, `{"error":"`+lookupErr.Error()+`"}`, http.StatusNotFound)
+			return
+		}
+		if authenticatedAccountIdentifier, _ := authmiddleware.AuthenticatedAccountIdentifier(request); authenticatedAccountIdentifier != existingRecord.AccountIdentifier {
+			respondForbiddenOwnAccountOnly(responseWriter)
 			return
 		}
 		if revokeErr := manager.RevokeApiKey(wireRequest.ApiKeyValue); revokeErr != nil {
@@ -272,6 +382,10 @@ func buildWebhookSubscribeHandler(manager *webhookdelivery.WebhookDeliveryManage
 			http.Error(responseWriter, `{"error":"invalid JSON body"}`, http.StatusBadRequest)
 			return
 		}
+		if authenticatedAccountIdentifier, _ := authmiddleware.AuthenticatedAccountIdentifier(request); authenticatedAccountIdentifier != wireRequest.AccountIdentifier {
+			respondForbiddenOwnAccountOnly(responseWriter)
+			return
+		}
 		subscription, subscribeErr := manager.RegisterSubscription(
 			wireRequest.AccountIdentifier,
 			webhookdelivery.EventType(wireRequest.EventType),
@@ -296,6 +410,10 @@ func buildTcaReportHandler() http.HandlerFunc {
 		accountIdentifier := request.URL.Query().Get("accountId")
 		if accountIdentifier == "" {
 			http.Error(responseWriter, `{"error":"accountId query parameter is required"}`, http.StatusBadRequest)
+			return
+		}
+		if authenticatedAccountIdentifier, _ := authmiddleware.AuthenticatedAccountIdentifier(request); authenticatedAccountIdentifier != accountIdentifier {
+			respondForbiddenOwnAccountOnly(responseWriter)
 			return
 		}
 		// See internal/tca/fillDataSource.go for exactly why this uses
@@ -327,6 +445,10 @@ func buildAccountAggregatorHandler(omsGatewayBaseUrl, mutualFundsBaseUrl string)
 		accountIdentifier := request.URL.Query().Get("accountId")
 		if accountIdentifier == "" {
 			http.Error(responseWriter, `{"error":"accountId query parameter is required"}`, http.StatusBadRequest)
+			return
+		}
+		if authenticatedAccountIdentifier, _ := authmiddleware.AuthenticatedAccountIdentifier(request); authenticatedAccountIdentifier != accountIdentifier {
+			respondForbiddenOwnAccountOnly(responseWriter)
 			return
 		}
 

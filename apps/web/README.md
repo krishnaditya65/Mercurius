@@ -226,10 +226,24 @@ cd ../../services/matching-engine && cargo run              # :9101 (+ market-da
 cd ../../services/market-data && cargo run                  # :9102/:9103/:9104 — needed for the price chart, price alerts, options chain's spot-price prefill, volume profile, and order-flow footprint
 cd ../../services/quant-engine && python3 -m venv .venv && .venv/bin/pip install -e . && .venv/bin/quant-engine-server   # :8085 — needed for the options chain
 cd ../../services/oms-gateway && go run ./cmd/server        # :8081 — needed for almost everything, including the new /options/chain and /strategies/* endpoints
+cd ../../services/api-gateway && go run ./cmd/server         # :8089 — needed for the Developer API keys page only
 ```
 
 Override base URLs via `NEXT_PUBLIC_OMS_GATEWAY_BASE_URL` (default
 `http://localhost:8081`), `NEXT_PUBLIC_MARKET_DATA_BASE_URL` (default
-`http://localhost:9103`), and `NEXT_PUBLIC_MATCHING_ENGINE_DOM_REPLAY_BASE_URL`
+`http://localhost:9103`), `NEXT_PUBLIC_MATCHING_ENGINE_DOM_REPLAY_BASE_URL`
 (default `http://localhost:9106`, used only by the Historical DOM replay
-page) if any service isn't at its default port.
+page), `NEXT_PUBLIC_QUANT_ENGINE_BASE_URL` (default `http://localhost:8085`,
+used by the Portfolio Greeks and IV Rank pages among others), and
+`NEXT_PUBLIC_API_GATEWAY_BASE_URL` (default `http://localhost:8089`, used
+only by the Developer API keys page) if any service isn't at its default
+port.
+
+**Known gap in the Developer API keys page:** api-gateway's
+`cmd/server/main.go` has no CORS middleware at all (unlike oms-gateway's
+`withPermissiveCorsForDevelopment` or quant-engine's permissive CORS
+header) — a real browser running this page against a real api-gateway on
+a different origin will have every fetch blocked by the browser's CORS
+policy. Verified via curl (server-to-server calls are unaffected) but NOT
+verified from an actual browser client — see `docs/BUILD_LOG.md` for the
+exact verification performed.

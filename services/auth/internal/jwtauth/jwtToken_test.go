@@ -9,7 +9,7 @@ import (
 var testSigningSecret = []byte("test-signing-secret-do-not-use-in-production")
 
 func TestIssuedTokenHasThreeDotSeparatedSegments(t *testing.T) {
-	token, issueError := IssueAccessToken("acct-001", testSigningSecret, time.Hour, time.Unix(1_700_000_000, 0))
+	token, issueError := IssueAccessToken("acct-001", RoleRetail, testSigningSecret, time.Hour, time.Unix(1_700_000_000, 0))
 	if issueError != nil {
 		t.Fatalf("unexpected error issuing token: %v", issueError)
 	}
@@ -20,7 +20,7 @@ func TestIssuedTokenHasThreeDotSeparatedSegments(t *testing.T) {
 
 func TestValidTokenParsesBackToTheOriginalSubject(t *testing.T) {
 	issuedAt := time.Unix(1_700_000_000, 0)
-	token, _ := IssueAccessToken("acct-001", testSigningSecret, time.Hour, issuedAt)
+	token, _ := IssueAccessToken("acct-001", RoleRetail, testSigningSecret, time.Hour, issuedAt)
 
 	claims, parseError := ParseAndVerifyAccessToken(token, testSigningSecret, issuedAt.Add(time.Minute))
 	if parseError != nil {
@@ -31,9 +31,22 @@ func TestValidTokenParsesBackToTheOriginalSubject(t *testing.T) {
 	}
 }
 
+func TestValidTokenParsesBackToTheOriginalRole(t *testing.T) {
+	issuedAt := time.Unix(1_700_000_000, 0)
+	token, _ := IssueAccessToken("acct-001", RoleAdmin, testSigningSecret, time.Hour, issuedAt)
+
+	claims, parseError := ParseAndVerifyAccessToken(token, testSigningSecret, issuedAt.Add(time.Minute))
+	if parseError != nil {
+		t.Fatalf("unexpected error parsing a valid token: %v", parseError)
+	}
+	if claims.Role != RoleAdmin {
+		t.Fatalf("expected role %q, got %q", RoleAdmin, claims.Role)
+	}
+}
+
 func TestExpiredTokenIsRejected(t *testing.T) {
 	issuedAt := time.Unix(1_700_000_000, 0)
-	token, _ := IssueAccessToken("acct-001", testSigningSecret, time.Minute, issuedAt)
+	token, _ := IssueAccessToken("acct-001", RoleRetail, testSigningSecret, time.Minute, issuedAt)
 
 	_, parseError := ParseAndVerifyAccessToken(token, testSigningSecret, issuedAt.Add(2*time.Minute))
 	if parseError != ErrTokenExpired {
@@ -43,7 +56,7 @@ func TestExpiredTokenIsRejected(t *testing.T) {
 
 func TestTokenAtExactExpiryInstantIsRejected(t *testing.T) {
 	issuedAt := time.Unix(1_700_000_000, 0)
-	token, _ := IssueAccessToken("acct-001", testSigningSecret, time.Minute, issuedAt)
+	token, _ := IssueAccessToken("acct-001", RoleRetail, testSigningSecret, time.Minute, issuedAt)
 
 	_, parseError := ParseAndVerifyAccessToken(token, testSigningSecret, issuedAt.Add(time.Minute))
 	if parseError != ErrTokenExpired {
@@ -53,7 +66,7 @@ func TestTokenAtExactExpiryInstantIsRejected(t *testing.T) {
 
 func TestTokenSignedWithADifferentSecretIsRejected(t *testing.T) {
 	issuedAt := time.Unix(1_700_000_000, 0)
-	token, _ := IssueAccessToken("acct-001", testSigningSecret, time.Hour, issuedAt)
+	token, _ := IssueAccessToken("acct-001", RoleRetail, testSigningSecret, time.Hour, issuedAt)
 
 	_, parseError := ParseAndVerifyAccessToken(token, []byte("a-completely-different-secret"), issuedAt)
 	if parseError != ErrTokenSignatureInvalid {
@@ -63,13 +76,13 @@ func TestTokenSignedWithADifferentSecretIsRejected(t *testing.T) {
 
 func TestTamperedClaimsSegmentIsRejected(t *testing.T) {
 	issuedAt := time.Unix(1_700_000_000, 0)
-	token, _ := IssueAccessToken("acct-001", testSigningSecret, time.Hour, issuedAt)
+	token, _ := IssueAccessToken("acct-001", RoleRetail, testSigningSecret, time.Hour, issuedAt)
 
 	segments := strings.Split(token, ".")
 	// Swap in a claims segment that decodes to valid JSON for a DIFFERENT
 	// account, without recomputing the signature — simulates an attacker
 	// trying to escalate to another account's identity.
-	forgedClaimsToken, _ := IssueAccessToken("acct-002-attacker", testSigningSecret, time.Hour, issuedAt)
+	forgedClaimsToken, _ := IssueAccessToken("acct-002-attacker", RoleRetail, testSigningSecret, time.Hour, issuedAt)
 	forgedSegments := strings.Split(forgedClaimsToken, ".")
 	tamperedToken := segments[0] + "." + forgedSegments[1] + "." + segments[2]
 

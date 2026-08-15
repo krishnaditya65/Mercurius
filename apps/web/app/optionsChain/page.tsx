@@ -34,6 +34,7 @@
 
 import { useState } from "react";
 import Link from "next/link";
+import { loadSession } from "../session/authSession";
 
 const omsGatewayBaseUrl = process.env.NEXT_PUBLIC_OMS_GATEWAY_BASE_URL ?? "http://localhost:8081";
 const marketDataBaseUrl = process.env.NEXT_PUBLIC_MARKET_DATA_BASE_URL ?? "http://localhost:9103";
@@ -110,12 +111,18 @@ export default function OptionsChainPage() {
   }
 
   async function fetchOptionsChain() {
-    setIsLoading(true);
     setErrorMessage(null);
     setOptionsChain(null);
+    const storedSession = loadSession();
+    if (!storedSession?.accessToken) {
+      setErrorMessage("Log in first (see the Account panel above).");
+      return;
+    }
+    setIsLoading(true);
     try {
       const httpResponse = await fetch(
-        `${omsGatewayBaseUrl}/options/chain?underlyingSpotPrice=${encodeURIComponent(underlyingSpotPriceInput)}&expiryDate=${encodeURIComponent(expiryDateInput)}&symbol=${encodeURIComponent(underlyingSymbol)}`
+        `${omsGatewayBaseUrl}/options/chain?underlyingSpotPrice=${encodeURIComponent(underlyingSpotPriceInput)}&expiryDate=${encodeURIComponent(expiryDateInput)}&symbol=${encodeURIComponent(underlyingSymbol)}`,
+        { headers: { Authorization: `Bearer ${storedSession.accessToken}` } }
       );
       if (!httpResponse.ok) {
         const bodyText = await httpResponse.text();

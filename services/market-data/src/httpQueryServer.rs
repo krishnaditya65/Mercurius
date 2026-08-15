@@ -85,6 +85,22 @@ impl SharedMarketDataState {
             omsGatewayHttpAddress: omsGatewayHttpAddress.to_string(),
         }
     }
+
+    /// Same as `newEmptyStateWithOmsGatewayAddress`, but takes
+    /// already-constructed `watchlists`/`priceAlerts` stores — used by
+    /// main.rs to plug in real Postgres-backed stores
+    /// (docs/BUILD_LOG.md's Postgres-persistence entry) while leaving
+    /// `candleAggregator`/`columnarTickStore` in-memory, per that
+    /// entry's documented hot-path-performance tradeoff.
+    pub fn newStateWithStores(omsGatewayHttpAddress: &str, watchlists: WatchlistStore, priceAlerts: PriceAlertStore) -> Self {
+        SharedMarketDataState {
+            candleAggregator: Mutex::new(CandleAggregator::newEmptyAggregator()),
+            columnarTickStore: ColumnarTickStore::newEmptyStore(),
+            watchlists,
+            priceAlerts,
+            omsGatewayHttpAddress: omsGatewayHttpAddress.to_string(),
+        }
+    }
 }
 
 /// Current wall-clock time as epoch MILLISECONDS (not seconds — see

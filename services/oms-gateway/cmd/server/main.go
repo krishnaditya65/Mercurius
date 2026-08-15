@@ -10,20 +10,26 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"mercurius/omsgateway/internal/algolimits"
 	"mercurius/omsgateway/internal/amoqueue"
 	"mercurius/omsgateway/internal/audittrail"
+	"mercurius/omsgateway/internal/authmiddleware"
 	"mercurius/omsgateway/internal/autoliquidation"
 	"mercurius/omsgateway/internal/backofficeclient"
 	"mercurius/omsgateway/internal/basketorders"
@@ -69,6 +75,63 @@ import (
 	"mercurius/omsgateway/internal/tradesurveillance"
 )
 
+// ensureTargetDatabaseExists handles Postgres's real "no CREATE DATABASE
+// IF NOT EXISTS" gap: the compose Postgres (infra/docker/docker-
+// compose.yml) only provisions a `ledger` database via POSTGRES_DB —
+// oms-gateway's own `omsgateway` database does not exist on a fresh
+// stack. This connects to the SAME server's default `postgres`
+// administrative database (never the target database itself — you
+// cannot CREATE DATABASE from within the database being created),
+// checks pg_database for the target name, and issues a real
+// CREATE DATABASE if it's missing. Idempotent by construction (checks
+// first) — safe to call on every startup, not just the first one.
+func ensureTargetDatabaseExists(ctx context.Context, targetDsn string) error {
+	parsedDsn, parseError := url.Parse(targetDsn)
+	if parseError != nil {
+		return fmt.Errorf("ensureTargetDatabaseExists: parse DSN: %w", parseError)
+	}
+	targetDatabaseName := strings.TrimPrefix(parsedDsn.Path, "/")
+	if targetDatabaseName == "" {
+		return fmt.Errorf("ensureTargetDatabaseExists: DSN %q has no database name", targetDsn)
+	}
+
+	adminDsn := *parsedDsn
+	adminDsn.Path = "/postgres"
+	adminPool, connectError := pgxpool.New(ctx, adminDsn.String())
+	if connectError != nil {
+		return fmt.Errorf("ensureTargetDatabaseExists: connect to admin database: %w", connectError)
+	}
+	defer adminPool.Close()
+
+	var exists bool
+	queryError := adminPool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM pg_database WHERE datname = $1)`, targetDatabaseName).Scan(&exists)
+	if queryError != nil {
+		return fmt.Errorf("ensureTargetDatabaseExists: check pg_database: %w", queryError)
+	}
+	if exists {
+		return nil
+	}
+
+	// CREATE DATABASE cannot use a query parameter placeholder for the
+	// database name (it's DDL, not DML) — targetDatabaseName came out of
+	// our OWN DSN's path (an operator-controlled env var, not untrusted
+	// end-user input), so this is the same trust boundary every other
+	// env-var-driven config value in this codebase already has.
+	if _, execError := adminPool.Exec(ctx, fmt.Sprintf(`CREATE DATABASE %s`, pgxQuoteIdentifier(targetDatabaseName))); execError != nil {
+		return fmt.Errorf("ensureTargetDatabaseExists: create database %q: %w", targetDatabaseName, execError)
+	}
+	log.Printf("oms-gateway: created Postgres database %q (did not previously exist)", targetDatabaseName)
+	return nil
+}
+
+// pgxQuoteIdentifier double-quotes a Postgres identifier, doubling any
+// embedded double-quote — the standard SQL identifier-quoting rule,
+// applied here because CREATE DATABASE cannot take the name as a bound
+// parameter.
+func pgxQuoteIdentifier(identifier string) string {
+	return `"` + strings.ReplaceAll(identifier, `"`, `""`) + `"`
+}
+
 // demoTrackedAccountIdentifiers is the set of accounts this skeleton
 // knows to sync from the ledger at startup. TODO(real build): this
 // entire list disappears once accounts are created dynamically through a
@@ -102,7 +165,40 @@ func main() {
 	}
 	quantEngineClient := quantengineclient.NewQuantEngineClient(quantEngineBaseUrl)
 
+	// Real Postgres persistence (docs/BUILD_LOG.md's Postgres-persistence
+	// entry): audittrail/positions/idempotency all share ONE database —
+	// OMS_POSTGRES_DSN, defaulting to
+	// postgres://trading:trading@localhost:5432/omsgateway, same
+	// hardcoded-dev-default pattern as ledger's POSTGRES_DSN. Unlike
+	// ledger's `ledger` database (provisioned directly by
+	// infra/docker/docker-compose.yml's POSTGRES_DB), `omsgateway` does
+	// NOT exist on a fresh compose stack — ensureTargetDatabaseExists
+	// (above) creates it on first startup, handling Postgres's real lack
+	// of `CREATE DATABASE IF NOT EXISTS`. Same fail-OPEN-to-in-memory
+	// choice as ledger if Postgres is unreachable at startup — logged
+	// loudly, not crashed — see docs/BUILD_LOG.md's known-limitations
+	// list for why a real production deployment likely wants the
+	// opposite.
+	omsPostgresDsn := os.Getenv("OMS_POSTGRES_DSN")
+	if omsPostgresDsn == "" {
+		omsPostgresDsn = "postgres://trading:trading@localhost:5432/omsgateway"
+	}
+	omsPostgresBackedStartupContext := context.Background()
+	omsPostgresAvailable := true
+	if ensureDbError := ensureTargetDatabaseExists(omsPostgresBackedStartupContext, omsPostgresDsn); ensureDbError != nil {
+		log.Printf("WARNING: could not ensure OMS Postgres database exists (%v) — audittrail/positions/idempotency will fall back to IN-MEMORY storage, data will NOT survive a restart", ensureDbError)
+		omsPostgresAvailable = false
+	}
+
 	positionBook := positions.NewPositionBook()
+	if omsPostgresAvailable {
+		if postgresPositionBook, postgresError := positions.NewPostgresBackedPositionBook(omsPostgresBackedStartupContext, omsPostgresDsn); postgresError != nil {
+			log.Printf("WARNING: could not connect positions to Postgres (%v) — falling back to IN-MEMORY position book", postgresError)
+		} else {
+			positionBook = postgresPositionBook
+			log.Printf("positions connected to Postgres at %s — positions are now durable across restarts", omsPostgresDsn)
+		}
+	}
 	// paperPositionBook is FEATURES.md §7's paper trading mode: a
 	// COMPLETELY SEPARATE positions.PositionBook instance (same type,
 	// distinct state) so simulated paper fills can never contaminate real
@@ -184,6 +280,14 @@ func main() {
 		log.Fatalf("failed to construct large-order friction tracker: %v", largeOrderFrictionTrackerError)
 	}
 	idempotencyStore := idempotency.NewIdempotencyStore()
+	if omsPostgresAvailable {
+		if postgresIdempotencyStore, postgresError := idempotency.NewPostgresBackedIdempotencyStore(omsPostgresBackedStartupContext, omsPostgresDsn); postgresError != nil {
+			log.Printf("WARNING: could not connect idempotency store to Postgres (%v) — falling back to IN-MEMORY idempotency store", postgresError)
+		} else {
+			idempotencyStore = postgresIdempotencyStore
+			log.Printf("idempotency store connected to Postgres at %s — completed responses are now durable across restarts (TTL-bounded)", omsPostgresDsn)
+		}
+	}
 	marketSession := marketsession.NewMarketSessionState()
 	// squareOffCutoffConfig / squareOffReminderTracker: FEATURES.md §21
 	// intraday auto square-off countdown timer + reminders — see
@@ -195,6 +299,14 @@ func main() {
 	}
 	afterMarketOrderQueue := amoqueue.NewAfterMarketOrderQueue()
 	auditTrail := audittrail.NewAuditTrail()
+	if omsPostgresAvailable {
+		if postgresAuditTrail, postgresError := audittrail.NewPostgresBackedAuditTrail(omsPostgresBackedStartupContext, omsPostgresDsn); postgresError != nil {
+			log.Printf("WARNING: could not connect audit trail to Postgres (%v) — falling back to IN-MEMORY audit trail, this is disqualifying for anything actually regulated", postgresError)
+		} else {
+			auditTrail = postgresAuditTrail
+			log.Printf("audit trail connected to Postgres at %s — audit entries are now durable across restarts", omsPostgresDsn)
+		}
+	}
 	// corporateActionExplainerLog: FEATURES.md §21 corporate-action
 	// explainer — see internal/corporateactionexplainer's package doc
 	// for the honest "this is the explainer surface only, not real
@@ -255,7 +367,7 @@ func main() {
 			OrderSideIsBuyNotSell:      false,
 			OrderIsMarketOrderNotLimit: true,
 			OrderQuantity:              uint64(quantityToSell),
-		})
+		}, "" /* no authenticated human actor — auto-liquidation-engine-triggered */)
 		if !acknowledgement.WasOrderAccepted {
 			return false, errors.New(acknowledgement.HumanReadableRejectionReason)
 		}
@@ -267,85 +379,106 @@ func main() {
 	}
 
 	httpRequestMultiplexer := http.NewServeMux()
+
+	// signingSecret is used to verify every bearer access token this
+	// service gates a route with below — see internal/authmiddleware's
+	// package doc for why this is a byte-identical copy of the auth
+	// service's own verification logic rather than a shared import.
+	signingSecret := authmiddleware.SigningSecretFromEnv()
+
+	// Route classification (see each buildXHandler's doc comment for the
+	// full per-route reasoning):
+	//   - public: no auth at all — /health, /metrics, /orders/estimate-charges
+	//     (an explicitly documented pre-order quote), and a small set of
+	//     genuinely public reference/global-state reads.
+	//   - authmiddleware.RequireAuth: any authenticated user (any role) —
+	//     the vast majority of routes. Where the request body/query carries
+	//     a clientAccountIdentifier/accountId, the handler ALSO checks it
+	//     against the authenticated caller's own account id (see the
+	//     "account-id match" check at the top of the relevant buildXHandler
+	//     closures) and responds 403 on a mismatch.
+	//   - authmiddleware.RequireRole(..., RoleAdmin): operationally
+	//     privileged routes that mutate GLOBAL state or are an
+	//     operator/compliance-only surface, not one account's own trading.
 	httpRequestMultiplexer.HandleFunc("/health", healthCheckHandler)
-	httpRequestMultiplexer.HandleFunc("/orders/submit", buildSubmitOrderHandler(orderSubmissionDeps, idempotencyStore, marketSession, afterMarketOrderQueue, overtradingDetector))
-	httpRequestMultiplexer.HandleFunc("/overtrading-detection/status", buildOvertradingStatusHandler(overtradingDetector))
-	httpRequestMultiplexer.HandleFunc("/risk-disclosure/acknowledge", buildAcknowledgeRiskDisclosureHandler(riskDisclosureGate))
-	httpRequestMultiplexer.HandleFunc("/risk-disclosure/status", buildRiskDisclosureStatusHandler(riskDisclosureGate))
+	httpRequestMultiplexer.HandleFunc("/orders/submit", authmiddleware.RequireAuth(signingSecret, buildSubmitOrderHandler(orderSubmissionDeps, idempotencyStore, marketSession, afterMarketOrderQueue, overtradingDetector)))
+	httpRequestMultiplexer.HandleFunc("/overtrading-detection/status", authmiddleware.RequireAuth(signingSecret, buildOvertradingStatusHandler(overtradingDetector)))
+	httpRequestMultiplexer.HandleFunc("/risk-disclosure/acknowledge", authmiddleware.RequireAuth(signingSecret, buildAcknowledgeRiskDisclosureHandler(riskDisclosureGate)))
+	httpRequestMultiplexer.HandleFunc("/risk-disclosure/status", authmiddleware.RequireAuth(signingSecret, buildRiskDisclosureStatusHandler(riskDisclosureGate)))
 	httpRequestMultiplexer.HandleFunc("/market-session/square-off/countdown", buildSquareOffCountdownHandler(squareOffCutoffConfig))
-	httpRequestMultiplexer.HandleFunc("/market-session/square-off/reminders", buildSquareOffRemindersHandler(squareOffCutoffConfig, squareOffReminderTracker))
-	httpRequestMultiplexer.HandleFunc("/positions", buildPositionsHandler(positionBook))
-	httpRequestMultiplexer.HandleFunc("/paper-positions", buildPositionsHandler(paperPositionBook))
-	httpRequestMultiplexer.HandleFunc("/paper-positions/fractional", buildFractionalPaperPositionsHandler(milliSharePaperPositionBook))
-	httpRequestMultiplexer.HandleFunc("/orders/cancel", buildCancelOrderHandler(matchingEngineClient, auditTrail))
-	httpRequestMultiplexer.HandleFunc("/orders/cover-submit", buildCoverOrderHandler(orderSubmissionDeps))
-	httpRequestMultiplexer.HandleFunc("/orders/status", buildOrderStatusHandler(matchingEngineClient))
+	httpRequestMultiplexer.HandleFunc("/market-session/square-off/reminders", authmiddleware.RequireAuth(signingSecret, buildSquareOffRemindersHandler(squareOffCutoffConfig, squareOffReminderTracker)))
+	httpRequestMultiplexer.HandleFunc("/positions", authmiddleware.RequireAuth(signingSecret, buildPositionsHandler(positionBook)))
+	httpRequestMultiplexer.HandleFunc("/paper-positions", authmiddleware.RequireAuth(signingSecret, buildPositionsHandler(paperPositionBook)))
+	httpRequestMultiplexer.HandleFunc("/paper-positions/fractional", authmiddleware.RequireAuth(signingSecret, buildFractionalPaperPositionsHandler(milliSharePaperPositionBook)))
+	httpRequestMultiplexer.HandleFunc("/orders/cancel", authmiddleware.RequireAuth(signingSecret, buildCancelOrderHandler(matchingEngineClient, auditTrail)))
+	httpRequestMultiplexer.HandleFunc("/orders/cover-submit", authmiddleware.RequireAuth(signingSecret, buildCoverOrderHandler(orderSubmissionDeps)))
+	httpRequestMultiplexer.HandleFunc("/orders/status", authmiddleware.RequireAuth(signingSecret, buildOrderStatusHandler(matchingEngineClient)))
 	httpRequestMultiplexer.HandleFunc("/market-session/status", buildMarketSessionStatusHandler(marketSession, afterMarketOrderQueue))
-	httpRequestMultiplexer.HandleFunc("/market-session/open", buildMarketSessionOpenHandler(marketSession, afterMarketOrderQueue, orderSubmissionDeps))
-	httpRequestMultiplexer.HandleFunc("/market-session/close", buildMarketSessionCloseHandler(marketSession, auditTrail))
-	httpRequestMultiplexer.HandleFunc("/market-session/set-phase", buildSetSessionPhaseHandler(marketSession))
-	httpRequestMultiplexer.HandleFunc("/audit-trail", buildAuditTrailHandler(auditTrail))
-	httpRequestMultiplexer.HandleFunc("/compliance/surveillance", buildTradeSurveillanceHandler(auditTrail))
-	httpRequestMultiplexer.HandleFunc("/conversational-order/parse", buildConversationalOrderParseHandler())
-	httpRequestMultiplexer.HandleFunc("/conversational-order/confirm-and-submit", buildConversationalOrderConfirmAndSubmitHandler(orderSubmissionDeps))
-	httpRequestMultiplexer.HandleFunc("/orders/reconcile", buildOrderReconcileHandler(idempotencyStore))
-	httpRequestMultiplexer.HandleFunc("/positions/corporate-action-adjustments/apply", buildApplyCorporateActionAdjustmentHandler(positionBook, corporateActionExplainerLog))
-	httpRequestMultiplexer.HandleFunc("/positions/corporate-action-adjustments", buildCorporateActionAdjustmentsHandler(corporateActionExplainerLog))
-	httpRequestMultiplexer.HandleFunc("/corporate-actions/holdings/seed", buildSeedCorporateActionsHoldingHandler(corporateActionsHoldingsBook, positionBook))
-	httpRequestMultiplexer.HandleFunc("/corporate-actions/holdings", buildGetCorporateActionsHoldingHandler(corporateActionsHoldingsBook))
-	httpRequestMultiplexer.HandleFunc("/corporate-actions/process", buildProcessCorporateActionHandler(corporateActionsHoldingsBook, positionBook, ledgerClient))
-	httpRequestMultiplexer.HandleFunc("/corporate-actions/processed-actions", buildProcessedCorporateActionsHandler(corporateActionsHoldingsBook))
+	httpRequestMultiplexer.HandleFunc("/market-session/open", authmiddleware.RequireRole(signingSecret, authmiddleware.RoleAdmin, buildMarketSessionOpenHandler(marketSession, afterMarketOrderQueue, orderSubmissionDeps)))
+	httpRequestMultiplexer.HandleFunc("/market-session/close", authmiddleware.RequireRole(signingSecret, authmiddleware.RoleAdmin, buildMarketSessionCloseHandler(marketSession, auditTrail)))
+	httpRequestMultiplexer.HandleFunc("/market-session/set-phase", authmiddleware.RequireRole(signingSecret, authmiddleware.RoleAdmin, buildSetSessionPhaseHandler(marketSession)))
+	httpRequestMultiplexer.HandleFunc("/audit-trail", authmiddleware.RequireRole(signingSecret, authmiddleware.RoleAdmin, buildAuditTrailHandler(auditTrail)))
+	httpRequestMultiplexer.HandleFunc("/compliance/surveillance", authmiddleware.RequireRole(signingSecret, authmiddleware.RoleAdmin, buildTradeSurveillanceHandler(auditTrail)))
+	httpRequestMultiplexer.HandleFunc("/conversational-order/parse", authmiddleware.RequireAuth(signingSecret, buildConversationalOrderParseHandler()))
+	httpRequestMultiplexer.HandleFunc("/conversational-order/confirm-and-submit", authmiddleware.RequireAuth(signingSecret, buildConversationalOrderConfirmAndSubmitHandler(orderSubmissionDeps)))
+	httpRequestMultiplexer.HandleFunc("/orders/reconcile", authmiddleware.RequireAuth(signingSecret, buildOrderReconcileHandler(idempotencyStore)))
+	httpRequestMultiplexer.HandleFunc("/positions/corporate-action-adjustments/apply", authmiddleware.RequireRole(signingSecret, authmiddleware.RoleAdmin, buildApplyCorporateActionAdjustmentHandler(positionBook, corporateActionExplainerLog)))
+	httpRequestMultiplexer.HandleFunc("/positions/corporate-action-adjustments", authmiddleware.RequireRole(signingSecret, authmiddleware.RoleAdmin, buildCorporateActionAdjustmentsHandler(corporateActionExplainerLog)))
+	httpRequestMultiplexer.HandleFunc("/corporate-actions/holdings/seed", authmiddleware.RequireRole(signingSecret, authmiddleware.RoleAdmin, buildSeedCorporateActionsHoldingHandler(corporateActionsHoldingsBook, positionBook)))
+	httpRequestMultiplexer.HandleFunc("/corporate-actions/holdings", authmiddleware.RequireAuth(signingSecret, buildGetCorporateActionsHoldingHandler(corporateActionsHoldingsBook)))
+	httpRequestMultiplexer.HandleFunc("/corporate-actions/process", authmiddleware.RequireRole(signingSecret, authmiddleware.RoleAdmin, buildProcessCorporateActionHandler(corporateActionsHoldingsBook, positionBook, ledgerClient)))
+	httpRequestMultiplexer.HandleFunc("/corporate-actions/processed-actions", authmiddleware.RequireAuth(signingSecret, buildProcessedCorporateActionsHandler(corporateActionsHoldingsBook)))
 	httpRequestMultiplexer.HandleFunc("/orders/estimate-charges", buildEstimateChargesHandler())
 	httpRequestMultiplexer.HandleFunc("/metrics", metrics.BuildMetricsHandler(metricsRegistry))
-	httpRequestMultiplexer.HandleFunc("/margin-pledge/pledge", buildPledgeHoldingHandler(pledgeBook, positionBook, preTradeRiskEngine))
-	httpRequestMultiplexer.HandleFunc("/margin-pledge/unpledge", buildUnpledgeHoldingHandler(pledgeBook, preTradeRiskEngine))
-	httpRequestMultiplexer.HandleFunc("/margin-pledge/set-utilized-margin", buildSetUtilizedMarginHandler(pledgeBook))
-	httpRequestMultiplexer.HandleFunc("/margin-pledge/holdings", buildPledgesForAccountHandler(pledgeBook))
-	httpRequestMultiplexer.HandleFunc("/margin/calculate-span-exposure", buildCalculateSpanExposureMarginHandler())
-	httpRequestMultiplexer.HandleFunc("/margin/calculate-portfolio-margin", buildCalculatePortfolioMarginHandler())
-	httpRequestMultiplexer.HandleFunc("/margin-funding/request", buildMarginFundingRequestHandler(fundingBook, pledgeBook, ledgerClient, preTradeRiskEngine))
-	httpRequestMultiplexer.HandleFunc("/margin-funding", buildMarginFundingStatusHandler(fundingBook, pledgeBook))
-	httpRequestMultiplexer.HandleFunc("/margin-funding/interest-cost", buildMarginFundingInterestCostHandler(fundingBook))
-	httpRequestMultiplexer.HandleFunc("/loan-against-securities/request", buildLoanAgainstSecuritiesRequestHandler(loanAgainstSecuritiesBook, pledgeBook, ledgerClient, preTradeRiskEngine))
-	httpRequestMultiplexer.HandleFunc("/loan-against-securities/repay", buildLoanAgainstSecuritiesRepayHandler(loanAgainstSecuritiesBook, ledgerClient, preTradeRiskEngine))
-	httpRequestMultiplexer.HandleFunc("/loan-against-securities", buildLoanAgainstSecuritiesStatusHandler(loanAgainstSecuritiesBook, pledgeBook))
-	httpRequestMultiplexer.HandleFunc("/options/chain", buildOptionsChainHandler(quantEngineClient))
-	httpRequestMultiplexer.HandleFunc("/algo-limits/configure", buildConfigureAlgoLimitsHandler(algoLimitsRegistry))
-	httpRequestMultiplexer.HandleFunc("/algo-limits", buildAlgoLimitsStatusHandler(algoLimitsRegistry))
+	httpRequestMultiplexer.HandleFunc("/margin-pledge/pledge", authmiddleware.RequireAuth(signingSecret, buildPledgeHoldingHandler(pledgeBook, positionBook, preTradeRiskEngine)))
+	httpRequestMultiplexer.HandleFunc("/margin-pledge/unpledge", authmiddleware.RequireAuth(signingSecret, buildUnpledgeHoldingHandler(pledgeBook, preTradeRiskEngine)))
+	httpRequestMultiplexer.HandleFunc("/margin-pledge/set-utilized-margin", authmiddleware.RequireAuth(signingSecret, buildSetUtilizedMarginHandler(pledgeBook)))
+	httpRequestMultiplexer.HandleFunc("/margin-pledge/holdings", authmiddleware.RequireAuth(signingSecret, buildPledgesForAccountHandler(pledgeBook)))
+	httpRequestMultiplexer.HandleFunc("/margin/calculate-span-exposure", authmiddleware.RequireAuth(signingSecret, buildCalculateSpanExposureMarginHandler()))
+	httpRequestMultiplexer.HandleFunc("/margin/calculate-portfolio-margin", authmiddleware.RequireAuth(signingSecret, buildCalculatePortfolioMarginHandler()))
+	httpRequestMultiplexer.HandleFunc("/margin-funding/request", authmiddleware.RequireAuth(signingSecret, buildMarginFundingRequestHandler(fundingBook, pledgeBook, ledgerClient, preTradeRiskEngine)))
+	httpRequestMultiplexer.HandleFunc("/margin-funding", authmiddleware.RequireAuth(signingSecret, buildMarginFundingStatusHandler(fundingBook, pledgeBook)))
+	httpRequestMultiplexer.HandleFunc("/margin-funding/interest-cost", authmiddleware.RequireAuth(signingSecret, buildMarginFundingInterestCostHandler(fundingBook)))
+	httpRequestMultiplexer.HandleFunc("/loan-against-securities/request", authmiddleware.RequireAuth(signingSecret, buildLoanAgainstSecuritiesRequestHandler(loanAgainstSecuritiesBook, pledgeBook, ledgerClient, preTradeRiskEngine)))
+	httpRequestMultiplexer.HandleFunc("/loan-against-securities/repay", authmiddleware.RequireAuth(signingSecret, buildLoanAgainstSecuritiesRepayHandler(loanAgainstSecuritiesBook, ledgerClient, preTradeRiskEngine)))
+	httpRequestMultiplexer.HandleFunc("/loan-against-securities", authmiddleware.RequireAuth(signingSecret, buildLoanAgainstSecuritiesStatusHandler(loanAgainstSecuritiesBook, pledgeBook)))
+	httpRequestMultiplexer.HandleFunc("/options/chain", authmiddleware.RequireAuth(signingSecret, buildOptionsChainHandler(quantEngineClient)))
+	httpRequestMultiplexer.HandleFunc("/algo-limits/configure", authmiddleware.RequireRole(signingSecret, authmiddleware.RoleAdmin, buildConfigureAlgoLimitsHandler(algoLimitsRegistry)))
+	httpRequestMultiplexer.HandleFunc("/algo-limits", authmiddleware.RequireAuth(signingSecret, buildAlgoLimitsStatusHandler(algoLimitsRegistry)))
 	httpRequestMultiplexer.HandleFunc("/strategies", buildListVerifiedStrategiesHandler(strategyFollowingRegistry))
-	httpRequestMultiplexer.HandleFunc("/strategies/admin/verify", buildVerifyStrategyHandler(strategyFollowingRegistry))
-	httpRequestMultiplexer.HandleFunc("/strategies/follow", buildFollowStrategyHandler(strategyFollowingRegistry))
-	httpRequestMultiplexer.HandleFunc("/strategies/unfollow", buildUnfollowStrategyHandler(strategyFollowingRegistry))
-	httpRequestMultiplexer.HandleFunc("/strategies/followers", buildStrategyFollowersHandler(strategyFollowingRegistry))
-	httpRequestMultiplexer.HandleFunc("/strategies/following", buildAccountFollowingHandler(strategyFollowingRegistry))
-	httpRequestMultiplexer.HandleFunc("/mark-to-market/price", buildSetMarkToMarketPriceHandler(markToMarketEngine))
-	httpRequestMultiplexer.HandleFunc("/mark-to-market", buildMarkToMarketHandler(markToMarketEngine, fundingBook, pledgeBook))
-	httpRequestMultiplexer.HandleFunc("/auto-liquidation/status", buildAutoLiquidationStatusHandler(fundingBook, pledgeBook))
-	httpRequestMultiplexer.HandleFunc("/auto-liquidation/evaluate", buildAutoLiquidationEvaluateHandler(liquidationEngine, fundingBook, pledgeBook, positionBook, markToMarketEngine))
-	httpRequestMultiplexer.HandleFunc("/exposure-limits/configure", buildConfigureExposureLimitsHandler(exposureLimitsRegistry))
-	httpRequestMultiplexer.HandleFunc("/exposure-limits", buildExposureLimitsStatusHandler(exposureLimitsRegistry))
-	httpRequestMultiplexer.HandleFunc("/connectivity-kill-switch/engage", buildEngageKillSwitchHandler(connectivityKillSwitch))
-	httpRequestMultiplexer.HandleFunc("/connectivity-kill-switch/disengage", buildDisengageKillSwitchHandler(connectivityKillSwitch))
-	httpRequestMultiplexer.HandleFunc("/connectivity-kill-switch/status", buildKillSwitchStatusHandler(connectivityKillSwitch))
-	httpRequestMultiplexer.HandleFunc("/execution-algos/twap/create", buildCreateTwapExecutionAlgoHandler(executionAlgoOrderRegistry))
-	httpRequestMultiplexer.HandleFunc("/execution-algos/vwap/create", buildCreateVwapExecutionAlgoHandler(executionAlgoOrderRegistry))
-	httpRequestMultiplexer.HandleFunc("/execution-algos/pov/create", buildCreatePovExecutionAlgoHandler(executionAlgoOrderRegistry))
-	httpRequestMultiplexer.HandleFunc("/execution-algos/poll", buildPollExecutionAlgoHandler(executionAlgoOrderRegistry))
-	httpRequestMultiplexer.HandleFunc("/execution-algos/pov/observe-volume", buildObservePovVolumeHandler(executionAlgoOrderRegistry))
-	httpRequestMultiplexer.HandleFunc("/execution-algos/status", buildExecutionAlgoStatusHandler(executionAlgoOrderRegistry))
-	httpRequestMultiplexer.HandleFunc("/payoff-diagram/compute", buildComputePayoffDiagramHandler())
-	httpRequestMultiplexer.HandleFunc("/multileg-options/execute", buildExecuteMultiLegOptionsHandler(orderSubmissionDeps))
-	httpRequestMultiplexer.HandleFunc("/basket-orders/execute", buildExecuteBasketOrderHandler(orderSubmissionDeps))
-	httpRequestMultiplexer.HandleFunc("/impact-cost/estimate", buildEstimateImpactCostHandler())
-	httpRequestMultiplexer.HandleFunc("/liquidity-badge/compute", buildLiquidityBadgeHandler())
-	httpRequestMultiplexer.HandleFunc("/portfolio-stress-test/compute", buildPortfolioStressTestHandler(positionBook))
-	httpRequestMultiplexer.HandleFunc("/securities-lending/lend", buildLendSecurityHandler(securitiesLendingBorrowingDesk, positionBook))
-	httpRequestMultiplexer.HandleFunc("/securities-lending/recall", buildRecallLendingHandler(securitiesLendingBorrowingDesk))
-	httpRequestMultiplexer.HandleFunc("/securities-lending/borrow", buildBorrowSecurityHandler(securitiesLendingBorrowingDesk))
-	httpRequestMultiplexer.HandleFunc("/securities-lending/return", buildReturnBorrowingHandler(securitiesLendingBorrowingDesk))
-	httpRequestMultiplexer.HandleFunc("/securities-lending", buildSecuritiesLendingStatusHandler(securitiesLendingBorrowingDesk))
-	httpRequestMultiplexer.HandleFunc("/drip/toggle", buildSetDripToggleHandler(dripToggleRegistry))
-	httpRequestMultiplexer.HandleFunc("/drip/process-dividend", buildProcessDividendEventHandler(orderSubmissionDeps, dripToggleRegistry))
+	httpRequestMultiplexer.HandleFunc("/strategies/admin/verify", authmiddleware.RequireRole(signingSecret, authmiddleware.RoleAdmin, buildVerifyStrategyHandler(strategyFollowingRegistry)))
+	httpRequestMultiplexer.HandleFunc("/strategies/follow", authmiddleware.RequireAuth(signingSecret, buildFollowStrategyHandler(strategyFollowingRegistry)))
+	httpRequestMultiplexer.HandleFunc("/strategies/unfollow", authmiddleware.RequireAuth(signingSecret, buildUnfollowStrategyHandler(strategyFollowingRegistry)))
+	httpRequestMultiplexer.HandleFunc("/strategies/followers", authmiddleware.RequireRole(signingSecret, authmiddleware.RoleAdmin, buildStrategyFollowersHandler(strategyFollowingRegistry)))
+	httpRequestMultiplexer.HandleFunc("/strategies/following", authmiddleware.RequireAuth(signingSecret, buildAccountFollowingHandler(strategyFollowingRegistry)))
+	httpRequestMultiplexer.HandleFunc("/mark-to-market/price", authmiddleware.RequireRole(signingSecret, authmiddleware.RoleAdmin, buildSetMarkToMarketPriceHandler(markToMarketEngine)))
+	httpRequestMultiplexer.HandleFunc("/mark-to-market", authmiddleware.RequireAuth(signingSecret, buildMarkToMarketHandler(markToMarketEngine, fundingBook, pledgeBook)))
+	httpRequestMultiplexer.HandleFunc("/auto-liquidation/status", authmiddleware.RequireAuth(signingSecret, buildAutoLiquidationStatusHandler(fundingBook, pledgeBook)))
+	httpRequestMultiplexer.HandleFunc("/auto-liquidation/evaluate", authmiddleware.RequireRole(signingSecret, authmiddleware.RoleAdmin, buildAutoLiquidationEvaluateHandler(liquidationEngine, fundingBook, pledgeBook, positionBook, markToMarketEngine)))
+	httpRequestMultiplexer.HandleFunc("/exposure-limits/configure", authmiddleware.RequireRole(signingSecret, authmiddleware.RoleAdmin, buildConfigureExposureLimitsHandler(exposureLimitsRegistry)))
+	httpRequestMultiplexer.HandleFunc("/exposure-limits", authmiddleware.RequireAuth(signingSecret, buildExposureLimitsStatusHandler(exposureLimitsRegistry)))
+	httpRequestMultiplexer.HandleFunc("/connectivity-kill-switch/engage", authmiddleware.RequireRole(signingSecret, authmiddleware.RoleAdmin, buildEngageKillSwitchHandler(connectivityKillSwitch)))
+	httpRequestMultiplexer.HandleFunc("/connectivity-kill-switch/disengage", authmiddleware.RequireRole(signingSecret, authmiddleware.RoleAdmin, buildDisengageKillSwitchHandler(connectivityKillSwitch)))
+	httpRequestMultiplexer.HandleFunc("/connectivity-kill-switch/status", authmiddleware.RequireRole(signingSecret, authmiddleware.RoleAdmin, buildKillSwitchStatusHandler(connectivityKillSwitch)))
+	httpRequestMultiplexer.HandleFunc("/execution-algos/twap/create", authmiddleware.RequireAuth(signingSecret, buildCreateTwapExecutionAlgoHandler(executionAlgoOrderRegistry)))
+	httpRequestMultiplexer.HandleFunc("/execution-algos/vwap/create", authmiddleware.RequireAuth(signingSecret, buildCreateVwapExecutionAlgoHandler(executionAlgoOrderRegistry)))
+	httpRequestMultiplexer.HandleFunc("/execution-algos/pov/create", authmiddleware.RequireAuth(signingSecret, buildCreatePovExecutionAlgoHandler(executionAlgoOrderRegistry)))
+	httpRequestMultiplexer.HandleFunc("/execution-algos/poll", authmiddleware.RequireAuth(signingSecret, buildPollExecutionAlgoHandler(executionAlgoOrderRegistry)))
+	httpRequestMultiplexer.HandleFunc("/execution-algos/pov/observe-volume", authmiddleware.RequireAuth(signingSecret, buildObservePovVolumeHandler(executionAlgoOrderRegistry)))
+	httpRequestMultiplexer.HandleFunc("/execution-algos/status", authmiddleware.RequireAuth(signingSecret, buildExecutionAlgoStatusHandler(executionAlgoOrderRegistry)))
+	httpRequestMultiplexer.HandleFunc("/payoff-diagram/compute", authmiddleware.RequireAuth(signingSecret, buildComputePayoffDiagramHandler()))
+	httpRequestMultiplexer.HandleFunc("/multileg-options/execute", authmiddleware.RequireAuth(signingSecret, buildExecuteMultiLegOptionsHandler(orderSubmissionDeps)))
+	httpRequestMultiplexer.HandleFunc("/basket-orders/execute", authmiddleware.RequireAuth(signingSecret, buildExecuteBasketOrderHandler(orderSubmissionDeps)))
+	httpRequestMultiplexer.HandleFunc("/impact-cost/estimate", authmiddleware.RequireAuth(signingSecret, buildEstimateImpactCostHandler()))
+	httpRequestMultiplexer.HandleFunc("/liquidity-badge/compute", authmiddleware.RequireAuth(signingSecret, buildLiquidityBadgeHandler()))
+	httpRequestMultiplexer.HandleFunc("/portfolio-stress-test/compute", authmiddleware.RequireAuth(signingSecret, buildPortfolioStressTestHandler(positionBook)))
+	httpRequestMultiplexer.HandleFunc("/securities-lending/lend", authmiddleware.RequireAuth(signingSecret, buildLendSecurityHandler(securitiesLendingBorrowingDesk, positionBook)))
+	httpRequestMultiplexer.HandleFunc("/securities-lending/recall", authmiddleware.RequireAuth(signingSecret, buildRecallLendingHandler(securitiesLendingBorrowingDesk)))
+	httpRequestMultiplexer.HandleFunc("/securities-lending/borrow", authmiddleware.RequireAuth(signingSecret, buildBorrowSecurityHandler(securitiesLendingBorrowingDesk)))
+	httpRequestMultiplexer.HandleFunc("/securities-lending/return", authmiddleware.RequireAuth(signingSecret, buildReturnBorrowingHandler(securitiesLendingBorrowingDesk)))
+	httpRequestMultiplexer.HandleFunc("/securities-lending", authmiddleware.RequireAuth(signingSecret, buildSecuritiesLendingStatusHandler(securitiesLendingBorrowingDesk)))
+	httpRequestMultiplexer.HandleFunc("/drip/toggle", authmiddleware.RequireAuth(signingSecret, buildSetDripToggleHandler(dripToggleRegistry)))
+	httpRequestMultiplexer.HandleFunc("/drip/process-dividend", authmiddleware.RequireRole(signingSecret, authmiddleware.RoleAdmin, buildProcessDividendEventHandler(orderSubmissionDeps, dripToggleRegistry)))
 
 	// FEATURES.md §3 DMA/FIX gateway (internal/dmagateway) — LOUD WARNING:
 	// NOT FIX-protocol-certified, see that package's doc comment for the
@@ -354,7 +487,10 @@ func main() {
 	// risk-check/audit-trail/matching-engine pipeline as HTTP
 	// /orders/submit.
 	dmaOrderSubmitFunc := func(request orders.OrderSubmissionRequest) orders.OrderAcknowledgementResponse {
-		return processOrderSubmission(orderSubmissionDeps, request)
+		// No authenticated human actor here either — the DMA/FIX-inspired
+		// TCP session (internal/dmagateway) has no bearer-token auth model
+		// at all, see that package's own loud disclaimer.
+		return processOrderSubmission(orderSubmissionDeps, request, "")
 	}
 	dmaListenAddress := os.Getenv("DMA_GATEWAY_LISTEN_ADDRESS")
 	if dmaListenAddress == "" {
@@ -392,7 +528,7 @@ func main() {
 
 	listenAddress := ":8081"
 	log.Printf(
-		"oms-gateway listening on %s (CORS wide open — see withPermissiveCorsForDevelopment) — matching-engine at %s, ledger at %s, kyc-onboarding at %s, backoffice at %s, quant-engine at %s\n",
+		"oms-gateway listening on %s (CORS allow-listed — see withAllowListedCorsOrigin) — matching-engine at %s, ledger at %s, kyc-onboarding at %s, backoffice at %s, quant-engine at %s\n",
 		listenAddress,
 		matchingEngineTcpAddress,
 		ledgerBaseUrl,
@@ -401,28 +537,40 @@ func main() {
 		quantEngineBaseUrl,
 	)
 	instrumentedHandler := metrics.WithRequestTiming(metricsRegistry, httplogging.WithRequestLogging(httpRequestMultiplexer))
-	if serverStartupError := http.ListenAndServe(listenAddress, withPermissiveCorsForDevelopment(instrumentedHandler)); serverStartupError != nil {
+	if serverStartupError := http.ListenAndServe(listenAddress, withAllowListedCorsOrigin(instrumentedHandler)); serverStartupError != nil {
 		log.Fatalf("oms-gateway failed to start: %v", serverStartupError)
 	}
 }
 
-// withPermissiveCorsForDevelopment wraps every request with CORS headers
-// permissive enough for apps/web (served from a different origin/port in
-// dev, e.g. localhost:3000/3100 vs oms-gateway's :8081) to actually call
-// this API from a real browser — without it, every fetch() from the
-// dashboard fails silently with a CORS error before it even reaches a
-// handler.
+// defaultAllowedCorsOrigins is used when CORS_ALLOWED_ORIGINS is unset —
+// apps/web's own dev origins (served from a different origin/port than
+// oms-gateway's :8081).
+const defaultAllowedCorsOrigins = "http://localhost:3000,http://localhost:3100"
+
+// withAllowListedCorsOrigin wraps every request with CORS headers scoped
+// to an explicit allow-list of origins (CORS_ALLOWED_ORIGINS, a
+// comma-separated list; defaults to defaultAllowedCorsOrigins when unset)
+// so apps/web (served from a different origin/port in dev, e.g.
+// localhost:3000/3100 vs oms-gateway's :8081) can actually call this API
+// from a real browser — without it, every fetch() from the dashboard
+// fails silently with a CORS error before it even reaches a handler.
 //
-// TODO(real build): `Access-Control-Allow-Origin: *` is fine for a
-// no-auth demo skeleton and actively wrong once any real auth (cookies,
-// bearer tokens) exists — a real build must echo back a specific
-// allow-listed origin instead of `*`, per the standard CORS-with-
-// credentials restriction.
-func withPermissiveCorsForDevelopment(nextHandler http.Handler) http.Handler {
+// Unlike a wildcard `Access-Control-Allow-Origin: *`, this echoes back
+// the exact incoming Origin header ONLY when it matches an allow-listed
+// origin, and pairs it with Access-Control-Allow-Credentials: true — the
+// standard CORS-with-credentials pattern now that requests carry a real
+// bearer token. A request from a non-allow-listed origin gets no CORS
+// headers at all, so the browser blocks it.
+func withAllowListedCorsOrigin(nextHandler http.Handler) http.Handler {
+	allowedOrigins := allowedCorsOriginsFromEnv()
 	return http.HandlerFunc(func(responseWriter http.ResponseWriter, request *http.Request) {
-		responseWriter.Header().Set("Access-Control-Allow-Origin", "*")
-		responseWriter.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-		responseWriter.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+		requestOrigin := request.Header.Get("Origin")
+		if requestOrigin != "" && allowedOrigins[requestOrigin] {
+			responseWriter.Header().Set("Access-Control-Allow-Origin", requestOrigin)
+			responseWriter.Header().Set("Access-Control-Allow-Credentials", "true")
+			responseWriter.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+			responseWriter.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+		}
 
 		if request.Method == http.MethodOptions {
 			responseWriter.WriteHeader(http.StatusNoContent)
@@ -431,6 +579,24 @@ func withPermissiveCorsForDevelopment(nextHandler http.Handler) http.Handler {
 
 		nextHandler.ServeHTTP(responseWriter, request)
 	})
+}
+
+// allowedCorsOriginsFromEnv reads CORS_ALLOWED_ORIGINS (comma-separated),
+// falling back to defaultAllowedCorsOrigins when unset, and returns it as
+// a set for O(1) origin lookups.
+func allowedCorsOriginsFromEnv() map[string]bool {
+	rawOrigins := os.Getenv("CORS_ALLOWED_ORIGINS")
+	if rawOrigins == "" {
+		rawOrigins = defaultAllowedCorsOrigins
+	}
+	allowedOrigins := make(map[string]bool)
+	for _, origin := range strings.Split(rawOrigins, ",") {
+		trimmedOrigin := strings.TrimSpace(origin)
+		if trimmedOrigin != "" {
+			allowedOrigins[trimmedOrigin] = true
+		}
+	}
+	return allowedOrigins
 }
 
 // syncRiskEngineBalancesFromLedger does a one-shot fetch-and-seed at
@@ -521,6 +687,9 @@ func buildSubmitOrderHandler(
 			http.Error(responseWriter, "malformed order submission payload", http.StatusBadRequest)
 			return
 		}
+		if !authenticatedAccountMatches(responseWriter, request, incomingOrderSubmissionRequest.ClientAccountIdentifier) {
+			return
+		}
 
 		// FEATURES.md §3 Iceberg/FOK/IOC: validated and accepted here — see
 		// orders.ValidateOrderExecutionType's doc comment for the honest
@@ -568,10 +737,12 @@ func buildSubmitOrderHandler(
 		// get queued (not deduplicated).
 		if incomingOrderSubmissionRequest.OrderIsAfterMarketOrder && !marketSession.IsMarketOpen() {
 			afterMarketOrderQueue.Enqueue(incomingOrderSubmissionRequest)
+			amoQueueTimeActor, _ := authmiddleware.AuthenticatedAccountIdentifier(request)
 			dependencies.auditTrail.Append(audittrail.Entry{
-				EventType:               audittrail.EventAfterMarketOrderQueued,
-				ClientAccountIdentifier: incomingOrderSubmissionRequest.ClientAccountIdentifier,
-				InstrumentSymbol:        incomingOrderSubmissionRequest.InstrumentSymbol,
+				EventType:                           audittrail.EventAfterMarketOrderQueued,
+				ClientAccountIdentifier:             incomingOrderSubmissionRequest.ClientAccountIdentifier,
+				InstrumentSymbol:                    incomingOrderSubmissionRequest.InstrumentSymbol,
+				AuthenticatedActorAccountIdentifier: amoQueueTimeActor,
 			})
 			queuedAcknowledgement := orders.OrderAcknowledgementResponse{
 				WasOrderAccepted:           true,
@@ -602,7 +773,8 @@ func buildSubmitOrderHandler(
 			return
 		}
 
-		acknowledgement := processOrderSubmission(dependencies, incomingOrderSubmissionRequest)
+		authenticatedActorAccountIdentifier, _ := authmiddleware.AuthenticatedAccountIdentifier(request)
+		acknowledgement := processOrderSubmission(dependencies, incomingOrderSubmissionRequest, authenticatedActorAccountIdentifier)
 
 		// FEATURES.md §19 overtrading/revenge-trading pattern detection —
 		// deliberately evaluated AFTER the order is fully processed and
@@ -647,6 +819,9 @@ func buildOvertradingStatusHandler(overtradingDetector *overtradingdetection.Det
 			http.Error(responseWriter, "accountId query parameter is required", http.StatusBadRequest)
 			return
 		}
+		if !authenticatedAccountMatches(responseWriter, request, accountIdentifier) {
+			return
+		}
 		status := overtradingDetector.Status(accountIdentifier, time.Now())
 		respondWithJson(responseWriter, http.StatusOK, status)
 	}
@@ -677,6 +852,9 @@ func buildAcknowledgeRiskDisclosureHandler(gate *riskdisclosuregate.Gate) http.H
 			http.Error(responseWriter, "clientAccountIdentifier is required", http.StatusBadRequest)
 			return
 		}
+		if !authenticatedAccountMatches(responseWriter, request, incomingRequest.ClientAccountIdentifier) {
+			return
+		}
 		gate.Acknowledge(incomingRequest.ClientAccountIdentifier, time.Now())
 		respondWithJson(responseWriter, http.StatusOK, gate.Status(incomingRequest.ClientAccountIdentifier))
 	}
@@ -694,6 +872,9 @@ func buildRiskDisclosureStatusHandler(gate *riskdisclosuregate.Gate) http.Handle
 		accountIdentifier := request.URL.Query().Get("accountId")
 		if accountIdentifier == "" {
 			http.Error(responseWriter, "accountId query parameter is required", http.StatusBadRequest)
+			return
+		}
+		if !authenticatedAccountMatches(responseWriter, request, accountIdentifier) {
 			return
 		}
 		respondWithJson(responseWriter, http.StatusOK, gate.Status(accountIdentifier))
@@ -752,6 +933,9 @@ func buildSquareOffRemindersHandler(cutoffConfig marketsession.SquareOffCutoffCo
 			http.Error(responseWriter, "accountId query parameter is required", http.StatusBadRequest)
 			return
 		}
+		if !authenticatedAccountMatches(responseWriter, request, accountIdentifier) {
+			return
+		}
 		now := parseOptionalNowQueryParam(request)
 		cutoffTime := cutoffConfig.CutoffForDate(now)
 		dueReminders := tracker.DueReminders(accountIdentifier, cutoffTime, now)
@@ -773,9 +957,25 @@ func buildSquareOffRemindersHandler(cutoffConfig marketsession.SquareOffCutoffCo
 // buildCoverOrderHandler (and any future multi-leg order type) can drive
 // an entry leg through the exact same real checks instead of
 // reimplementing them.
+// authenticatedActorAccountIdentifier is the REAL authenticated caller
+// (authmiddleware.AuthenticatedAccountIdentifier(request), extracted by
+// the outer HTTP handler — see each call site below) — added this build
+// alongside real Postgres persistence so every audit_trail_entries row
+// records who actually made the authenticated call, not just which
+// account the order request body claims to be for (the two already had
+// to match per authenticatedAccountMatches for a directly-submitted
+// order, but diverge for the two internal, non-per-account-authenticated
+// callers below: dmaOrderSubmitFunc, whose DMA/FIX-style TCP session has
+// no bearer-token auth model at all, and submitReducingOrderFunc, an
+// auto-liquidation-engine-triggered SELL with no human caller in the
+// loop — both pass "" here, honestly recorded as "no authenticated
+// actor", not a guessed value). See docs/BUILD_LOG.md's Postgres-
+// persistence entry for the full list of which of the 9 call sites pass
+// a real value vs. "".
 func processOrderSubmission(
 	dependencies orderSubmissionDependencies,
 	incomingOrderSubmissionRequest orders.OrderSubmissionRequest,
+	authenticatedActorAccountIdentifier string,
 ) orders.OrderAcknowledgementResponse {
 	// FEATURES.md §12 exchange-connectivity kill-switch — checked BEFORE
 	// EVERYTHING else, including strategy limits: if trading is halted
@@ -789,10 +989,11 @@ func processOrderSubmission(
 	// cancelled".
 	if dependencies.connectivityKillSwitch.IsTradingHalted() {
 		dependencies.auditTrail.Append(audittrail.Entry{
-			EventType:               audittrail.EventOrderRejected,
-			ClientAccountIdentifier: incomingOrderSubmissionRequest.ClientAccountIdentifier,
-			InstrumentSymbol:        incomingOrderSubmissionRequest.InstrumentSymbol,
-			DetailMessage:           "TRADING_HALTED",
+			EventType:                           audittrail.EventOrderRejected,
+			ClientAccountIdentifier:             incomingOrderSubmissionRequest.ClientAccountIdentifier,
+			AuthenticatedActorAccountIdentifier: authenticatedActorAccountIdentifier,
+			InstrumentSymbol:                    incomingOrderSubmissionRequest.InstrumentSymbol,
+			DetailMessage:                       "TRADING_HALTED",
 		})
 		return orders.OrderAcknowledgementResponse{
 			WasOrderAccepted:               false,
@@ -821,10 +1022,11 @@ func processOrderSubmission(
 		)
 		if sessionRuleError != nil {
 			dependencies.auditTrail.Append(audittrail.Entry{
-				EventType:               audittrail.EventOrderRejected,
-				ClientAccountIdentifier: incomingOrderSubmissionRequest.ClientAccountIdentifier,
-				InstrumentSymbol:        incomingOrderSubmissionRequest.InstrumentSymbol,
-				DetailMessage:           fmt.Sprintf("SESSION_PHASE_RULE_VIOLATION: %v", sessionRuleError),
+				EventType:                           audittrail.EventOrderRejected,
+				ClientAccountIdentifier:             incomingOrderSubmissionRequest.ClientAccountIdentifier,
+				AuthenticatedActorAccountIdentifier: authenticatedActorAccountIdentifier,
+				InstrumentSymbol:                    incomingOrderSubmissionRequest.InstrumentSymbol,
+				DetailMessage:                       fmt.Sprintf("SESSION_PHASE_RULE_VIOLATION: %v", sessionRuleError),
 			})
 			return orders.OrderAcknowledgementResponse{
 				WasOrderAccepted:               false,
@@ -857,10 +1059,11 @@ func processOrderSubmission(
 				machineReadableReason = "STRATEGY_DAILY_NOTIONAL_LIMIT_EXCEEDED"
 			}
 			dependencies.auditTrail.Append(audittrail.Entry{
-				EventType:               audittrail.EventStrategyLimitRejected,
-				ClientAccountIdentifier: incomingOrderSubmissionRequest.ClientAccountIdentifier,
-				InstrumentSymbol:        incomingOrderSubmissionRequest.InstrumentSymbol,
-				DetailMessage:           fmt.Sprintf("strategyId=%s: %v", incomingOrderSubmissionRequest.StrategyIdentifier, limitError),
+				EventType:                           audittrail.EventStrategyLimitRejected,
+				ClientAccountIdentifier:             incomingOrderSubmissionRequest.ClientAccountIdentifier,
+				AuthenticatedActorAccountIdentifier: authenticatedActorAccountIdentifier,
+				InstrumentSymbol:                    incomingOrderSubmissionRequest.InstrumentSymbol,
+				DetailMessage:                       fmt.Sprintf("strategyId=%s: %v", incomingOrderSubmissionRequest.StrategyIdentifier, limitError),
 			})
 			return orders.OrderAcknowledgementResponse{
 				WasOrderAccepted:               false,
@@ -892,10 +1095,11 @@ func processOrderSubmission(
 			machineReadableReason = "SEGMENT_EXPOSURE_LIMIT_EXCEEDED"
 		}
 		dependencies.auditTrail.Append(audittrail.Entry{
-			EventType:               audittrail.EventOrderRejected,
-			ClientAccountIdentifier: incomingOrderSubmissionRequest.ClientAccountIdentifier,
-			InstrumentSymbol:        incomingOrderSubmissionRequest.InstrumentSymbol,
-			DetailMessage:           fmt.Sprintf("%s: %v", machineReadableReason, exposureError),
+			EventType:                           audittrail.EventOrderRejected,
+			ClientAccountIdentifier:             incomingOrderSubmissionRequest.ClientAccountIdentifier,
+			AuthenticatedActorAccountIdentifier: authenticatedActorAccountIdentifier,
+			InstrumentSymbol:                    incomingOrderSubmissionRequest.InstrumentSymbol,
+			DetailMessage:                       fmt.Sprintf("%s: %v", machineReadableReason, exposureError),
 		})
 		return orders.OrderAcknowledgementResponse{
 			WasOrderAccepted:               false,
@@ -917,10 +1121,11 @@ func processOrderSubmission(
 		)
 		if frictionResult.RequiresConfirmation && !incomingOrderSubmissionRequest.ConfirmedLargeOrder {
 			dependencies.auditTrail.Append(audittrail.Entry{
-				EventType:               audittrail.EventOrderRejected,
-				ClientAccountIdentifier: incomingOrderSubmissionRequest.ClientAccountIdentifier,
-				InstrumentSymbol:        incomingOrderSubmissionRequest.InstrumentSymbol,
-				DetailMessage:           fmt.Sprintf("LARGE_ORDER_CONFIRMATION_REQUIRED: %s", frictionResult.Reason),
+				EventType:                           audittrail.EventOrderRejected,
+				ClientAccountIdentifier:             incomingOrderSubmissionRequest.ClientAccountIdentifier,
+				AuthenticatedActorAccountIdentifier: authenticatedActorAccountIdentifier,
+				InstrumentSymbol:                    incomingOrderSubmissionRequest.InstrumentSymbol,
+				DetailMessage:                       fmt.Sprintf("LARGE_ORDER_CONFIRMATION_REQUIRED: %s", frictionResult.Reason),
 			})
 			return orders.OrderAcknowledgementResponse{
 				WasOrderAccepted: false,
@@ -954,10 +1159,11 @@ func processOrderSubmission(
 		log.Printf("KYC check unreachable for %s, failing OPEN (see comment above): %v", incomingOrderSubmissionRequest.ClientAccountIdentifier, kycFetchError)
 	} else if !kycStatus.IsEligibleToPlaceOrders {
 		dependencies.auditTrail.Append(audittrail.Entry{
-			EventType:               audittrail.EventOrderRejected,
-			ClientAccountIdentifier: incomingOrderSubmissionRequest.ClientAccountIdentifier,
-			InstrumentSymbol:        incomingOrderSubmissionRequest.InstrumentSymbol,
-			DetailMessage:           "KYC_NOT_VERIFIED",
+			EventType:                           audittrail.EventOrderRejected,
+			ClientAccountIdentifier:             incomingOrderSubmissionRequest.ClientAccountIdentifier,
+			AuthenticatedActorAccountIdentifier: authenticatedActorAccountIdentifier,
+			InstrumentSymbol:                    incomingOrderSubmissionRequest.InstrumentSymbol,
+			DetailMessage:                       "KYC_NOT_VERIFIED",
 		})
 		return orders.OrderAcknowledgementResponse{
 			WasOrderAccepted: false,
@@ -976,10 +1182,11 @@ func processOrderSubmission(
 		log.Printf("freeze check unreachable for %s, failing OPEN (see KYC gate comment above): %v", incomingOrderSubmissionRequest.ClientAccountIdentifier, freezeFetchError)
 	} else if freezeStatus.IsFrozen {
 		dependencies.auditTrail.Append(audittrail.Entry{
-			EventType:               audittrail.EventOrderRejected,
-			ClientAccountIdentifier: incomingOrderSubmissionRequest.ClientAccountIdentifier,
-			InstrumentSymbol:        incomingOrderSubmissionRequest.InstrumentSymbol,
-			DetailMessage:           fmt.Sprintf("ACCOUNT_FROZEN: %s", freezeStatus.FreezeReason),
+			EventType:                           audittrail.EventOrderRejected,
+			ClientAccountIdentifier:             incomingOrderSubmissionRequest.ClientAccountIdentifier,
+			AuthenticatedActorAccountIdentifier: authenticatedActorAccountIdentifier,
+			InstrumentSymbol:                    incomingOrderSubmissionRequest.InstrumentSymbol,
+			DetailMessage:                       fmt.Sprintf("ACCOUNT_FROZEN: %s", freezeStatus.FreezeReason),
 		})
 		return orders.OrderAcknowledgementResponse{
 			WasOrderAccepted:               false,
@@ -1004,10 +1211,11 @@ func processOrderSubmission(
 			unpledgedQuantity := netHoldingQuantity - int64(pledgedQuantity)
 			if unpledgedQuantity < 0 || incomingOrderSubmissionRequest.OrderQuantity > uint64(unpledgedQuantity) {
 				dependencies.auditTrail.Append(audittrail.Entry{
-					EventType:               audittrail.EventOrderRejected,
-					ClientAccountIdentifier: incomingOrderSubmissionRequest.ClientAccountIdentifier,
-					InstrumentSymbol:        incomingOrderSubmissionRequest.InstrumentSymbol,
-					DetailMessage:           "PLEDGED_QUANTITY_UNAVAILABLE",
+					EventType:                           audittrail.EventOrderRejected,
+					ClientAccountIdentifier:             incomingOrderSubmissionRequest.ClientAccountIdentifier,
+					AuthenticatedActorAccountIdentifier: authenticatedActorAccountIdentifier,
+					InstrumentSymbol:                    incomingOrderSubmissionRequest.InstrumentSymbol,
+					DetailMessage:                       "PLEDGED_QUANTITY_UNAVAILABLE",
 				})
 				return orders.OrderAcknowledgementResponse{
 					WasOrderAccepted: false,
@@ -1036,10 +1244,11 @@ func processOrderSubmission(
 			incomingOrderSubmissionRequest.ClientAccountIdentifier, isFnoInstrument, time.Now(),
 		); disclosureError != nil {
 			dependencies.auditTrail.Append(audittrail.Entry{
-				EventType:               audittrail.EventOrderRejected,
-				ClientAccountIdentifier: incomingOrderSubmissionRequest.ClientAccountIdentifier,
-				InstrumentSymbol:        incomingOrderSubmissionRequest.InstrumentSymbol,
-				DetailMessage:           fmt.Sprintf("FNO_RISK_DISCLOSURE_REQUIRED: %v", disclosureError),
+				EventType:                           audittrail.EventOrderRejected,
+				ClientAccountIdentifier:             incomingOrderSubmissionRequest.ClientAccountIdentifier,
+				AuthenticatedActorAccountIdentifier: authenticatedActorAccountIdentifier,
+				InstrumentSymbol:                    incomingOrderSubmissionRequest.InstrumentSymbol,
+				DetailMessage:                       fmt.Sprintf("FNO_RISK_DISCLOSURE_REQUIRED: %v", disclosureError),
 			})
 			return orders.OrderAcknowledgementResponse{
 				WasOrderAccepted:               false,
@@ -1081,10 +1290,11 @@ func processOrderSubmission(
 
 	if !riskCheckOutcome.IsOrderApproved {
 		dependencies.auditTrail.Append(audittrail.Entry{
-			EventType:               audittrail.EventOrderRejected,
-			ClientAccountIdentifier: incomingOrderSubmissionRequest.ClientAccountIdentifier,
-			InstrumentSymbol:        incomingOrderSubmissionRequest.InstrumentSymbol,
-			DetailMessage:           riskCheckOutcome.MachineReadableRejectionReason,
+			EventType:                           audittrail.EventOrderRejected,
+			ClientAccountIdentifier:             incomingOrderSubmissionRequest.ClientAccountIdentifier,
+			AuthenticatedActorAccountIdentifier: authenticatedActorAccountIdentifier,
+			InstrumentSymbol:                    incomingOrderSubmissionRequest.InstrumentSymbol,
+			DetailMessage:                       riskCheckOutcome.MachineReadableRejectionReason,
 		})
 		return orders.OrderAcknowledgementResponse{
 			WasOrderAccepted:               false,
@@ -1096,14 +1306,15 @@ func processOrderSubmission(
 	assignedGlobalSequenceNumber := dependencies.globalSequenceNumberAllocator.AllocateNextSequenceNumber()
 
 	dependencies.auditTrail.Append(audittrail.Entry{
-		EventType:                  audittrail.EventOrderSubmitted,
-		ClientAccountIdentifier:    incomingOrderSubmissionRequest.ClientAccountIdentifier,
-		InstrumentSymbol:           incomingOrderSubmissionRequest.InstrumentSymbol,
-		DetailMessage:              fmt.Sprintf("assignedGlobalSequenceNumber=%d", assignedGlobalSequenceNumber),
-		OrderSideIsBuyNotSell:      &incomingOrderSubmissionRequest.OrderSideIsBuyNotSell,
-		OrderQuantity:              incomingOrderSubmissionRequest.OrderQuantity,
-		LimitPriceInMinorUnits:     incomingOrderSubmissionRequest.LimitPriceInMinorUnits,
-		OrderIsMarketOrderNotLimit: incomingOrderSubmissionRequest.OrderIsMarketOrderNotLimit,
+		EventType:                           audittrail.EventOrderSubmitted,
+		ClientAccountIdentifier:             incomingOrderSubmissionRequest.ClientAccountIdentifier,
+		InstrumentSymbol:                    incomingOrderSubmissionRequest.InstrumentSymbol,
+		DetailMessage:                       fmt.Sprintf("assignedGlobalSequenceNumber=%d", assignedGlobalSequenceNumber),
+		OrderSideIsBuyNotSell:               &incomingOrderSubmissionRequest.OrderSideIsBuyNotSell,
+		OrderQuantity:                       incomingOrderSubmissionRequest.OrderQuantity,
+		LimitPriceInMinorUnits:              incomingOrderSubmissionRequest.LimitPriceInMinorUnits,
+		OrderIsMarketOrderNotLimit:          incomingOrderSubmissionRequest.OrderIsMarketOrderNotLimit,
+		AuthenticatedActorAccountIdentifier: authenticatedActorAccountIdentifier,
 	})
 
 	acknowledgement := orders.OrderAcknowledgementResponse{
@@ -1148,10 +1359,11 @@ func processOrderSubmission(
 			if fractionalSimulationError != nil {
 				acknowledgement.PaperOrderSimulationError = fractionalSimulationError.Error()
 				dependencies.auditTrail.Append(audittrail.Entry{
-					EventType:               audittrail.EventPaperOrderSimulationFailed,
-					ClientAccountIdentifier: incomingOrderSubmissionRequest.ClientAccountIdentifier,
-					InstrumentSymbol:        incomingOrderSubmissionRequest.InstrumentSymbol,
-					DetailMessage:           fractionalSimulationError.Error(),
+					EventType:                           audittrail.EventPaperOrderSimulationFailed,
+					ClientAccountIdentifier:             incomingOrderSubmissionRequest.ClientAccountIdentifier,
+					AuthenticatedActorAccountIdentifier: authenticatedActorAccountIdentifier,
+					InstrumentSymbol:                    incomingOrderSubmissionRequest.InstrumentSymbol,
+					DetailMessage:                       fractionalSimulationError.Error(),
 				})
 				return acknowledgement
 			}
@@ -1171,9 +1383,10 @@ func processOrderSubmission(
 				ExecutedMilliShareQuantity: fractionalFill.ExecutedMilliShareQuantity,
 			})
 			dependencies.auditTrail.Append(audittrail.Entry{
-				EventType:               audittrail.EventPaperOrderFilled,
-				ClientAccountIdentifier: incomingOrderSubmissionRequest.ClientAccountIdentifier,
-				InstrumentSymbol:        incomingOrderSubmissionRequest.InstrumentSymbol,
+				EventType:                           audittrail.EventPaperOrderFilled,
+				ClientAccountIdentifier:             incomingOrderSubmissionRequest.ClientAccountIdentifier,
+				AuthenticatedActorAccountIdentifier: authenticatedActorAccountIdentifier,
+				InstrumentSymbol:                    incomingOrderSubmissionRequest.InstrumentSymbol,
 				DetailMessage: fmt.Sprintf(
 					"SIMULATED FRACTIONAL fill %d milli-share-units @ %d (NOT a real matching-engine trade, NOT settled to ledger)",
 					fractionalFill.ExecutedMilliShareQuantity, fractionalFill.ExecutedPriceInMinorUnits,
@@ -1186,10 +1399,11 @@ func processOrderSubmission(
 		if simulationError != nil {
 			acknowledgement.PaperOrderSimulationError = simulationError.Error()
 			dependencies.auditTrail.Append(audittrail.Entry{
-				EventType:               audittrail.EventPaperOrderSimulationFailed,
-				ClientAccountIdentifier: incomingOrderSubmissionRequest.ClientAccountIdentifier,
-				InstrumentSymbol:        incomingOrderSubmissionRequest.InstrumentSymbol,
-				DetailMessage:           simulationError.Error(),
+				EventType:                           audittrail.EventPaperOrderSimulationFailed,
+				ClientAccountIdentifier:             incomingOrderSubmissionRequest.ClientAccountIdentifier,
+				AuthenticatedActorAccountIdentifier: authenticatedActorAccountIdentifier,
+				InstrumentSymbol:                    incomingOrderSubmissionRequest.InstrumentSymbol,
+				DetailMessage:                       simulationError.Error(),
 			})
 			return acknowledgement
 		}
@@ -1212,9 +1426,10 @@ func processOrderSubmission(
 			ExecutedQuantity:          simulatedFill.ExecutedQuantity,
 		})
 		dependencies.auditTrail.Append(audittrail.Entry{
-			EventType:               audittrail.EventPaperOrderFilled,
-			ClientAccountIdentifier: incomingOrderSubmissionRequest.ClientAccountIdentifier,
-			InstrumentSymbol:        incomingOrderSubmissionRequest.InstrumentSymbol,
+			EventType:                           audittrail.EventPaperOrderFilled,
+			ClientAccountIdentifier:             incomingOrderSubmissionRequest.ClientAccountIdentifier,
+			AuthenticatedActorAccountIdentifier: authenticatedActorAccountIdentifier,
+			InstrumentSymbol:                    incomingOrderSubmissionRequest.InstrumentSymbol,
 			DetailMessage: fmt.Sprintf(
 				"SIMULATED fill %d @ %d (NOT a real matching-engine trade, NOT settled to ledger)",
 				simulatedFill.ExecutedQuantity, simulatedFill.ExecutedPriceInMinorUnits,
@@ -1258,10 +1473,11 @@ func processOrderSubmission(
 		log.Printf("matching-engine hand-off failed for seq=%d: %v", assignedGlobalSequenceNumber, handoffError)
 		acknowledgement.MatchingEngineHandoffError = handoffError.Error()
 		dependencies.auditTrail.Append(audittrail.Entry{
-			EventType:               audittrail.EventOrderMatchingEngineFailure,
-			ClientAccountIdentifier: incomingOrderSubmissionRequest.ClientAccountIdentifier,
-			InstrumentSymbol:        incomingOrderSubmissionRequest.InstrumentSymbol,
-			DetailMessage:           handoffError.Error(),
+			EventType:                           audittrail.EventOrderMatchingEngineFailure,
+			ClientAccountIdentifier:             incomingOrderSubmissionRequest.ClientAccountIdentifier,
+			AuthenticatedActorAccountIdentifier: authenticatedActorAccountIdentifier,
+			InstrumentSymbol:                    incomingOrderSubmissionRequest.InstrumentSymbol,
+			DetailMessage:                       handoffError.Error(),
 		})
 
 	case matchingEngineResponse.ErrorMessage != nil:
@@ -1272,10 +1488,11 @@ func processOrderSubmission(
 		)
 		acknowledgement.MatchingEngineHandoffError = *matchingEngineResponse.ErrorMessage
 		dependencies.auditTrail.Append(audittrail.Entry{
-			EventType:               audittrail.EventOrderMatchingEngineFailure,
-			ClientAccountIdentifier: incomingOrderSubmissionRequest.ClientAccountIdentifier,
-			InstrumentSymbol:        incomingOrderSubmissionRequest.InstrumentSymbol,
-			DetailMessage:           *matchingEngineResponse.ErrorMessage,
+			EventType:                           audittrail.EventOrderMatchingEngineFailure,
+			ClientAccountIdentifier:             incomingOrderSubmissionRequest.ClientAccountIdentifier,
+			AuthenticatedActorAccountIdentifier: authenticatedActorAccountIdentifier,
+			InstrumentSymbol:                    incomingOrderSubmissionRequest.InstrumentSymbol,
+			DetailMessage:                       *matchingEngineResponse.ErrorMessage,
 		})
 
 	default:
@@ -1287,14 +1504,15 @@ func processOrderSubmission(
 			// later cancel entry will also carry — internal/
 			// tradesurveillance joins on it.
 			dependencies.auditTrail.Append(audittrail.Entry{
-				EventType:                         audittrail.EventOrderRoutedToMatchingEngine,
-				ClientAccountIdentifier:           incomingOrderSubmissionRequest.ClientAccountIdentifier,
-				InstrumentSymbol:                  incomingOrderSubmissionRequest.InstrumentSymbol,
-				MatchingEngineOrderSequenceNumber: acknowledgement.MatchingEngineOrderSequenceNumber,
-				OrderSideIsBuyNotSell:             &incomingOrderSubmissionRequest.OrderSideIsBuyNotSell,
-				OrderQuantity:                     incomingOrderSubmissionRequest.OrderQuantity,
-				LimitPriceInMinorUnits:            incomingOrderSubmissionRequest.LimitPriceInMinorUnits,
-				OrderIsMarketOrderNotLimit:        incomingOrderSubmissionRequest.OrderIsMarketOrderNotLimit,
+				EventType:                           audittrail.EventOrderRoutedToMatchingEngine,
+				ClientAccountIdentifier:             incomingOrderSubmissionRequest.ClientAccountIdentifier,
+				InstrumentSymbol:                    incomingOrderSubmissionRequest.InstrumentSymbol,
+				MatchingEngineOrderSequenceNumber:   acknowledgement.MatchingEngineOrderSequenceNumber,
+				OrderSideIsBuyNotSell:               &incomingOrderSubmissionRequest.OrderSideIsBuyNotSell,
+				OrderQuantity:                       incomingOrderSubmissionRequest.OrderQuantity,
+				LimitPriceInMinorUnits:              incomingOrderSubmissionRequest.LimitPriceInMinorUnits,
+				OrderIsMarketOrderNotLimit:          incomingOrderSubmissionRequest.OrderIsMarketOrderNotLimit,
+				AuthenticatedActorAccountIdentifier: authenticatedActorAccountIdentifier,
 			})
 		}
 		for _, tradeExecutionWireEvent := range matchingEngineResponse.TradeExecutionEvents {
@@ -1336,10 +1554,11 @@ func processOrderSubmission(
 					tradeExecutionWireEvent.BuyingClientAccountId,
 					tradeExecutionWireEvent.SellingClientAccountId,
 				),
-				BuyingClientAccountIdentifier:  tradeExecutionWireEvent.BuyingClientAccountId,
-				SellingClientAccountIdentifier: tradeExecutionWireEvent.SellingClientAccountId,
-				ExecutedPriceInMinorUnits:      tradeExecutionWireEvent.ExecutedPriceInMinorUnits,
-				ExecutedQuantity:               tradeExecutionWireEvent.ExecutedQuantity,
+				BuyingClientAccountIdentifier:       tradeExecutionWireEvent.BuyingClientAccountId,
+				SellingClientAccountIdentifier:      tradeExecutionWireEvent.SellingClientAccountId,
+				ExecutedPriceInMinorUnits:           tradeExecutionWireEvent.ExecutedPriceInMinorUnits,
+				ExecutedQuantity:                    tradeExecutionWireEvent.ExecutedQuantity,
+				AuthenticatedActorAccountIdentifier: authenticatedActorAccountIdentifier,
 			})
 		}
 	}
@@ -1390,6 +1609,9 @@ func buildPositionsHandler(positionBook *positions.PositionBook) http.HandlerFun
 		accountIdentifier := request.URL.Query().Get("accountId")
 		if accountIdentifier == "" {
 			http.Error(responseWriter, "missing accountId query parameter", http.StatusBadRequest)
+			return
+		}
+		if !authenticatedAccountMatches(responseWriter, request, accountIdentifier) {
 			return
 		}
 
@@ -1502,6 +1724,9 @@ func buildGetCorporateActionsHoldingHandler(holdingsBook *corporateactionsproces
 		instrumentSymbol := request.URL.Query().Get("instrument")
 		if accountIdentifier == "" || instrumentSymbol == "" {
 			http.Error(responseWriter, "accountId and instrument query parameters are both required", http.StatusBadRequest)
+			return
+		}
+		if !authenticatedAccountMatches(responseWriter, request, accountIdentifier) {
 			return
 		}
 		holding, exists := holdingsBook.GetHolding(accountIdentifier, instrumentSymbol)
@@ -1628,6 +1853,9 @@ func buildProcessedCorporateActionsHandler(holdingsBook *corporateactionsprocess
 			http.Error(responseWriter, "missing accountId query parameter", http.StatusBadRequest)
 			return
 		}
+		if !authenticatedAccountMatches(responseWriter, request, accountIdentifier) {
+			return
+		}
 		respondWithJson(responseWriter, http.StatusOK, map[string]any{
 			"accountIdentifier": accountIdentifier,
 			"processedActions":  holdingsBook.ProcessedActionsForAccount(accountIdentifier),
@@ -1648,6 +1876,9 @@ func buildFractionalPaperPositionsHandler(milliSharePaperPositionBook *fractiona
 		accountIdentifier := request.URL.Query().Get("accountId")
 		if accountIdentifier == "" {
 			http.Error(responseWriter, "missing accountId query parameter", http.StatusBadRequest)
+			return
+		}
+		if !authenticatedAccountMatches(responseWriter, request, accountIdentifier) {
 			return
 		}
 
@@ -1688,6 +1919,7 @@ func buildCancelOrderHandler(matchingEngineClient *matchingengineclient.Matching
 			http.Error(responseWriter, fmt.Sprintf("malformed cancel request: %v", decodeError), http.StatusBadRequest)
 			return
 		}
+		cancelActor := authenticatedActorAccountIdentifierOrEmpty(request)
 
 		matchingEngineResponse, cancelError := matchingEngineClient.CancelOrderAndAwaitResult(
 			cancelRequest.InstrumentSymbol,
@@ -1703,10 +1935,11 @@ func buildCancelOrderHandler(matchingEngineClient *matchingengineclient.Matching
 			// stays available in the logs/audit trail for diagnostics.
 			log.Printf("matching-engine cancel hand-off failed for order %d: %v", cancelRequest.MatchingEngineOrderSequenceNumber, cancelError)
 			auditTrail.Append(audittrail.Entry{
-				EventType:                         audittrail.EventOrderCancelFailed,
-				InstrumentSymbol:                  cancelRequest.InstrumentSymbol,
-				MatchingEngineOrderSequenceNumber: cancelRequest.MatchingEngineOrderSequenceNumber,
-				DetailMessage:                     cancelError.Error(),
+				EventType:                           audittrail.EventOrderCancelFailed,
+				InstrumentSymbol:                    cancelRequest.InstrumentSymbol,
+				MatchingEngineOrderSequenceNumber:   cancelRequest.MatchingEngineOrderSequenceNumber,
+				DetailMessage:                       cancelError.Error(),
+				AuthenticatedActorAccountIdentifier: cancelActor,
 			})
 			respondWithJson(responseWriter, http.StatusOK, orders.CancelOrderResponse{
 				WasOrderCancelled: false,
@@ -1719,19 +1952,21 @@ func buildCancelOrderHandler(matchingEngineClient *matchingengineclient.Matching
 		const orderNotFoundReason = "No matching order was found to cancel — it may have already fully filled, already been cancelled, or never existed."
 		if wasOrderCancelled {
 			auditTrail.Append(audittrail.Entry{
-				EventType:                         audittrail.EventOrderCancelled,
-				InstrumentSymbol:                  cancelRequest.InstrumentSymbol,
-				MatchingEngineOrderSequenceNumber: cancelRequest.MatchingEngineOrderSequenceNumber,
+				EventType:                           audittrail.EventOrderCancelled,
+				InstrumentSymbol:                    cancelRequest.InstrumentSymbol,
+				MatchingEngineOrderSequenceNumber:   cancelRequest.MatchingEngineOrderSequenceNumber,
+				AuthenticatedActorAccountIdentifier: cancelActor,
 			})
 			respondWithJson(responseWriter, http.StatusOK, orders.CancelOrderResponse{WasOrderCancelled: true})
 			return
 		}
 
 		auditTrail.Append(audittrail.Entry{
-			EventType:                         audittrail.EventOrderCancelFailed,
-			InstrumentSymbol:                  cancelRequest.InstrumentSymbol,
-			MatchingEngineOrderSequenceNumber: cancelRequest.MatchingEngineOrderSequenceNumber,
-			DetailMessage:                     orderNotFoundReason,
+			EventType:                           audittrail.EventOrderCancelFailed,
+			InstrumentSymbol:                    cancelRequest.InstrumentSymbol,
+			MatchingEngineOrderSequenceNumber:   cancelRequest.MatchingEngineOrderSequenceNumber,
+			DetailMessage:                       orderNotFoundReason,
+			AuthenticatedActorAccountIdentifier: cancelActor,
 		})
 		// Previously this branch left ErrorMessage empty on the actual
 		// client-facing response — the plain-language reason only ever
@@ -1784,6 +2019,9 @@ func buildCoverOrderHandler(dependencies orderSubmissionDependencies) http.Handl
 			http.Error(responseWriter, "malformed cover order payload", http.StatusBadRequest)
 			return
 		}
+		if !authenticatedAccountMatches(responseWriter, request, coverOrderRequest.ClientAccountIdentifier) {
+			return
+		}
 
 		entryAcknowledgement := processOrderSubmission(dependencies, orders.OrderSubmissionRequest{
 			ClientAccountIdentifier:    coverOrderRequest.ClientAccountIdentifier,
@@ -1792,7 +2030,7 @@ func buildCoverOrderHandler(dependencies orderSubmissionDependencies) http.Handl
 			OrderIsMarketOrderNotLimit: coverOrderRequest.OrderIsMarketOrderNotLimit,
 			LimitPriceInMinorUnits:     coverOrderRequest.LimitPriceInMinorUnits,
 			OrderQuantity:              coverOrderRequest.OrderQuantity,
-		})
+		}, authenticatedActorAccountIdentifierOrEmpty(request))
 
 		coverOrderResponse := orders.CoverOrderResponse{EntryOrderAcknowledgement: entryAcknowledgement}
 
@@ -1827,34 +2065,38 @@ func buildCoverOrderHandler(dependencies orderSubmissionDependencies) http.Handl
 			},
 		)
 
+		coverOrderActor := authenticatedActorAccountIdentifierOrEmpty(request)
 		switch {
 		case protectiveLegError != nil:
 			log.Printf("COVER ORDER PROTECTIVE LEG FAILED for %s on %s — position is OPEN and UNPROTECTED: %v", coverOrderRequest.ClientAccountIdentifier, coverOrderRequest.InstrumentSymbol, protectiveLegError)
 			coverOrderResponse.ProtectiveStopOrderError = protectiveLegError.Error()
 			dependencies.auditTrail.Append(audittrail.Entry{
-				EventType:               audittrail.EventCoverProtectiveLegFailed,
-				ClientAccountIdentifier: coverOrderRequest.ClientAccountIdentifier,
-				InstrumentSymbol:        coverOrderRequest.InstrumentSymbol,
-				DetailMessage:           protectiveLegError.Error(),
+				EventType:                           audittrail.EventCoverProtectiveLegFailed,
+				ClientAccountIdentifier:             coverOrderRequest.ClientAccountIdentifier,
+				InstrumentSymbol:                    coverOrderRequest.InstrumentSymbol,
+				DetailMessage:                       protectiveLegError.Error(),
+				AuthenticatedActorAccountIdentifier: coverOrderActor,
 			})
 		case matchingEngineResponse.ErrorMessage != nil:
 			log.Printf("COVER ORDER PROTECTIVE LEG REJECTED for %s on %s — position is OPEN and UNPROTECTED: %s", coverOrderRequest.ClientAccountIdentifier, coverOrderRequest.InstrumentSymbol, *matchingEngineResponse.ErrorMessage)
 			coverOrderResponse.ProtectiveStopOrderError = *matchingEngineResponse.ErrorMessage
 			dependencies.auditTrail.Append(audittrail.Entry{
-				EventType:               audittrail.EventCoverProtectiveLegFailed,
-				ClientAccountIdentifier: coverOrderRequest.ClientAccountIdentifier,
-				InstrumentSymbol:        coverOrderRequest.InstrumentSymbol,
-				DetailMessage:           *matchingEngineResponse.ErrorMessage,
+				EventType:                           audittrail.EventCoverProtectiveLegFailed,
+				ClientAccountIdentifier:             coverOrderRequest.ClientAccountIdentifier,
+				InstrumentSymbol:                    coverOrderRequest.InstrumentSymbol,
+				DetailMessage:                       *matchingEngineResponse.ErrorMessage,
+				AuthenticatedActorAccountIdentifier: coverOrderActor,
 			})
 		default:
 			if matchingEngineResponse.AssignedOrderSequenceNumber != nil {
 				coverOrderResponse.ProtectiveStopOrderSequenceNumber = *matchingEngineResponse.AssignedOrderSequenceNumber
 			}
 			dependencies.auditTrail.Append(audittrail.Entry{
-				EventType:                         audittrail.EventCoverProtectiveLegPlaced,
-				ClientAccountIdentifier:           coverOrderRequest.ClientAccountIdentifier,
-				InstrumentSymbol:                  coverOrderRequest.InstrumentSymbol,
-				MatchingEngineOrderSequenceNumber: coverOrderResponse.ProtectiveStopOrderSequenceNumber,
+				EventType:                           audittrail.EventCoverProtectiveLegPlaced,
+				ClientAccountIdentifier:             coverOrderRequest.ClientAccountIdentifier,
+				InstrumentSymbol:                    coverOrderRequest.InstrumentSymbol,
+				MatchingEngineOrderSequenceNumber:   coverOrderResponse.ProtectiveStopOrderSequenceNumber,
+				AuthenticatedActorAccountIdentifier: coverOrderActor,
 			})
 		}
 
@@ -1947,7 +2189,7 @@ func buildMarketSessionCloseHandler(marketSession *marketsession.MarketSessionSt
 	return func(responseWriter http.ResponseWriter, request *http.Request) {
 		marketSession.SetMarketOpen(false)
 		log.Printf("market session CLOSED")
-		auditTrail.Append(audittrail.Entry{EventType: audittrail.EventMarketSessionClosed})
+		auditTrail.Append(audittrail.Entry{EventType: audittrail.EventMarketSessionClosed, AuthenticatedActorAccountIdentifier: authenticatedActorAccountIdentifierOrEmpty(request)})
 		respondWithJson(responseWriter, http.StatusOK, map[string]any{"isMarketOpen": false})
 	}
 }
@@ -1973,14 +2215,21 @@ func buildMarketSessionOpenHandler(
 ) http.HandlerFunc {
 	return func(responseWriter http.ResponseWriter, request *http.Request) {
 		marketSession.SetMarketOpen(true)
-		dependencies.auditTrail.Append(audittrail.Entry{EventType: audittrail.EventMarketSessionOpened})
+		dependencies.auditTrail.Append(audittrail.Entry{EventType: audittrail.EventMarketSessionOpened, AuthenticatedActorAccountIdentifier: authenticatedActorAccountIdentifierOrEmpty(request)})
 
 		drainedRequests := afterMarketOrderQueue.DrainAll()
 		log.Printf("market session OPENED — draining %d queued after-market order(s)", len(drainedRequests))
 
+		// The authenticated actor recorded on every drained order's audit
+		// entries below is the ADMIN who triggered THIS market-open call —
+		// not each queued order's original submitter (that information
+		// isn't retained by afterMarketOrderQueue; see its own doc
+		// comment). Honest, not a guess: an AMO drain really is one
+		// authenticated admin action replaying N previously-queued orders.
+		drainTriggeringActor := authenticatedActorAccountIdentifierOrEmpty(request)
 		processedAcknowledgements := make([]orders.OrderAcknowledgementResponse, 0, len(drainedRequests))
 		for _, queuedRequest := range drainedRequests {
-			acknowledgement := processOrderSubmission(dependencies, queuedRequest)
+			acknowledgement := processOrderSubmission(dependencies, queuedRequest, drainTriggeringActor)
 			processedAcknowledgements = append(processedAcknowledgements, acknowledgement)
 		}
 
@@ -2119,6 +2368,9 @@ func buildConversationalOrderParseHandler() http.HandlerFunc {
 
 		response := conversationalOrderParseResponse{ParsedIntent: parsedIntent}
 		if parseRequest.ClientAccountIdentifier != "" {
+			if !authenticatedAccountMatches(responseWriter, request, parseRequest.ClientAccountIdentifier) {
+				return
+			}
 			builtRequest := parsedIntent.ToOrderSubmissionRequest(parseRequest.ClientAccountIdentifier)
 			response.OrderSubmissionRequest = &builtRequest
 		}
@@ -2173,8 +2425,11 @@ func buildConversationalOrderConfirmAndSubmitHandler(dependencies orderSubmissio
 			)
 			return
 		}
+		if !authenticatedAccountMatches(responseWriter, request, confirmRequest.OrderSubmissionRequest.ClientAccountIdentifier) {
+			return
+		}
 
-		acknowledgement := processOrderSubmission(dependencies, confirmRequest.OrderSubmissionRequest)
+		acknowledgement := processOrderSubmission(dependencies, confirmRequest.OrderSubmissionRequest, authenticatedActorAccountIdentifierOrEmpty(request))
 		respondWithJson(responseWriter, http.StatusOK, acknowledgement)
 	}
 }
@@ -2202,6 +2457,41 @@ func buildOrderReconcileHandler(idempotencyStore *idempotency.IdempotencyStore) 
 		}
 		respondWithJson(responseWriter, http.StatusOK, idempotencyStore.Reconcile(idempotencyKey))
 	}
+}
+
+// authenticatedAccountMatches is the shared "you can only act on your own
+// account" check every authenticated-retail handler that carries a
+// client account identifier (in its body or a query param) runs BEFORE
+// doing anything else. Returns true (and writes nothing) if the
+// authenticated caller's own account id matches requestedAccountIdentifier;
+// otherwise writes a 403 JSON error and returns false, so the caller can
+// simply `if !authenticatedAccountMatches(...) { return }`.
+//
+// An empty requestedAccountIdentifier never matches — every route this
+// helper guards already requires a non-empty account id for its own
+// business logic to make sense, so treating "" as "no check needed" would
+// silently skip the check on a malformed/empty request instead of
+// rejecting it.
+// authenticatedActorAccountIdentifierOrEmpty extracts the real
+// authenticated caller for a processOrderSubmission call site that has a
+// live *http.Request in scope — used everywhere except the two genuinely
+// non-per-request-authenticated internal callers (dmaOrderSubmitFunc,
+// submitReducingOrderFunc), which pass "" directly instead. See
+// processOrderSubmission's own doc comment.
+func authenticatedActorAccountIdentifierOrEmpty(request *http.Request) string {
+	authenticatedActorAccountIdentifier, _ := authmiddleware.AuthenticatedAccountIdentifier(request)
+	return authenticatedActorAccountIdentifier
+}
+
+func authenticatedAccountMatches(responseWriter http.ResponseWriter, request *http.Request, requestedAccountIdentifier string) bool {
+	authenticatedAccountIdentifier, _ := authmiddleware.AuthenticatedAccountIdentifier(request)
+	if requestedAccountIdentifier == "" || authenticatedAccountIdentifier != requestedAccountIdentifier {
+		respondWithJson(responseWriter, http.StatusForbidden, map[string]string{
+			"errorMessage": "you can only act on your own account",
+		})
+		return false
+	}
+	return true
 }
 
 func respondWithJson(responseWriter http.ResponseWriter, httpStatusCode int, responseBody any) {
@@ -2293,6 +2583,9 @@ func buildPledgeHoldingHandler(
 			http.Error(responseWriter, "malformed pledge request", http.StatusBadRequest)
 			return
 		}
+		if !authenticatedAccountMatches(responseWriter, request, wireRequest.ClientAccountIdentifier) {
+			return
+		}
 
 		currentNetHoldingQuantity := positionBook.PositionsForAccount(wireRequest.ClientAccountIdentifier)[wireRequest.InstrumentSymbol]
 
@@ -2360,6 +2653,9 @@ func buildUnpledgeHoldingHandler(
 			http.Error(responseWriter, "malformed unpledge request", http.StatusBadRequest)
 			return
 		}
+		if !authenticatedAccountMatches(responseWriter, request, wireRequest.ClientAccountIdentifier) {
+			return
+		}
 
 		marginValueReleased, unpledgeError := pledgeBook.UnpledgeHolding(
 			wireRequest.ClientAccountIdentifier,
@@ -2406,6 +2702,9 @@ func buildSetUtilizedMarginHandler(pledgeBook *marginpledge.PledgeBook) http.Han
 			http.Error(responseWriter, "malformed set-utilized-margin request", http.StatusBadRequest)
 			return
 		}
+		if !authenticatedAccountMatches(responseWriter, request, wireRequest.ClientAccountIdentifier) {
+			return
+		}
 
 		pledgeBook.SetUtilizedMarginInMinorUnits(wireRequest.ClientAccountIdentifier, wireRequest.UtilizedMarginInMinorUnits)
 		respondWithJson(responseWriter, http.StatusOK, map[string]any{
@@ -2422,6 +2721,9 @@ func buildPledgesForAccountHandler(pledgeBook *marginpledge.PledgeBook) http.Han
 		accountIdentifier := request.URL.Query().Get("accountId")
 		if accountIdentifier == "" {
 			http.Error(responseWriter, "missing accountId query parameter", http.StatusBadRequest)
+			return
+		}
+		if !authenticatedAccountMatches(responseWriter, request, accountIdentifier) {
 			return
 		}
 		respondWithJson(responseWriter, http.StatusOK, map[string]any{
@@ -2535,6 +2837,9 @@ func buildMarginFundingRequestHandler(
 			http.Error(responseWriter, "malformed margin-funding request", http.StatusBadRequest)
 			return
 		}
+		if !authenticatedAccountMatches(responseWriter, request, wireRequest.ClientAccountIdentifier) {
+			return
+		}
 
 		pledgedMarginValue := pledgeBook.TotalPledgedMarginValueForAccount(wireRequest.ClientAccountIdentifier)
 
@@ -2610,6 +2915,9 @@ func buildMarginFundingInterestCostHandler(fundingBook *marginfunding.FundingBoo
 			http.Error(responseWriter, "accountId query parameter is required", http.StatusBadRequest)
 			return
 		}
+		if !authenticatedAccountMatches(responseWriter, request, accountIdentifier) {
+			return
+		}
 		now := parseOptionalNowQueryParam(request)
 
 		projectDays := int64(30)
@@ -2647,6 +2955,9 @@ func buildMarginFundingStatusHandler(
 		accountIdentifier := request.URL.Query().Get("accountId")
 		if accountIdentifier == "" {
 			http.Error(responseWriter, "missing accountId query parameter", http.StatusBadRequest)
+			return
+		}
+		if !authenticatedAccountMatches(responseWriter, request, accountIdentifier) {
 			return
 		}
 
@@ -2710,6 +3021,9 @@ func buildLoanAgainstSecuritiesRequestHandler(
 		var wireRequest loanAgainstSecuritiesRequestWireRequest
 		if decodeError := json.NewDecoder(request.Body).Decode(&wireRequest); decodeError != nil {
 			http.Error(responseWriter, "malformed loan-against-securities request", http.StatusBadRequest)
+			return
+		}
+		if !authenticatedAccountMatches(responseWriter, request, wireRequest.ClientAccountIdentifier) {
 			return
 		}
 
@@ -2781,6 +3095,9 @@ func buildLoanAgainstSecuritiesRepayHandler(
 			http.Error(responseWriter, "malformed loan-against-securities repayment request", http.StatusBadRequest)
 			return
 		}
+		if !authenticatedAccountMatches(responseWriter, request, wireRequest.ClientAccountIdentifier) {
+			return
+		}
 
 		newOutstanding, repayError := loanBook.RepayLoan(wireRequest.ClientAccountIdentifier, wireRequest.AmountInMinorUnits)
 		if repayError != nil {
@@ -2820,6 +3137,9 @@ func buildLoanAgainstSecuritiesStatusHandler(
 		accountIdentifier := request.URL.Query().Get("accountId")
 		if accountIdentifier == "" {
 			http.Error(responseWriter, "missing accountId query parameter", http.StatusBadRequest)
+			return
+		}
+		if !authenticatedAccountMatches(responseWriter, request, accountIdentifier) {
 			return
 		}
 		loanRecord := loanBook.LoanRecordForAccount(accountIdentifier)
@@ -3334,6 +3654,9 @@ func buildExecuteMultiLegOptionsHandler(dependencies orderSubmissionDependencies
 			http.Error(responseWriter, "clientAccountIdentifier is required", http.StatusBadRequest)
 			return
 		}
+		if !authenticatedAccountMatches(responseWriter, request, wireRequest.ClientAccountIdentifier) {
+			return
+		}
 
 		// submitLeg: each leg reuses the EXACT SAME processOrderSubmission
 		// pipeline (KYC/freeze/risk/matching-engine/audit-trail) every
@@ -3341,6 +3664,7 @@ func buildExecuteMultiLegOptionsHandler(dependencies orderSubmissionDependencies
 		// nothing duplicated. See internal/multilegoptions' package doc
 		// for the "no real listed options instrument" scope boundary: a
 		// leg submits as an ordinary LIMIT order at its premium.
+		multiLegActor := authenticatedActorAccountIdentifierOrEmpty(request)
 		submitLeg := func(leg multilegoptions.Leg) (bool, string, error) {
 			acknowledgement := processOrderSubmission(dependencies, orders.OrderSubmissionRequest{
 				ClientAccountIdentifier: wireRequest.ClientAccountIdentifier,
@@ -3348,7 +3672,7 @@ func buildExecuteMultiLegOptionsHandler(dependencies orderSubmissionDependencies
 				OrderSideIsBuyNotSell:   leg.IsBuyNotSell,
 				LimitPriceInMinorUnits:  leg.PremiumInMinorUnits,
 				OrderQuantity:           leg.Quantity,
-			})
+			}, multiLegActor)
 			return acknowledgement.WasOrderAccepted, acknowledgement.HumanReadableRejectionReason, nil
 		}
 
@@ -3363,9 +3687,10 @@ func buildExecuteMultiLegOptionsHandler(dependencies orderSubmissionDependencies
 		}
 
 		dependencies.auditTrail.Append(audittrail.Entry{
-			EventType:               audittrail.EventOrderSubmitted,
-			ClientAccountIdentifier: wireRequest.ClientAccountIdentifier,
-			DetailMessage:           fmt.Sprintf("MULTI_LEG_STRATEGY_%s wasFullyExecuted=%v", wireRequest.Strategy, result.WasFullyExecuted),
+			EventType:                           audittrail.EventOrderSubmitted,
+			ClientAccountIdentifier:             wireRequest.ClientAccountIdentifier,
+			DetailMessage:                       fmt.Sprintf("MULTI_LEG_STRATEGY_%s wasFullyExecuted=%v", wireRequest.Strategy, result.WasFullyExecuted),
+			AuthenticatedActorAccountIdentifier: multiLegActor,
 		})
 
 		respondWithJson(responseWriter, http.StatusOK, result)
@@ -3392,7 +3717,11 @@ func buildExecuteBasketOrderHandler(dependencies orderSubmissionDependencies) ht
 			http.Error(responseWriter, "malformed basket order execution request", http.StatusBadRequest)
 			return
 		}
+		if !authenticatedAccountMatches(responseWriter, request, basketRequest.ClientAccountIdentifier) {
+			return
+		}
 
+		basketOrderActor := authenticatedActorAccountIdentifierOrEmpty(request)
 		submitConstituent := func(instrumentSymbol string, isBuyNotSell bool, quantity uint64) (bool, uint64, string, error) {
 			acknowledgement := processOrderSubmission(dependencies, orders.OrderSubmissionRequest{
 				ClientAccountIdentifier:    basketRequest.ClientAccountIdentifier,
@@ -3400,7 +3729,7 @@ func buildExecuteBasketOrderHandler(dependencies orderSubmissionDependencies) ht
 				OrderSideIsBuyNotSell:      isBuyNotSell,
 				OrderIsMarketOrderNotLimit: true,
 				OrderQuantity:              quantity,
-			})
+			}, basketOrderActor)
 			var filledQuantity uint64
 			for _, tradeExecutionSummary := range acknowledgement.TradeExecutionEvents {
 				filledQuantity += tradeExecutionSummary.ExecutedQuantity
@@ -3415,9 +3744,10 @@ func buildExecuteBasketOrderHandler(dependencies orderSubmissionDependencies) ht
 		}
 
 		dependencies.auditTrail.Append(audittrail.Entry{
-			EventType:               audittrail.EventOrderSubmitted,
-			ClientAccountIdentifier: basketRequest.ClientAccountIdentifier,
-			DetailMessage:           fmt.Sprintf("BASKET_ORDER_%s aggregateStatus=%s", basketRequest.BasketIdentifier, result.AggregateStatus),
+			EventType:                           audittrail.EventOrderSubmitted,
+			ClientAccountIdentifier:             basketRequest.ClientAccountIdentifier,
+			DetailMessage:                       fmt.Sprintf("BASKET_ORDER_%s aggregateStatus=%s", basketRequest.BasketIdentifier, result.AggregateStatus),
+			AuthenticatedActorAccountIdentifier: basketOrderActor,
 		})
 
 		respondWithJson(responseWriter, http.StatusOK, result)
@@ -3497,6 +3827,9 @@ func buildPortfolioStressTestHandler(positionBook *positions.PositionBook) http.
 		}
 		if wireRequest.ClientAccountIdentifier == "" {
 			http.Error(responseWriter, "clientAccountIdentifier is required", http.StatusBadRequest)
+			return
+		}
+		if !authenticatedAccountMatches(responseWriter, request, wireRequest.ClientAccountIdentifier) {
 			return
 		}
 
@@ -3607,6 +3940,9 @@ func buildLendSecurityHandler(desk *securitieslendingborrowing.Desk, positionBoo
 			http.Error(responseWriter, "malformed lend security request", http.StatusBadRequest)
 			return
 		}
+		if !authenticatedAccountMatches(responseWriter, request, wireRequest.ClientAccountIdentifier) {
+			return
+		}
 		currentNetHoldingQuantity := positionBook.PositionsForAccount(wireRequest.ClientAccountIdentifier)[wireRequest.InstrumentSymbol]
 		record, lendError := desk.LendSecurity(
 			wireRequest.ClientAccountIdentifier,
@@ -3641,6 +3977,9 @@ func buildRecallLendingHandler(desk *securitieslendingborrowing.Desk) http.Handl
 			http.Error(responseWriter, "malformed recall lending request", http.StatusBadRequest)
 			return
 		}
+		if !authenticatedAccountMatches(responseWriter, request, wireRequest.ClientAccountIdentifier) {
+			return
+		}
 		record, recallError := desk.RecallLending(wireRequest.ClientAccountIdentifier, wireRequest.InstrumentSymbol, wireRequest.Quantity)
 		if recallError != nil {
 			http.Error(responseWriter, recallError.Error(), http.StatusBadRequest)
@@ -3667,6 +4006,9 @@ func buildBorrowSecurityHandler(desk *securitieslendingborrowing.Desk) http.Hand
 		var wireRequest borrowSecurityWireRequest
 		if decodeError := json.NewDecoder(request.Body).Decode(&wireRequest); decodeError != nil {
 			http.Error(responseWriter, "malformed borrow security request", http.StatusBadRequest)
+			return
+		}
+		if !authenticatedAccountMatches(responseWriter, request, wireRequest.ClientAccountIdentifier) {
 			return
 		}
 		record, borrowError := desk.BorrowSecurity(
@@ -3701,6 +4043,9 @@ func buildReturnBorrowingHandler(desk *securitieslendingborrowing.Desk) http.Han
 			http.Error(responseWriter, "malformed return borrowing request", http.StatusBadRequest)
 			return
 		}
+		if !authenticatedAccountMatches(responseWriter, request, wireRequest.ClientAccountIdentifier) {
+			return
+		}
 		record, returnError := desk.ReturnBorrowing(wireRequest.ClientAccountIdentifier, wireRequest.InstrumentSymbol, wireRequest.Quantity)
 		if returnError != nil {
 			http.Error(responseWriter, returnError.Error(), http.StatusBadRequest)
@@ -3714,6 +4059,9 @@ func buildReturnBorrowingHandler(desk *securitieslendingborrowing.Desk) http.Han
 func buildSecuritiesLendingStatusHandler(desk *securitieslendingborrowing.Desk) http.HandlerFunc {
 	return func(responseWriter http.ResponseWriter, request *http.Request) {
 		accountIdentifier := request.URL.Query().Get("accountId")
+		if accountIdentifier != "" && !authenticatedAccountMatches(responseWriter, request, accountIdentifier) {
+			return
+		}
 		respondWithJson(responseWriter, http.StatusOK, map[string]interface{}{
 			"accountIdentifier": accountIdentifier,
 			"lendingRecords":    desk.LendingRecordsForAccount(accountIdentifier),
@@ -3746,6 +4094,9 @@ func buildSetDripToggleHandler(dripToggleRegistry *drip.ToggleRegistry) http.Han
 		var wireRequest setDripToggleWireRequest
 		if decodeError := json.NewDecoder(request.Body).Decode(&wireRequest); decodeError != nil {
 			http.Error(responseWriter, "malformed DRIP toggle request", http.StatusBadRequest)
+			return
+		}
+		if !authenticatedAccountMatches(responseWriter, request, wireRequest.ClientAccountIdentifier) {
 			return
 		}
 		dripToggleRegistry.SetAutoReinvest(wireRequest.ClientAccountIdentifier, wireRequest.Enabled)
@@ -3826,11 +4177,18 @@ func buildProcessDividendEventHandler(
 		wireResponse.WasLedgerCreditPosted = true
 		dependencies.preTradeRiskEngine.AdjustAvailableMarginInMinorUnits(wireRequest.ClientAccountIdentifier, cashCredited)
 
+		// /drip/process-dividend is RoleAdmin-gated (docs/BUILD_LOG.md's
+		// auth pass) — the authenticated actor recorded below is the
+		// admin/operator who processed this dividend event, not the
+		// account holder it was credited to (that's already
+		// ClientAccountIdentifier on this same entry).
+		dividendProcessingActor := authenticatedActorAccountIdentifierOrEmpty(request)
 		dependencies.auditTrail.Append(audittrail.Entry{
-			EventType:               audittrail.EventOrderSubmitted,
-			ClientAccountIdentifier: wireRequest.ClientAccountIdentifier,
-			InstrumentSymbol:        wireRequest.InstrumentSymbol,
-			DetailMessage:           fmt.Sprintf("DIVIDEND_CREDITED cashCreditedInMinorUnits=%d", cashCredited),
+			EventType:                           audittrail.EventOrderSubmitted,
+			ClientAccountIdentifier:             wireRequest.ClientAccountIdentifier,
+			InstrumentSymbol:                    wireRequest.InstrumentSymbol,
+			DetailMessage:                       fmt.Sprintf("DIVIDEND_CREDITED cashCreditedInMinorUnits=%d", cashCredited),
+			AuthenticatedActorAccountIdentifier: dividendProcessingActor,
 		})
 
 		if !dripToggleRegistry.IsAutoReinvestEnabled(wireRequest.ClientAccountIdentifier) {
@@ -3859,7 +4217,7 @@ func buildProcessDividendEventHandler(
 			OrderSideIsBuyNotSell:   true,
 			LimitPriceInMinorUnits:  wireRequest.ReinvestmentReferencePriceInMinorUnits,
 			OrderQuantity:           reinvestmentPlan.ReinvestmentQuantity,
-		})
+		}, dividendProcessingActor)
 		wireResponse.WasAutoReinvested = reinvestmentAcknowledgement.WasOrderAccepted
 		wireResponse.ReinvestmentOrder = &reinvestmentAcknowledgement
 
@@ -3945,6 +4303,9 @@ func buildFollowStrategyHandler(strategyFollowingRegistry *strategyfollowing.Reg
 			http.Error(responseWriter, "malformed follow request", http.StatusBadRequest)
 			return
 		}
+		if !authenticatedAccountMatches(responseWriter, request, wireRequest.AccountIdentifier) {
+			return
+		}
 
 		if followError := strategyFollowingRegistry.Follow(wireRequest.AccountIdentifier, wireRequest.StrategyIdentifier); followError != nil {
 			http.Error(responseWriter, followError.Error(), http.StatusBadRequest)
@@ -3971,6 +4332,9 @@ func buildUnfollowStrategyHandler(strategyFollowingRegistry *strategyfollowing.R
 		var wireRequest followStrategyWireRequest
 		if decodeError := json.NewDecoder(request.Body).Decode(&wireRequest); decodeError != nil {
 			http.Error(responseWriter, "malformed unfollow request", http.StatusBadRequest)
+			return
+		}
+		if !authenticatedAccountMatches(responseWriter, request, wireRequest.AccountIdentifier) {
 			return
 		}
 
@@ -4009,6 +4373,9 @@ func buildAccountFollowingHandler(strategyFollowingRegistry *strategyfollowing.R
 		accountIdentifier := request.URL.Query().Get("accountId")
 		if accountIdentifier == "" {
 			http.Error(responseWriter, "missing accountId query parameter", http.StatusBadRequest)
+			return
+		}
+		if !authenticatedAccountMatches(responseWriter, request, accountIdentifier) {
 			return
 		}
 
@@ -4075,6 +4442,9 @@ func buildMarkToMarketHandler(
 		accountIdentifier := request.URL.Query().Get("accountId")
 		if accountIdentifier == "" {
 			http.Error(responseWriter, "missing accountId query parameter", http.StatusBadRequest)
+			return
+		}
+		if !authenticatedAccountMatches(responseWriter, request, accountIdentifier) {
 			return
 		}
 
@@ -4149,6 +4519,9 @@ func buildAutoLiquidationStatusHandler(
 		accountIdentifier := request.URL.Query().Get("accountId")
 		if accountIdentifier == "" {
 			http.Error(responseWriter, "missing accountId query parameter", http.StatusBadRequest)
+			return
+		}
+		if !authenticatedAccountMatches(responseWriter, request, accountIdentifier) {
 			return
 		}
 
@@ -4268,6 +4641,9 @@ func buildExposureLimitsStatusHandler(exposureLimitsRegistry *exposurelimits.Lim
 		accountIdentifier := request.URL.Query().Get("accountId")
 		if accountIdentifier == "" {
 			http.Error(responseWriter, "missing accountId query parameter", http.StatusBadRequest)
+			return
+		}
+		if !authenticatedAccountMatches(responseWriter, request, accountIdentifier) {
 			return
 		}
 

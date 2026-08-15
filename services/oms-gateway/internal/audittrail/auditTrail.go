@@ -6,6 +6,7 @@
 package audittrail
 
 import (
+	"log"
 	"sync"
 	"time"
 )
@@ -78,6 +79,21 @@ type Entry struct {
 	MatchingEngineOrderSequenceNumber uint64    `json:"matchingEngineOrderSequenceNumber,omitempty"`
 	DetailMessage                     string    `json:"detailMessage,omitempty"`
 
+	// AuthenticatedActorAccountIdentifier is the REAL authenticated caller
+	// (authmiddleware.AuthenticatedAccountIdentifier(request)) — new this
+	// build, alongside real Postgres persistence (see
+	// docs/BUILD_LOG.md's Postgres-persistence entry). Distinct from
+	// ClientAccountIdentifier (the account the order/action is FOR — which
+	// authenticatedAccountMatches already guarantees equals the
+	// authenticated caller for a directly-submitted order): this field
+	// exists so an entry appended by an internal, non-per-request-
+	// authenticated caller (the DMA/FIX-style gateway, the auto-
+	// liquidation engine) is honestly distinguishable from one a real
+	// logged-in human triggered — empty ("") for the former, never
+	// guessed. Additive/omitempty — every entry appended before this
+	// field existed is completely unaffected.
+	AuthenticatedActorAccountIdentifier string `json:"authenticatedActorAccountIdentifier,omitempty"`
+
 	// The fields below are ADDITIVE (all omitempty; every pre-existing
 	// caller/entry that never sets them is completely unaffected) and
 	// exist so internal/tradesurveillance can compute real spoofing/
@@ -122,21 +138,27 @@ type Entry struct {
 	ExecutedQuantity               uint64 `json:"executedQuantity,omitempty"`
 }
 
-// AuditTrail is an append-only, in-memory log. "Immutable" here means:
-// no method on this type can modify or remove an entry once appended —
-// only Append (add) and the two read methods exist. That's a real
-// guarantee at the Go API level, not just a naming convention.
+// AuditTrail is an append-only log. "Immutable" here means: no method
+// on this type can modify or remove an entry once appended — only
+// Append (add) and the two read methods exist. That's a real guarantee
+// at the Go API level, not just a naming convention.
 //
-// TODO(real build): in-memory only — an oms-gateway restart loses the
-// entire audit trail, which is disqualifying for anything actually
-// regulated. A real build needs this backed by an actual
-// append-only/WORM store (e.g. a dedicated audit log table with no
-// UPDATE/DELETE grants, or an event log like Kafka with infinite
-// retention) that survives a restart and can't be tampered with even by
-// this service's own operators.
+// Real Postgres persistence (docs/BUILD_LOG.md's Postgres-persistence
+// entry): when constructed via NewPostgresBackedAuditTrail
+// (postgresBacking.go, same package), `postgres` is set and every
+// method below reads/writes real Postgres instead of the in-memory
+// `entries` slice — Postgres becomes the sole source of truth in that
+// mode, not a mirror. NewAuditTrail() (unchanged) leaves `postgres` nil
+// and behaves exactly as it always did — in-memory only, restart loses
+// everything, which is exactly the historical behavior this comment
+// used to describe as "disqualifying for anything actually regulated."
+// A real production deployment should always use the Postgres-backed
+// constructor; the in-memory one remains for tests and for a
+// Postgres-unreachable-at-startup fallback (see cmd/server/main.go).
 type AuditTrail struct {
 	mutexGuardingEntries sync.Mutex
 	entries              []Entry
+	postgres             *postgresBacking
 }
 
 func NewAuditTrail() *AuditTrail {
@@ -144,9 +166,19 @@ func NewAuditTrail() *AuditTrail {
 }
 
 // Append adds a new entry, stamped with the current time. There is no
-// corresponding Remove/Update — that's the whole point.
+// corresponding Remove/Update — that's the whole point. When Postgres-
+// backed, a write failure is logged-and-swallowed (matching this
+// method's pre-existing signature, which has no error return) rather
+// than panicking — see docs/BUILD_LOG.md's known-limitations list.
 func (trail *AuditTrail) Append(entry Entry) {
 	entry.RecordedAtTime = time.Now()
+
+	if trail.postgres != nil {
+		if insertError := trail.appendToPostgres(entry); insertError != nil {
+			log.Printf("audittrail: FAILED to persist entry to Postgres (event=%s account=%s): %v", entry.EventType, entry.ClientAccountIdentifier, insertError)
+		}
+		return
+	}
 
 	trail.mutexGuardingEntries.Lock()
 	defer trail.mutexGuardingEntries.Unlock()
@@ -156,6 +188,10 @@ func (trail *AuditTrail) Append(entry Entry) {
 // AllEntries returns every entry recorded so far, oldest first. Returns
 // a copy — callers can't mutate the trail's internal slice through it.
 func (trail *AuditTrail) AllEntries() []Entry {
+	if trail.postgres != nil {
+		return trail.allEntriesFromPostgres()
+	}
+
 	trail.mutexGuardingEntries.Lock()
 	defer trail.mutexGuardingEntries.Unlock()
 
@@ -168,6 +204,10 @@ func (trail *AuditTrail) AllEntries() []Entry {
 // Entries with no ClientAccountIdentifier (e.g. market-session events)
 // are never matched by this filter.
 func (trail *AuditTrail) EntriesForAccount(clientAccountIdentifier string) []Entry {
+	if trail.postgres != nil {
+		return trail.entriesForAccountFromPostgres(clientAccountIdentifier)
+	}
+
 	trail.mutexGuardingEntries.Lock()
 	defer trail.mutexGuardingEntries.Unlock()
 

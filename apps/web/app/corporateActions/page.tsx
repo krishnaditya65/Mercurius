@@ -29,8 +29,10 @@
 
 import { useState } from "react";
 import Link from "next/link";
+import { loadSession } from "../session/authSession";
 
 const omsGatewayBaseUrl = process.env.NEXT_PUBLIC_OMS_GATEWAY_BASE_URL ?? "http://localhost:8081";
+const LOG_IN_FIRST_MESSAGE = "Log in first from the dashboard's Account panel to use this.";
 
 type Holding = {
   clientAccountIdentifier: string;
@@ -76,9 +78,15 @@ export default function CorporateActionsPage() {
 
   async function refreshHolding() {
     setErrorMessage(null);
+    const storedSession = loadSession();
+    if (!storedSession?.accessToken) {
+      setErrorMessage(LOG_IN_FIRST_MESSAGE);
+      return;
+    }
     try {
       const httpResponse = await fetch(
-        `${omsGatewayBaseUrl}/corporate-actions/holdings?accountId=${encodeURIComponent(accountIdentifier)}&instrument=${encodeURIComponent(instrumentSymbol)}`
+        `${omsGatewayBaseUrl}/corporate-actions/holdings?accountId=${encodeURIComponent(accountIdentifier)}&instrument=${encodeURIComponent(instrumentSymbol)}`,
+        { headers: { Authorization: `Bearer ${storedSession.accessToken}` } }
       );
       if (!httpResponse.ok) {
         const bodyText = await httpResponse.text();
@@ -92,9 +100,15 @@ export default function CorporateActionsPage() {
   }
 
   async function refreshProcessedActions() {
+    const storedSession = loadSession();
+    if (!storedSession?.accessToken) {
+      setErrorMessage(LOG_IN_FIRST_MESSAGE);
+      return;
+    }
     try {
       const httpResponse = await fetch(
-        `${omsGatewayBaseUrl}/corporate-actions/processed-actions?accountId=${encodeURIComponent(accountIdentifier)}`
+        `${omsGatewayBaseUrl}/corporate-actions/processed-actions?accountId=${encodeURIComponent(accountIdentifier)}`,
+        { headers: { Authorization: `Bearer ${storedSession.accessToken}` } }
       );
       if (!httpResponse.ok) throw new Error(`HTTP ${httpResponse.status}`);
       const parsed: { accountIdentifier: string; processedActions: ProcessedAction[] | null } = await httpResponse.json();
@@ -109,12 +123,20 @@ export default function CorporateActionsPage() {
   }
 
   async function seedHolding() {
-    setIsSeeding(true);
     setSeedStatusMessage(null);
+    const storedSession = loadSession();
+    if (!storedSession?.accessToken) {
+      setSeedStatusMessage(LOG_IN_FIRST_MESSAGE);
+      return;
+    }
+    setIsSeeding(true);
     try {
       const httpResponse = await fetch(`${omsGatewayBaseUrl}/corporate-actions/holdings/seed`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${storedSession.accessToken}`,
+        },
         body: JSON.stringify({
           clientAccountIdentifier: accountIdentifier,
           instrumentSymbol,
@@ -134,9 +156,14 @@ export default function CorporateActionsPage() {
   }
 
   async function processAction() {
-    setIsProcessing(true);
     setErrorMessage(null);
     setLastProcessedResult(null);
+    const storedSession = loadSession();
+    if (!storedSession?.accessToken) {
+      setErrorMessage(LOG_IN_FIRST_MESSAGE);
+      return;
+    }
+    setIsProcessing(true);
     try {
       const requestBody: Record<string, unknown> = {
         actionType,
@@ -156,7 +183,10 @@ export default function CorporateActionsPage() {
 
       const httpResponse = await fetch(`${omsGatewayBaseUrl}/corporate-actions/process`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${storedSession.accessToken}`,
+        },
         body: JSON.stringify(requestBody),
       });
       const bodyText = await httpResponse.text();

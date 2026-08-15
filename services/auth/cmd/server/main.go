@@ -60,7 +60,17 @@ func main() {
 		log.Printf("AUTH_JWT_SIGNING_SECRET not set — using an insecure development default. Do not use this in production.")
 	}
 
+	// TODO(real build): same dev-only-default pattern as
+	// AUTH_JWT_SIGNING_SECRET above — a hardcoded fallback password is
+	// only acceptable for local development.
+	demoAccountPassword := os.Getenv("AUTH_DEMO_ACCOUNT_PASSWORD")
+	if demoAccountPassword == "" {
+		demoAccountPassword = "dev-only-insecure-demo-account-password"
+		log.Printf("AUTH_DEMO_ACCOUNT_PASSWORD not set — using an insecure development default for the seeded demo accounts. Do not use this in production.")
+	}
+
 	accounts := accountstore.NewAccountStore()
+	seedDemoAccounts(accounts, demoAccountPassword)
 	sessions := sessionstore.NewSessionStore(refreshTokenLifetime)
 	mfa := mfastate.NewMfaState()
 	loginRateLimiter := ratelimiter.NewRateLimiter(maxLoginAttemptsPerAccountPerWindow, rateLimitWindowDuration)
@@ -74,7 +84,7 @@ func main() {
 	})
 	httpRequestMultiplexer.HandleFunc("/auth/register", buildRegisterHandler(accounts, registerRateLimiter))
 	httpRequestMultiplexer.HandleFunc("/auth/login", buildLoginHandler(accounts, sessions, mfa, signingSecret, loginRateLimiter, loginAnomalyDetector))
-	httpRequestMultiplexer.HandleFunc("/auth/refresh", buildRefreshHandler(sessions, signingSecret))
+	httpRequestMultiplexer.HandleFunc("/auth/refresh", buildRefreshHandler(sessions, accounts, signingSecret))
 	httpRequestMultiplexer.HandleFunc("/auth/logout", buildLogoutHandler(sessions))
 	httpRequestMultiplexer.HandleFunc("/auth/mfa/enroll", buildMfaEnrollHandler(mfa, signingSecret))
 	httpRequestMultiplexer.HandleFunc("/auth/mfa/confirm-enrollment", buildMfaConfirmEnrollmentHandler(mfa, signingSecret))
@@ -89,6 +99,36 @@ func main() {
 	log.Printf("auth listening on %s (CORS wide open — see withPermissiveCorsForDevelopment)\n", listenAddress)
 	if serverStartupError := http.ListenAndServe(listenAddress, withPermissiveCorsForDevelopment(httplogging.WithRequestLogging(httpRequestMultiplexer))); serverStartupError != nil {
 		log.Fatalf("auth failed to start: %v", serverStartupError)
+	}
+}
+
+// demoSeedAccountIdentifiers are the SAME identifiers oms-gateway's
+// demoTrackedAccountIdentifiers / ledger's seeded accounts already use
+// (docs/DOCUMENTATION.md's oms-gateway/ledger sections) — reconciling
+// the account-identifier namespace split documented as a TODO
+// elsewhere in this package. Seeding them here means the existing demo
+// flows (an order ticket pre-filled with acct-001, etc.) can go through
+// a REAL login instead of being bypassed entirely now that other
+// services gate on a JWT.
+var demoSeedAccountIdentifiers = []string{"acct-001", "acct-002"}
+
+// seedDemoAccounts registers demoSeedAccountIdentifiers under a
+// well-known dev email/password so `curl`/apps/web can log in as one of
+// them directly. Both seeded accounts stay RoleRetail — admin-role
+// assignment has no seeding path in this build (out of scope; see
+// internal/accountstore's package doc). A failure here is logged, not
+// fatal — e.g. a restart during a test run that already seeded these
+// emails in a longer-lived store would otherwise crash startup for no
+// good reason (this store is in-memory and fresh per-process today, but
+// failing soft here costs nothing and avoids a future foot-gun).
+func seedDemoAccounts(accounts *accountstore.AccountStore, demoAccountPassword string) {
+	for _, accountIdentifier := range demoSeedAccountIdentifiers {
+		demoEmail := accountIdentifier + "@demo.mercurius.local"
+		if _, registerError := accounts.RegisterAccount(demoEmail, demoAccountPassword, accountIdentifier, jwtauth.RoleRetail); registerError != nil {
+			log.Printf("failed to seed demo account %s (%s): %v", accountIdentifier, demoEmail, registerError)
+			continue
+		}
+		log.Printf("seeded demo account %s (email=%s) for real login during local development", accountIdentifier, demoEmail)
 	}
 }
 
@@ -158,7 +198,7 @@ func buildRegisterHandler(accounts *accountstore.AccountStore, rateLimiter *rate
 		// verification (an unverified address can register and log in
 		// immediately) — see FEATURES.md §1's fuller scope.
 
-		accountIdentifier, registerError := accounts.RegisterAccount(wireRequest.Email, wireRequest.Password)
+		accountIdentifier, registerError := accounts.RegisterAccount(wireRequest.Email, wireRequest.Password, "", jwtauth.RoleRetail)
 		if registerError != nil {
 			respondWithJson(responseWriter, http.StatusConflict, registerWireResponse{ErrorMessage: registerError.Error()})
 			return
@@ -260,7 +300,7 @@ func buildLoginHandler(
 		// on every attempt, success or failure alike.
 		anomalyDetectionAccountKey := normalizeEmailForRateLimitKey(wireRequest.Email)
 
-		accountIdentifier, authError := accounts.AuthenticateWithPassword(wireRequest.Email, wireRequest.Password)
+		accountIdentifier, accountRole, authError := accounts.AuthenticateWithPassword(wireRequest.Email, wireRequest.Password)
 		if authError != nil {
 			recordLoginAttemptForAnomalyDetection(loginAnomalyDetector, anomalyDetectionAccountKey, wireRequest, false, now)
 			respondWithJson(responseWriter, http.StatusUnauthorized, authTokenWireResponse{ErrorMessage: "invalid email or password"})
@@ -290,7 +330,7 @@ func buildLoginHandler(
 				return
 			}
 		}
-		accessToken, tokenIssueError := jwtauth.IssueAccessToken(accountIdentifier, signingSecret, accessTokenLifetime, now)
+		accessToken, tokenIssueError := jwtauth.IssueAccessToken(accountIdentifier, accountRole, signingSecret, accessTokenLifetime, now)
 		if tokenIssueError != nil {
 			log.Printf("failed to issue access token for %s: %v", accountIdentifier, tokenIssueError)
 			http.Error(responseWriter, "failed to issue access token", http.StatusInternalServerError)
@@ -381,7 +421,7 @@ type refreshWireRequest struct {
 	RefreshToken string `json:"refreshToken"`
 }
 
-func buildRefreshHandler(sessions *sessionstore.SessionStore, signingSecret []byte) http.HandlerFunc {
+func buildRefreshHandler(sessions *sessionstore.SessionStore, accounts *accountstore.AccountStore, signingSecret []byte) http.HandlerFunc {
 	return func(responseWriter http.ResponseWriter, request *http.Request) {
 		if request.Method != http.MethodPost {
 			http.Error(responseWriter, "only POST is supported", http.StatusMethodNotAllowed)
@@ -416,7 +456,20 @@ func buildRefreshHandler(sessions *sessionstore.SessionStore, signingSecret []by
 			return
 		}
 
-		newAccessToken, tokenIssueError := jwtauth.IssueAccessToken(rotationResult.AccountIdentifier, signingSecret, accessTokenLifetime, now)
+		// The refresh token itself only carries an account identifier
+		// (internal/sessionstore's RotationResult), not a role — look the
+		// account's current role up fresh from accountstore rather than
+		// caching it anywhere on the session, so a role change (were one
+		// ever possible in this build — see accountstore's doc) would
+		// take effect on the very next refresh. An unknown identifier
+		// here would mean a session survived its account being deleted,
+		// which can't happen in this in-memory, non-deleting build; falls
+		// back to RoleRetail defensively rather than failing the refresh.
+		accountRole, roleWasFound := accounts.RoleForAccountIdentifier(rotationResult.AccountIdentifier)
+		if !roleWasFound {
+			accountRole = jwtauth.RoleRetail
+		}
+		newAccessToken, tokenIssueError := jwtauth.IssueAccessToken(rotationResult.AccountIdentifier, accountRole, signingSecret, accessTokenLifetime, now)
 		if tokenIssueError != nil {
 			log.Printf("failed to issue access token on refresh for %s: %v", rotationResult.AccountIdentifier, tokenIssueError)
 			http.Error(responseWriter, "failed to issue access token", http.StatusInternalServerError)

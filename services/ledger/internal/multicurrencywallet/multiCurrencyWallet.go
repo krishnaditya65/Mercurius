@@ -16,7 +16,7 @@
 // exists here.
 //
 // Design: each (accountIdentifier, currencyCode) pair is its own ledger
-// account inside the SAME shared *doubleentry.InMemoryDoubleEntryLedgerBook
+// account inside the SAME shared doubleentry.LedgerBook
 // everything else in this service uses — real doubleentry-backed numbers,
 // not a fabricated multiplier applied on top of one balance. The
 // account's NATIVE currency (INR, by convention matching every other
@@ -164,12 +164,12 @@ type CurrencyConversionResult struct {
 }
 
 // MultiCurrencyWalletRegistry is safe for concurrent use. It shares the
-// SAME *doubleentry.InMemoryDoubleEntryLedgerBook and
+// SAME doubleentry.LedgerBook and
 // *fundsegregation.SegregationGuard the rest of this service uses —
 // every wallet balance is a real, doubleentry-backed number, not a
 // parallel bookkeeping system.
 type MultiCurrencyWalletRegistry struct {
-	ledgerBook       *doubleentry.InMemoryDoubleEntryLedgerBook
+	ledgerBook       doubleentry.LedgerBook
 	segregationGuard *fundsegregation.SegregationGuard
 	fxRateTable      *FxRateTable
 
@@ -192,7 +192,7 @@ type MultiCurrencyWalletRegistry struct {
 // can tell wallet-layer plumbing apart from the pre-existing accounting
 // core's own clearing accounts at a glance.
 func NewMultiCurrencyWalletRegistry(
-	ledgerBook *doubleentry.InMemoryDoubleEntryLedgerBook,
+	ledgerBook doubleentry.LedgerBook,
 	segregationGuard *fundsegregation.SegregationGuard,
 	custodyPoolAccountId string,
 	walletExternalCashSuspenseAccountId string,

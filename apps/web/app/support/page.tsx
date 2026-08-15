@@ -29,8 +29,10 @@
 
 import { useState } from "react";
 import Link from "next/link";
+import { loadSession } from "../session/authSession";
 
 const backofficeBaseUrl = process.env.NEXT_PUBLIC_BACKOFFICE_BASE_URL ?? "http://localhost:8084";
+const LOG_IN_FIRST_MESSAGE = "Log in first from the dashboard's Account panel to use this.";
 
 type SupportTicketSummary = {
   ticketIdentifier: string;
@@ -78,9 +80,15 @@ export default function SupportTicketingPage() {
 
   async function refreshMyTickets() {
     setErrorMessage(null);
+    const storedSession = loadSession();
+    if (!storedSession?.accessToken) {
+      setErrorMessage(LOG_IN_FIRST_MESSAGE);
+      return;
+    }
     try {
       const httpResponse = await fetch(
-        `${backofficeBaseUrl}/support/tickets/by-account?accountId=${encodeURIComponent(accountIdentifier)}`
+        `${backofficeBaseUrl}/support/tickets/by-account?accountId=${encodeURIComponent(accountIdentifier)}`,
+        { headers: { Authorization: `Bearer ${storedSession.accessToken}` } }
       );
       if (!httpResponse.ok) throw new Error(`HTTP ${httpResponse.status}`);
       const parsed: { accountIdentifier: string; tickets: SupportTicketSummary[] } = await httpResponse.json();
@@ -96,10 +104,16 @@ export default function SupportTicketingPage() {
 
   async function refreshThread(ticketIdentifier: string) {
     setSelectedTicketIdentifier(ticketIdentifier);
+    const storedSession = loadSession();
+    if (!storedSession?.accessToken) {
+      setErrorMessage(LOG_IN_FIRST_MESSAGE);
+      return;
+    }
     setIsLoadingThread(true);
     try {
       const httpResponse = await fetch(
-        `${backofficeBaseUrl}/support/tickets/thread?ticketId=${encodeURIComponent(ticketIdentifier)}`
+        `${backofficeBaseUrl}/support/tickets/thread?ticketId=${encodeURIComponent(ticketIdentifier)}`,
+        { headers: { Authorization: `Bearer ${storedSession.accessToken}` } }
       );
       if (!httpResponse.ok) throw new Error(`HTTP ${httpResponse.status}`);
       const parsed: { ticketIdentifier: string; messages: SupportTicketMessage[] } = await httpResponse.json();
@@ -112,12 +126,20 @@ export default function SupportTicketingPage() {
   }
 
   async function createTicket() {
-    setIsCreatingTicket(true);
     setCreateStatusMessage(null);
+    const storedSession = loadSession();
+    if (!storedSession?.accessToken) {
+      setCreateStatusMessage(LOG_IN_FIRST_MESSAGE);
+      return;
+    }
+    setIsCreatingTicket(true);
     try {
       const httpResponse = await fetch(`${backofficeBaseUrl}/support/tickets/create`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${storedSession.accessToken}`,
+        },
         body: JSON.stringify({
           accountIdentifier,
           subject: newTicketSubject,
@@ -138,11 +160,19 @@ export default function SupportTicketingPage() {
 
   async function sendCustomerReply() {
     if (!selectedTicketIdentifier || !customerReplyBody.trim()) return;
+    const storedSession = loadSession();
+    if (!storedSession?.accessToken) {
+      setErrorMessage(LOG_IN_FIRST_MESSAGE);
+      return;
+    }
     setIsSendingCustomerReply(true);
     try {
       const httpResponse = await fetch(`${backofficeBaseUrl}/support/tickets/customer-message`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${storedSession.accessToken}`,
+        },
         body: JSON.stringify({
           ticketIdentifier: selectedTicketIdentifier,
           accountIdentifier,
@@ -161,11 +191,19 @@ export default function SupportTicketingPage() {
 
   async function sendAgentReply() {
     if (!selectedTicketIdentifier || !agentReplyBody.trim()) return;
+    const storedSession = loadSession();
+    if (!storedSession?.accessToken) {
+      setErrorMessage(LOG_IN_FIRST_MESSAGE);
+      return;
+    }
     setIsSendingAgentReply(true);
     try {
       const httpResponse = await fetch(`${backofficeBaseUrl}/support/tickets/agent-reply`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${storedSession.accessToken}`,
+        },
         body: JSON.stringify({
           ticketIdentifier: selectedTicketIdentifier,
           agentIdentifier,
@@ -184,10 +222,18 @@ export default function SupportTicketingPage() {
 
   async function setTicketStatus(newStatus: string) {
     if (!selectedTicketIdentifier) return;
+    const storedSession = loadSession();
+    if (!storedSession?.accessToken) {
+      setErrorMessage(LOG_IN_FIRST_MESSAGE);
+      return;
+    }
     try {
       const httpResponse = await fetch(`${backofficeBaseUrl}/support/tickets/status`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${storedSession.accessToken}`,
+        },
         body: JSON.stringify({ ticketIdentifier: selectedTicketIdentifier, newStatus }),
       });
       const bodyText = await httpResponse.text();
@@ -199,9 +245,16 @@ export default function SupportTicketingPage() {
   }
 
   async function refreshAgentQueue() {
+    const storedSession = loadSession();
+    if (!storedSession?.accessToken) {
+      setErrorMessage(LOG_IN_FIRST_MESSAGE);
+      return;
+    }
     setIsLoadingQueue(true);
     try {
-      const httpResponse = await fetch(`${backofficeBaseUrl}/support/tickets/queue?all=true`);
+      const httpResponse = await fetch(`${backofficeBaseUrl}/support/tickets/queue?all=true`, {
+        headers: { Authorization: `Bearer ${storedSession.accessToken}` },
+      });
       if (!httpResponse.ok) throw new Error(`HTTP ${httpResponse.status}`);
       const parsed: { tickets: SupportTicketSummary[] } = await httpResponse.json();
       setAgentTicketQueue(parsed.tickets ?? []);
