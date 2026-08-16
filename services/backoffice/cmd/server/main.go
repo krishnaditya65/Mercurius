@@ -416,7 +416,7 @@ func buildFamilyAccessPositionsHandler(registry *familyaccountaccess.Registry, o
 			return
 		}
 
-		positions, fetchError := omsGatewayClient.FetchPositions(ownerAccountIdentifier)
+		positions, fetchError := omsGatewayClient.FetchPositions(ownerAccountIdentifier, request.Header.Get("Authorization"))
 		if fetchError != nil {
 			log.Printf("failed to fetch positions for family-access viewer=%s owner=%s: %v", viewerAccountIdentifier, ownerAccountIdentifier, fetchError)
 			http.Error(responseWriter, "failed to fetch positions from oms-gateway: "+fetchError.Error(), http.StatusBadGateway)
@@ -998,7 +998,7 @@ func buildCheckAndQualifyReferralHandler(
 			return
 		}
 
-		positions, fetchError := omsGatewayClient.FetchPositions(wireRequest.ReferredAccountIdentifier)
+		positions, fetchError := omsGatewayClient.FetchPositions(wireRequest.ReferredAccountIdentifier, request.Header.Get("Authorization"))
 		if fetchError != nil {
 			log.Printf("referral qualification check failed to reach oms-gateway for %s: %v", wireRequest.ReferredAccountIdentifier, fetchError)
 			http.Error(responseWriter, "failed to check qualifying event against oms-gateway: "+fetchError.Error(), http.StatusBadGateway)

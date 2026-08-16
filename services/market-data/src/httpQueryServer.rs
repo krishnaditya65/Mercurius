@@ -11,7 +11,7 @@
 // (ARCHITECTURE.md §5), not polling this HTTP endpoint; this is a
 // stopgap so `apps/web` has SOMETHING to point a chart at today.
 
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -51,6 +51,17 @@ const DEFAULT_VALUE_AREA_VOLUME_FRACTION: f64 = 0.70;
 const DEFAULT_TPO_INTERVAL_SECONDS: u64 = 60;
 
 const DEFAULT_QUERY_LIMIT: usize = 100;
+
+/// Upper bound on a request body this server will allocate a buffer for,
+/// enforced BEFORE the `vec![0u8; contentLength]` allocation below —
+/// without this cap, a client-supplied `Content-Length` header (e.g.
+/// `999999999999`) would drive a multi-GB/TB allocation attempt that
+/// aborts the whole process via Rust's `handle_alloc_error`, a one-request
+/// DoS. The largest legitimate body this service actually receives is a
+/// small JSON object (`WatchlistMutationWireRequest`/
+/// `CreateAlertWireRequest` — a couple of short string/number fields, well
+/// under 1KB in practice) so 1MB is generous headroom, not a tight fit.
+const MAX_REQUEST_BODY_SIZE_BYTES: usize = 1024 * 1024;
 
 /// Everything the HTTP query server needs, bundled so `main.rs` only has
 /// to pass one thing across the thread boundary. Each field is its own
@@ -133,11 +144,16 @@ pub fn runHttpQueryServer(listenAddress: &str, sharedState: Arc<SharedMarketData
             continue;
         };
 
-        let Some((requestLine, requestBody)) = readRequestLineAndBody(&connectionStream) else {
-            continue;
+        let (statusLine, bodyJson) = match readRequestLineAndBody(BufReader::new(&connectionStream)) {
+            Ok((requestLine, requestBody)) => handleOneHttpRequest(&requestLine, &requestBody, &sharedState),
+            Err(ReadRequestError::BodyTooLarge { contentLength }) => (
+                "HTTP/1.1 413 Payload Too Large".to_string(),
+                format!(
+                    r#"{{"errorMessage":"request body of {contentLength} bytes exceeds the {MAX_REQUEST_BODY_SIZE_BYTES}-byte limit"}}"#
+                ),
+            ),
+            Err(ReadRequestError::Io) => continue,
         };
-
-        let (statusLine, bodyJson) = handleOneHttpRequest(&requestLine, &requestBody, &sharedState);
 
         let responseBytes = format!(
             "{statusLine}\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{bodyJson}",
@@ -147,20 +163,30 @@ pub fn runHttpQueryServer(listenAddress: &str, sharedState: Arc<SharedMarketData
     }
 }
 
-/// Reads the request line, then headers up to the blank line, then a
-/// body of exactly `Content-Length` bytes if present. Returns `None` on
-/// any I/O error — the caller just drops the connection, same tolerance
-/// as the original GET-only version had for a bad read.
-fn readRequestLineAndBody(connectionStream: &std::net::TcpStream) -> Option<(String, String)> {
-    let mut bufferedReader = BufReader::new(connectionStream);
+/// Why `readRequestLineAndBody` failed to produce a request.
+#[derive(Debug, PartialEq)]
+enum ReadRequestError {
+    /// The claimed `Content-Length` exceeds `MAX_REQUEST_BODY_SIZE_BYTES`
+    /// — rejected BEFORE any body-sized allocation is attempted.
+    BodyTooLarge { contentLength: usize },
+    /// Any other I/O error reading the request line/headers/body — the
+    /// caller just drops the connection, same tolerance as the original
+    /// GET-only version had for a bad read.
+    Io,
+}
 
+/// Reads the request line, then headers up to the blank line, then a
+/// body of exactly `Content-Length` bytes if present (and within
+/// `MAX_REQUEST_BODY_SIZE_BYTES`). Generic over `BufRead` so this can be
+/// unit-tested against an in-memory buffer, not just a real `TcpStream`.
+fn readRequestLineAndBody<R: BufRead>(mut bufferedReader: R) -> Result<(String, String), ReadRequestError> {
     let mut requestLine = String::new();
-    bufferedReader.read_line(&mut requestLine).ok()?;
+    bufferedReader.read_line(&mut requestLine).map_err(|_| ReadRequestError::Io)?;
 
     let mut contentLength: usize = 0;
     loop {
         let mut headerLine = String::new();
-        bufferedReader.read_line(&mut headerLine).ok()?;
+        bufferedReader.read_line(&mut headerLine).map_err(|_| ReadRequestError::Io)?;
         let trimmedHeaderLine = headerLine.trim_end();
         if trimmedHeaderLine.is_empty() {
             break; // blank line — end of headers
@@ -172,12 +198,22 @@ fn readRequestLineAndBody(connectionStream: &std::net::TcpStream) -> Option<(Str
         }
     }
 
-    let mut bodyBytes = vec![0u8; contentLength];
-    if contentLength > 0 {
-        bufferedReader.read_exact(&mut bodyBytes).ok()?;
+    // Reject BEFORE allocating a `contentLength`-sized buffer — a
+    // client-supplied header claiming an enormous body must not drive an
+    // allocation attempt at all, let alone one that reads (and blocks
+    // indefinitely on) that many bytes.
+    if contentLength > MAX_REQUEST_BODY_SIZE_BYTES {
+        return Err(ReadRequestError::BodyTooLarge { contentLength });
     }
 
-    Some((requestLine, String::from_utf8_lossy(&bodyBytes).to_string()))
+    let mut bodyBytes = vec![0u8; contentLength];
+    if contentLength > 0 {
+        bufferedReader
+            .read_exact(&mut bodyBytes)
+            .map_err(|_| ReadRequestError::Io)?;
+    }
+
+    Ok((requestLine, String::from_utf8_lossy(&bodyBytes).to_string()))
 }
 
 #[derive(Debug, Deserialize)]
@@ -481,11 +517,16 @@ fn handleOneHttpRequest(
                         .candleAggregator
                         .lock()
                         .expect("candle aggregator mutex poisoned");
-                    let snapshot = computeLivePnlSnapshot(&accountIdentifier, &omsPositions, &candleAggregator);
-                    (
-                        "HTTP/1.1 200 OK".to_string(),
-                        serde_json::to_string(&snapshot).unwrap_or_else(|_| "{}".to_string()),
-                    )
+                    match computeLivePnlSnapshot(&accountIdentifier, &omsPositions, &candleAggregator) {
+                        Ok(snapshot) => (
+                            "HTTP/1.1 200 OK".to_string(),
+                            serde_json::to_string(&snapshot).unwrap_or_else(|_| "{}".to_string()),
+                        ),
+                        Err(overflowError) => (
+                            "HTTP/1.1 500 Internal Server Error".to_string(),
+                            serde_json::json!({ "errorMessage": overflowError.to_string() }).to_string(),
+                        ),
+                    }
                 }
                 Err(fetchError) => (
                     "HTTP/1.1 502 Bad Gateway".to_string(),
@@ -523,6 +564,7 @@ fn parseQueryString(queryString: &str) -> std::collections::HashMap<String, Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Read;
 
     #[test]
     fn parsesMultipleQueryParameters() {
@@ -773,6 +815,112 @@ mod tests {
         let sharedState = Arc::new(SharedMarketDataState::newEmptyState());
         let (statusLine, _bodyJson) = handleOneHttpRequest("POST /watchlist/add HTTP/1.1", "not json", &sharedState);
         assert_eq!(statusLine, "HTTP/1.1 400 Bad Request");
+    }
+
+    // -------------------------------------------------------------
+    // readRequestLineAndBody — Content-Length DoS guard.
+    // -------------------------------------------------------------
+
+    #[test]
+    fn oversizedContentLengthIsRejectedBeforeAllocatingOrBlockingOnTheBody() {
+        // A claimed Content-Length far beyond MAX_REQUEST_BODY_SIZE_BYTES,
+        // with NO body bytes actually following it. Before the fix, this
+        // would (a) attempt a `vec![0u8; contentLength]` allocation of
+        // that many bytes, and (b) then block forever in `read_exact`
+        // waiting for bytes that will never arrive — the one-request DoS.
+        // With the fix, the oversized claim is rejected up front, before
+        // either of those things happens, so this call returns promptly.
+        let hugeContentLength: usize = 999_999_999_999;
+        let rawRequest = format!("POST /watchlist/add HTTP/1.1\r\nContent-Length: {hugeContentLength}\r\n\r\n");
+        let cursor = std::io::Cursor::new(rawRequest.into_bytes());
+
+        let result = readRequestLineAndBody(BufReader::new(cursor));
+        assert_eq!(
+            result,
+            Err(ReadRequestError::BodyTooLarge {
+                contentLength: hugeContentLength
+            })
+        );
+    }
+
+    #[test]
+    fn contentLengthJustOverTheCapIsRejected() {
+        let overCap = MAX_REQUEST_BODY_SIZE_BYTES + 1;
+        let rawRequest = format!("POST /watchlist/add HTTP/1.1\r\nContent-Length: {overCap}\r\n\r\n");
+        let cursor = std::io::Cursor::new(rawRequest.into_bytes());
+
+        let result = readRequestLineAndBody(BufReader::new(cursor));
+        assert_eq!(result, Err(ReadRequestError::BodyTooLarge { contentLength: overCap }));
+    }
+
+    #[test]
+    fn contentLengthAtOrUnderTheCapWithARealBodyIsAccepted() {
+        let smallBody = r#"{"accountIdentifier":"acct-001","instrumentSymbol":"DEMO-EQ"}"#;
+        let rawRequest = format!(
+            "POST /watchlist/add HTTP/1.1\r\nContent-Length: {}\r\n\r\n{smallBody}",
+            smallBody.len()
+        );
+        let cursor = std::io::Cursor::new(rawRequest.into_bytes());
+
+        let (requestLine, requestBody) = readRequestLineAndBody(BufReader::new(cursor)).expect("well-formed request");
+        assert_eq!(requestLine.trim(), "POST /watchlist/add HTTP/1.1");
+        assert_eq!(requestBody, smallBody);
+    }
+
+    #[test]
+    fn oversizedBodyOverRealHttpConnectionGetsA413WithoutTheServerHanging() {
+        // End-to-end over a real TcpListener/TcpStream (via
+        // runHttpQueryServer itself), proving the guard fires on the real
+        // I/O path this server actually uses, not just the unit-tested
+        // pure function above.
+        use std::net::TcpStream;
+        use std::thread;
+
+        let sharedState = Arc::new(SharedMarketDataState::newEmptyState());
+        let tcpListener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral test listener");
+        let listenAddress = tcpListener.local_addr().expect("read local addr").to_string();
+
+        let serverThread = thread::spawn(move || {
+            for incomingConnection in tcpListener.incoming().take(1) {
+                let Ok(mut connectionStream) = incomingConnection else {
+                    continue;
+                };
+                let (statusLine, bodyJson) = match readRequestLineAndBody(BufReader::new(&connectionStream)) {
+                    Ok((requestLine, requestBody)) => {
+                        handleOneHttpRequest(&requestLine, &requestBody, &sharedState)
+                    }
+                    Err(ReadRequestError::BodyTooLarge { contentLength }) => (
+                        "HTTP/1.1 413 Payload Too Large".to_string(),
+                        format!(r#"{{"errorMessage":"body of {contentLength} bytes exceeds the limit"}}"#),
+                    ),
+                    Err(ReadRequestError::Io) => continue,
+                };
+                let responseBytes = format!(
+                    "{statusLine}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{bodyJson}",
+                    bodyJson.len()
+                );
+                let _ = connectionStream.write_all(responseBytes.as_bytes());
+            }
+        });
+
+        let mut clientStream = TcpStream::connect(&listenAddress).expect("connect to test server");
+        clientStream
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .expect("set read timeout");
+        // Claims a huge body but never sends one — proves the server
+        // responds (rather than hanging waiting for bytes that never
+        // come) because it rejects on the Content-Length header alone.
+        clientStream
+            .write_all(b"POST /watchlist/add HTTP/1.1\r\nContent-Length: 999999999999\r\n\r\n")
+            .expect("write request headers");
+
+        let mut responseText = String::new();
+        clientStream
+            .read_to_string(&mut responseText)
+            .expect("read response before the timeout — proves the server did not hang");
+        serverThread.join().expect("server thread panicked");
+
+        assert!(responseText.starts_with("HTTP/1.1 413 Payload Too Large"));
     }
 
     #[test]

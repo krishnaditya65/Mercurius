@@ -29,6 +29,7 @@ import LanguageSwitcher from "./localization/languageSwitcher";
 import { useLocalization } from "./localization/localizationContext";
 import HomeScreenLivePnlWidget from "./homeScreenLivePnlWidget";
 import { clearSession, loadSession, saveSession, type StoredSession } from "./session/authSession";
+import { useSequencedFetch } from "./hooks/useSequencedFetch";
 
 const omsGatewayBaseUrl = process.env.NEXT_PUBLIC_OMS_GATEWAY_BASE_URL ?? "http://localhost:8081";
 const marketDataBaseUrl = process.env.NEXT_PUBLIC_MARKET_DATA_BASE_URL ?? "http://localhost:9103";
@@ -360,6 +361,13 @@ function OrderTicketSection() {
         }
         const parsedAcknowledgement: OrderAcknowledgementResponse = await httpResponse.json();
         setLatestAcknowledgement(parsedAcknowledgement);
+        // A successful submission consumed this key — mint a fresh one so
+        // an edited, distinct order submitted next doesn't silently reuse
+        // it and come back as oms-gateway's CACHED response for THIS
+        // order instead of actually being submitted. The manual
+        // "Generate a new key" button below still exists too, but this
+        // means correctness no longer depends on remembering to click it.
+        setIdempotencyKey(generateIdempotencyKey());
       }
     } catch (thrownError) {
       setSubmissionErrorMessage(
@@ -600,8 +608,13 @@ function PriceChartSection() {
   const [mostRecentTrade, setMostRecentTrade] = useState<TradeTick | null>(null);
   const [isAutoRefreshing, setIsAutoRefreshing] = useState(true);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const startNextChartRequest = useSequencedFetch();
 
   async function refreshChartData() {
+    // Guards against a stale, slower response (e.g. for the PREVIOUS
+    // instrument symbol) resolving after a newer request already
+    // rendered and overwriting the chart with the wrong instrument's data.
+    const isStillMostRecentRequest = startNextChartRequest();
     try {
       const [candlesResponse, tradesResponse] = await Promise.all([
         fetch(`${marketDataBaseUrl}/candles?instrumentSymbol=${encodeURIComponent(instrumentSymbol)}&limit=60`),
@@ -609,14 +622,20 @@ function PriceChartSection() {
       ]);
       if (!candlesResponse.ok) throw new Error(`HTTP ${candlesResponse.status}`);
       const parsedCandles: CandleBar[] = await candlesResponse.json();
-      setCandles(parsedCandles);
 
+      let parsedTrades: TradeTick[] | null = null;
       if (tradesResponse.ok) {
-        const parsedTrades: TradeTick[] = await tradesResponse.json();
+        parsedTrades = await tradesResponse.json();
+      }
+
+      if (!isStillMostRecentRequest()) return;
+      setCandles(parsedCandles);
+      if (parsedTrades) {
         setMostRecentTrade(parsedTrades.length > 0 ? parsedTrades[parsedTrades.length - 1] : null);
       }
       setErrorMessage(null);
     } catch (thrownError) {
+      if (!isStillMostRecentRequest()) return;
       setErrorMessage(
         thrownError instanceof Error
           ? `Couldn't reach market-data: ${thrownError.message}. Is it running on ${marketDataBaseUrl}?`

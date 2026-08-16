@@ -90,14 +90,20 @@ func (workflow *WithdrawalWorkflow) AvailableBalanceInMinorUnits(accountIdentifi
 	workflow.mutexGuardingRequests.Lock()
 	defer workflow.mutexGuardingRequests.Unlock()
 
+	return ledgerBalance - workflow.heldAmountInMinorUnitsLocked(accountIdentifier), nil
+}
+
+// heldAmountInMinorUnitsLocked sums every currently-held (PENDING_HOLD)
+// withdrawal amount for accountIdentifier. Callers MUST already hold
+// mutexGuardingRequests — this is a private helper, not a public API.
+func (workflow *WithdrawalWorkflow) heldAmountInMinorUnitsLocked(accountIdentifier string) int64 {
 	heldAmount := int64(0)
 	for _, request := range workflow.requestsById {
 		if request.AccountIdentifier == accountIdentifier && request.Status == StatusPendingHold {
 			heldAmount += request.AmountInMinorUnits
 		}
 	}
-
-	return ledgerBalance - heldAmount, nil
+	return heldAmount
 }
 
 // RequestWithdrawal places a hold for amountInMinorUnits, payable no
@@ -114,17 +120,29 @@ func (workflow *WithdrawalWorkflow) RequestWithdrawal(
 		return nil, ErrInvalidWithdrawalAmount
 	}
 
-	availableBalance, balanceError := workflow.AvailableBalanceInMinorUnits(accountIdentifier)
-	if balanceError != nil {
-		return nil, balanceError
-	}
-	if amountInMinorUnits > availableBalance {
-		return nil, ErrInsufficientAvailableBalance
-	}
-
 	withdrawalId, genError := generateWithdrawalId()
 	if genError != nil {
 		return nil, fmt.Errorf("failed to generate withdrawal id: %w", genError)
+	}
+
+	// The balance check and the hold insertion MUST happen inside the
+	// SAME critical section — computing "available balance" and then
+	// inserting the hold as two separate lock acquisitions would let two
+	// concurrent requests both observe the same available balance before
+	// either of their holds is visible to the other, overdrawing the
+	// account. Holding the lock across the ledger lookup, the
+	// already-held sum, the check, AND the insert makes the whole
+	// check-and-reserve atomic.
+	workflow.mutexGuardingRequests.Lock()
+	defer workflow.mutexGuardingRequests.Unlock()
+
+	ledgerBalance, balanceError := workflow.ledgerBook.CurrentBalanceInMinorUnits(accountIdentifier)
+	if balanceError != nil {
+		return nil, balanceError
+	}
+	availableBalance := ledgerBalance - workflow.heldAmountInMinorUnitsLocked(accountIdentifier)
+	if amountInMinorUnits > availableBalance {
+		return nil, ErrInsufficientAvailableBalance
 	}
 
 	request := &WithdrawalRequest{
@@ -135,10 +153,7 @@ func (workflow *WithdrawalWorkflow) RequestWithdrawal(
 		EligibleForPayoutAt: now.Add(workflow.settlementHoldDuration),
 		Status:              StatusPendingHold,
 	}
-
-	workflow.mutexGuardingRequests.Lock()
 	workflow.requestsById[withdrawalId] = request
-	workflow.mutexGuardingRequests.Unlock()
 
 	return request, nil
 }

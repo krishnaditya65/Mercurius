@@ -219,6 +219,134 @@ func TestCloseAuctionRejectsBidsBeyondCutoff(t *testing.T) {
 	}
 }
 
+// TestProRataAllotmentInMinorUnitsIsExactForTrillionsOfMinorUnits
+// reproduces the confirmed audit bug directly at the helper level: the
+// OLD formula, int64(float64(bidQuantity)/float64(groupTotalRequested)*
+// float64(remainingCapacity)), loses exact-integer precision once these
+// quantities run into the quadrillions of minor units (paise) a
+// realistically large G-Sec auction can reach — float64's 52-bit mantissa
+// cannot represent every integer above ~2^53 exactly, and even below that
+// threshold the fraction-then-multiply order of operations rounds
+// differently than exact integer math. These two (bidQuantity, remaining,
+// total) triples were found by brute-force search specifically because
+// the old float64 formula and exact integer division disagree on them.
+// proRataAllotmentInMinorUnits must match exact integer division
+// (bidQuantity*remainingCapacity)/groupTotalRequested computed via
+// math/big, not the old float64-truncated (and, here, actually
+// OVER-estimated) value.
+func TestProRataAllotmentInMinorUnitsIsExactForTrillionsOfMinorUnits(t *testing.T) {
+	cases := []struct {
+		name                 string
+		bidQuantity          int64
+		remainingCapacity    int64
+		groupTotalRequested  int64
+		wantExactAllotment   int64
+		oldFloat64Formula    int64 // what the old buggy code computed — documented for contrast, not asserted
+	}{
+		{
+			name:                "bidA of a two-way trillions-scale tie",
+			bidQuantity:         1_200_156_663_427_567,
+			remainingCapacity:   7_777_777_777_777_777,
+			groupTotalRequested: 9_000_000_000_000_001,
+			wantExactAllotment:  1_037_172_425_184_316,
+			oldFloat64Formula:   1_037_172_425_184_317, // off by +1 — an over-allotment
+		},
+		{
+			name:                "bidB of the same trillions-scale tie",
+			bidQuantity:         779_831_885_648_889,
+			remainingCapacity:   7_777_777_777_777_777,
+			groupTotalRequested: 9_000_000_000_000_001,
+			wantExactAllotment:  673_928_790_066_940,
+			oldFloat64Formula:   673_928_790_066_941, // off by +1 — an over-allotment
+		},
+	}
+
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			got := proRataAllotmentInMinorUnits(testCase.bidQuantity, testCase.remainingCapacity, testCase.groupTotalRequested)
+			if got != testCase.wantExactAllotment {
+				t.Fatalf("expected exact allotment %d, got %d (the old float64 formula would have given %d)",
+					testCase.wantExactAllotment, got, testCase.oldFloat64Formula)
+			}
+			if got == testCase.oldFloat64Formula {
+				t.Fatalf("test setup error: exact and old-formula values are equal (%d) — this case no longer demonstrates the precision bug", got)
+			}
+		})
+	}
+}
+
+// TestCloseAuctionExactProRataForTrillionsOfMinorUnits exercises the same
+// bug end-to-end through CloseAuction: a three-way tied group at
+// quadrillions-of-minor-units scale, where the first two (non-last) bids
+// hit the exact float64-vs-integer mismatches proven above, and the
+// third (last, by BidId) absorbs the rounding remainder as usual. Before
+// the fix, the two non-last bids were each over-allotted by 1 minor unit
+// relative to their true exact pro-rata share (and the last bid's
+// remainder absorption correspondingly under-allotted it by 2, though the
+// group total happened to still equal remainingCapacity by construction —
+// the bug's real effect is per-bid unfairness, not an inexact group
+// total). After the fix every bid's allotment must match the exact
+// integer pro-rata computation.
+func TestCloseAuctionExactProRataForTrillionsOfMinorUnits(t *testing.T) {
+	engine := newTestEngine()
+	auction := findAuctionForBond(engine, "GSEC-07.10-2028")
+
+	// Directly install an auction with a quadrillions-scale notified
+	// amount — internal/fixedincome's static seed calendar only ever
+	// uses small illustrative amounts, so a trillions/quadrillions-scale
+	// scenario has to be built by hand here (same package, so this white
+	// box test can reach the unexported map directly).
+	const remainingCapacity = int64(7_777_777_777_777_777)
+	const groupTotal = int64(9_000_000_000_000_001)
+	bidAQuantity := int64(1_200_156_663_427_567)
+	bidBQuantity := int64(779_831_885_648_889)
+	bidCQuantity := groupTotal - bidAQuantity - bidBQuantity // last bid, absorbs the remainder
+
+	now := auction.ScheduledAuctionDate
+
+	// Built directly (bypassing SubmitBid's random hex BidId generation)
+	// so BidId ordering — and therefore which bid is "last" and absorbs
+	// CloseAuction's rounding remainder — is deterministic: "bid-a" and
+	// "bid-b" sort before "bid-c", so bid-c is guaranteed last.
+	bidA := &Bid{BidId: "bid-a", AuctionId: auction.AuctionId, BidderAccountIdentifier: "acct-a", QuantityInMinorUnits: bidAQuantity, YieldPercent: 7.0, SubmittedAt: now, Status: BidStatusSubmitted}
+	bidB := &Bid{BidId: "bid-b", AuctionId: auction.AuctionId, BidderAccountIdentifier: "acct-b", QuantityInMinorUnits: bidBQuantity, YieldPercent: 7.0, SubmittedAt: now, Status: BidStatusSubmitted}
+	bidC := &Bid{BidId: "bid-c", AuctionId: auction.AuctionId, BidderAccountIdentifier: "acct-c", QuantityInMinorUnits: bidCQuantity, YieldPercent: 7.0, SubmittedAt: now, Status: BidStatusSubmitted}
+
+	engine.mutexGuardingState.Lock()
+	engine.auctionsById[auction.AuctionId] = &Auction{
+		AuctionId:                  auction.AuctionId,
+		BondId:                     auction.BondId,
+		ScheduledAuctionDate:       auction.ScheduledAuctionDate,
+		NotifiedAmountInMinorUnits: remainingCapacity,
+		Status:                     AuctionStatusOpen,
+	}
+	engine.bidsByAuctionId[auction.AuctionId] = []*Bid{bidA, bidB, bidC}
+	engine.mutexGuardingState.Unlock()
+
+	closedBids, closeError := engine.CloseAuction(auction.AuctionId, now)
+	if closeError != nil {
+		t.Fatalf("unexpected close error: %v", closeError)
+	}
+	byId := map[string]*Bid{}
+	for _, bid := range closedBids {
+		byId[bid.BidId] = bid
+	}
+
+	wantA := int64(1_037_172_425_184_316)
+	wantB := int64(673_928_790_066_940)
+	if got := byId[bidA.BidId].AllottedQuantityInMinorUnits; got != wantA {
+		t.Fatalf("expected bidA's exact pro-rata allotment %d, got %d", wantA, got)
+	}
+	if got := byId[bidB.BidId].AllottedQuantityInMinorUnits; got != wantB {
+		t.Fatalf("expected bidB's exact pro-rata allotment %d, got %d", wantB, got)
+	}
+
+	total := byId[bidA.BidId].AllottedQuantityInMinorUnits + byId[bidB.BidId].AllottedQuantityInMinorUnits + byId[bidC.BidId].AllottedQuantityInMinorUnits
+	if total != remainingCapacity {
+		t.Fatalf("expected all three allotments to sum exactly to remainingCapacity %d, got %d", remainingCapacity, total)
+	}
+}
+
 func TestCloseAuctionAlreadyClosedReturnsError(t *testing.T) {
 	engine := newTestEngine()
 	auction := findAuctionForBond(engine, "GSEC-07.10-2028")

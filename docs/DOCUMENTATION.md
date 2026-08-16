@@ -385,6 +385,13 @@ Watchlists/alerts have no auth, no technical
 triggers, no push notification (poll `GET /alerts` to discover a fired
 one), and a fired alert never re-arms.
 
+**Correctness fix, `docs/BUILD_LOG.md` entry 87 — unbounded-allocation
+DoS:** `readRequestLineAndBody` allocated `vec![0u8; contentLength]`
+directly off a client-supplied `Content-Length` header with no cap,
+letting one request drive an arbitrarily large allocation. Fixed with
+`MAX_REQUEST_BODY_SIZE_BYTES = 1024 * 1024`, rejecting an oversized
+`Content-Length` with a 413 BEFORE allocating or blocking on the body.
+
 ### `src/l1QuotePublisher.rs`, `src/l1QuoteWireProtocol.rs`, `src/l1QuoteWebSocketServer.rs` — new this build
 
 FEATURES.md §8: "WebSocket broadcast for L1 quotes to web/mobile
@@ -446,6 +453,15 @@ columnar tick store duplicates trade-tick storage alongside the
 existing candle aggregator's shorter trade tape (different retention
 purposes, real duplication nonetheless); everything in-memory only.
 
+**Correctness fix, `docs/BUILD_LOG.md` entry 87 — wire-format desync:**
+`udpMulticastPublisher.rs`'s `writeLengthPrefixedString` wrote a `u8`
+length prefix (max 255) while still writing the FULL string bytes for
+anything longer, so a symbol/field over 255 bytes desynced every field
+after it in the datagram (decoded length diverged from actual bytes
+written). Fixed by widening the prefix to little-endian `u16` on both
+the encode (`writeLengthPrefixedString`) and decode
+(`ByteCursor::readU16`/`readLengthPrefixedString`) side.
+
 ### `volumeProfileAggregator.rs`, `orderFlowFootprintAggregator.rs` — new this build
 
 FEATURES.md §20 (`docs/BUILD_LOG.md` entry 69). Real Volume Profile
@@ -465,6 +481,21 @@ level and buy=2/sell=7 at another reproduced exactly.
 **Known limitations:** inherits the columnar store's 50k-tick retention
 cap (older data silently drops); TPO's "letter A" starts at the
 earliest tick in a query result, not a real session-open time.
+
+**Correctness fix, `docs/BUILD_LOG.md` entry 87 — Value Area
+calculation bug, actually two compounding bugs in
+`computeValueAreaRange`:** (1) `bucketStep` used to be inferred from
+the minimum gap between OCCUPIED bucket keys, understating the real
+step whenever an intervening bucket has zero volume (and is therefore
+absent from the map) — now threaded through explicitly from the
+caller's real `priceBucketSizeInMinorUnits`. (2) the expansion loop
+only checked the single immediate neighbor bucket on each side and
+gave up on that side entirely if it was empty, even when a farther
+occupied bucket existed — new `nextOccupiedBucketOutward` walks past
+empty buckets to find the next real one. A regression test reproduces
+the exact scenario (ticks at 100/130/140, empty buckets at 110/120)
+and asserts the value area correctly reaches down to 100 instead of
+stopping short at the POC (130).
 
 ### `watchlist.rs` sync extension, `livePnlWidget.rs` — new this build
 
@@ -504,6 +535,16 @@ the fill immediately.
 push for watchlist changes or P&L); the change log is unbounded and
 unpersisted; a single blocking HTTP round-trip per P&L refresh with no
 retry/backoff.
+
+**Correctness fix, `docs/BUILD_LOG.md` entry 87 — P&L overflow:**
+`computeLivePnlSnapshot` now returns
+`Result<LivePnlSnapshot, LivePnlOverflowError>` — the raw
+`netQuantity * (currentPrice - averageEntryPrice)` and the running
+per-account total previously used plain `i64` arithmetic that could
+silently wrap on an extreme (but constructible) input; now uses
+`checked_sub`/`checked_mul`/`checked_add` throughout, returning a
+clean error (mapped to HTTP 500 by the one caller in
+`httpQueryServer.rs`) instead of wrapping or panicking.
 
 ---
 
@@ -571,6 +612,18 @@ adds a previously-unknown account) and `ApplyTradeSettlementToLocalCache`
 demo account list (`cmd/server/main.go`'s `demoTrackedAccountIdentifiers`)
 — a balance change from any other path (a deposit, a second OMS
 instance) is invisible to this cache until the process restarts.
+
+**Correctness fix, `docs/BUILD_LOG.md` entry 87:** `EvaluateOrderAgainstAvailableMargin`
+was `RLock`-guarded READ-ONLY, letting two concurrent orders from the
+same account both read the same available margin and both pass — a
+genuine reservation race, not just a cache-staleness concern. Now
+`Lock`-guarded and atomically debits `availableMargin` within the same
+call it approves in, with a new `ReleaseReservedMargin` for the
+rejection path (wired from `cmd/server/main.go`'s deferred-release
+block — see `internal/algolimits`/`internal/marginpledge` below for
+the same pattern applied to two other reservation types).
+Race-tested with 200 concurrent goroutines against a shared balance,
+race-clean.
 
 ### `internal/kycclient/kycClient.go` and `internal/backofficeclient/backofficeClient.go` — the two new gates
 
@@ -652,6 +705,18 @@ claim, only its completed responses once durably persisted.
 
 **Known limitation:** a plain admin-toggled flag, not a real clock-driven
 trading calendar (pre-open/continuous/closing-auction/holidays).
+
+**Correctness fixes, `docs/BUILD_LOG.md` entry 87:**
+`cmd/server/main.go`'s `buildMarketSessionCloseHandler`/
+`buildMarketSessionOpenHandler` previously accepted ANY HTTP method —
+a stray `GET` could silently open or close the market. Both now
+reject non-`POST` with 405. Separately, the AMO-drain response (fired
+from the open handler) now reports
+`totalDrainedAfterMarketOrders`/`acceptedAfterMarketOrders`/
+`rejectedAfterMarketOrders` with a per-rejection log line — the drain
+already executed correctly, but previously gave an operator zero
+visibility into how many queued after-market orders silently failed
+re-submission at market open.
 
 ### `internal/amoqueue/afterMarketOrderQueue.go` — FEATURES.md §3 AMO
 
@@ -842,11 +907,25 @@ hardcoded Go constants.
 
 ### `cmd/server/main.go`
 
+**`cmd/server/main_test.go` — new (`docs/BUILD_LOG.md` entry 87):** a
+real integration harness exercising `processOrderSubmission` and the
+market-session handlers end-to-end against FOUR fakes — real
+`httptest.Server`s standing in for KYC and backoffice, a configurable
+fake ledger server (toggleable success/failure, used to prove the
+settlement-rollback fix below), and a real TCP listener speaking
+oms-gateway's actual matching-engine wire protocol (matching-engine
+isn't HTTP, so this is a hand-rolled fake socket server, not
+`httptest`). 10 tests, several directly reproducing one of this
+entry's specific findings (concurrent margin over-approval, algo-
+limits/exposure-limits reservation leaks on rejection, settlement
+failure leaving the position book untouched, non-`POST` market-session
+requests).
+
 | Route / Function | Behavior |
 |---|---|
 | `GET /health` | Liveness check. |
 | `POST /orders/submit` | Decodes `OrderSubmissionRequest` → **idempotency check** (a hit short-circuits everything below, returning the cached response) → **AMO check** (if `OrderIsAfterMarketOrder` and the market is closed, queues into `afterMarketOrderQueue` and returns `IsQueuedAsAfterMarketOrder:true` WITHOUT touching idempotency-caching, KYC, freeze, or risk) → delegates to `processOrderSubmission` (see below) → caches the result under `IdempotencyKey` and responds. |
-| `processOrderSubmission(deps, request) OrderAcknowledgementResponse` | The actual pipeline, extracted out of the HTTP handler so `buildCoverOrderHandler` can reuse it for an entry leg: **KYC gate** → **freeze gate** → computes notional (`price × qty`; always 0 for a market/stop-market order — known gap, see file comment) → risk check → on approve, allocates a sequence number, calls `matchingEngineClient.SubmitOrderAndAwaitMatchResult`, captures `AssignedOrderSequenceNumber` into the response's `MatchingEngineOrderSequenceNumber`, and on a real fill calls `settleTradeAgainstLedgerAndLocalCache` and `positionBook.ApplyFill` for each trade. Takes an `orderSubmissionDependencies` struct instead of a long parameter list. |
+| `processOrderSubmission(deps, request) OrderAcknowledgementResponse` | The actual pipeline, extracted out of the HTTP handler so `buildCoverOrderHandler` can reuse it for an entry leg: **KYC gate** → **freeze gate** → computes notional (`price × qty`; always 0 for a market/stop-market order — known gap, see file comment) → risk check → on approve, allocates a sequence number, calls `matchingEngineClient.SubmitOrderAndAwaitMatchResult`, captures `AssignedOrderSequenceNumber` into the response's `MatchingEngineOrderSequenceNumber`, and on a real fill calls `settleTradeAgainstLedgerAndLocalCache` for each trade — `positionBook.ApplyFill` now only runs when settlement SUCCEEDED (`docs/BUILD_LOG.md` entry 87 fix, see `settleTradeAgainstLedgerAndLocalCache` below); a failed settlement is surfaced on the response via `SettlementFailures` instead of silently mutating the position book as if the trade had cleared. Also `defer`s a release of any provisional algo-limits/exposure-limits/pledge-book reservation the order took, if it never reached acceptance (same entry 87 fix — closes the reservation-leak half of the risk-engine/pledge-book/algo-limits races documented in their own sections above). Takes an `orderSubmissionDependencies` struct instead of a long parameter list. |
 | `GET /positions?accountId=...` | Calls `positionBook.PositionsForAccount`, returns net quantity per instrument. |
 | `POST /orders/cancel` | Decodes `CancelOrderRequest` → `matchingEngineClient.CancelOrderAndAwaitResult` → `CancelOrderResponse`. Deliberately NOT risk/KYC/freeze-gated (cancelling can only reduce exposure). Every failure path now populates a genuine plain-language `ErrorMessage` on the response itself (`docs/BUILD_LOG.md` entry 41 fixed a real gap where the not-found case's reason only ever reached the audit trail, never the client). Known gap: doesn't verify the caller owns the order being cancelled (no auth anywhere yet). |
 | `POST /orders/cover-submit` | FEATURES.md §3 Cover Orders: decodes `CoverOrderRequest` → runs the entry leg through `processOrderSubmission` → if it filled (sums `ExecutedQuantity` across its trades), places a `StopLossMarket` order on the opposite side for the filled quantity via a direct `matchingEngineClient` call — bypassing KYC/freeze/risk (same "can only reduce exposure" rationale as cancellation). If the entry didn't fill at all, no protective leg is placed. Returns `CoverOrderResponse` with the entry's ack plus the protective leg's id or, if placing it failed, a loudly-logged `ProtectiveStopOrderError`. |
@@ -861,7 +940,7 @@ hardcoded Go constants.
 | KYC gate | Calls `kycClient.FetchKycStatus`. An explicit `IsEligibleToPlaceOrders=false` rejects with `KYC_NOT_VERIFIED` (fails **closed**). A transport error logs a warning and lets the order proceed (fails **open**) — see the extensive doc comment in `main.go` on why, and the explicit caveat that real capital would likely want the opposite. |
 | Freeze gate | Same shape, calls `backofficeClient.FetchFreezeStatus`, rejects with `ACCOUNT_FROZEN` (+ the recorded reason) on an explicit frozen answer, fails open on transport error. |
 | `syncRiskEngineBalancesFromLedger` | Runs once at startup: fetches each account in `demoTrackedAccountIdentifiers` from `ledgerClient` and seeds the risk engine's cache. Logs and continues (doesn't crash) if the ledger isn't up yet. |
-| `settleTradeAgainstLedgerAndLocalCache` | For one fill: posts the settlement journal entry via `ledgerClient`, then — only on success — applies the same adjustment to the local risk cache via `ApplyTradeSettlementToLocalCache`. A failed settlement post is logged loudly (`SETTLEMENT FAILED`) since there's no reconciliation/retry job yet to catch it silently going missing. |
+| `settleTradeAgainstLedgerAndLocalCache` | For one fill: posts the settlement journal entry via `ledgerClient`, then — only on success — applies the same adjustment to the local risk cache via `ApplyTradeSettlementToLocalCache`. A failed settlement post is logged loudly (`SETTLEMENT FAILED`) AND (as of `docs/BUILD_LOG.md` entry 87) now returns a real `error` instead of only logging — the caller (`processOrderSubmission`) uses that to skip `positionBook.ApplyFill` and record the failure in the response's `SettlementFailures` plus a new `audittrail.EventSettlementFailedPositionNotApplied` entry, rather than the pre-fix behavior of applying the fill to the position book regardless of whether settlement actually succeeded. There's still no reconciliation/retry job to automatically resolve a settlement failure once surfaced. |
 
 **Verified end-to-end** (`docs/BUILD_LOG.md` entries 14–16, all five
 services running together): a resting buy produces no trades; a crossing
@@ -917,6 +996,16 @@ caller-supplied (no live price feed here yet); utilized margin for open
 derivative positions is set via an admin-style endpoint, not derived
 from a structured F&O position book (doesn't exist yet).
 
+**Correctness fix, `docs/BUILD_LOG.md` entry 87:** the pledged-holding
+sell-reservation check used to read `PledgedQuantity()` and
+`PositionsForAccount()` as two INDEPENDENT reads, letting two
+concurrent sell attempts against the same unpledged remainder both
+pass — a genuine reservation race, same family as `riskengine`'s fix
+above. A new `reservedForPendingSellByAccountAndSymbol` map plus an
+atomic `ReserveUnpledgedQuantityForSell`/`ReleaseSellReservation` pair
+closes it. Race-tested: 3 concurrent goroutines each trying to sell 60
+of a 100-share holding correctly leave exactly 1 winner.
+
 ### `internal/marginfunding`, `internal/optionschain`, `internal/dmagateway`, `internal/papertrading`, `internal/algolimits` — new this build
 
 Five FEATURES.md items built sequentially in one pass (§2 P2, §3 P2/P4,
@@ -967,6 +1056,9 @@ per-`strategyId` rate limiting (orders/sec) and daily notional caps,
 enforced before an order reaches the risk engine or matching-engine. 18
 tests. Verified live: rate-limit rejection, refill-then-succeed, the
 exact daily-cap boundary, post-cap rejection, untagged orders unaffected.
+A sub-1 orders/sec rate (e.g. 0.5/sec) and a missing rejection-path
+`Release()` were both real bugs, fixed in `docs/BUILD_LOG.md` entry
+87 — see this file's own `internal/algolimits` entry above.
 
 **Known limitations per item:** margin funding's interest formula isn't
 auto-applied and reuses the existing clearing account; options chain
@@ -976,6 +1068,19 @@ complete); the DMA/FIX gateway needs a certified FIX engine and real
 exchange onboarding to be genuinely complete; paper trading's SELL gate
 still checks real positions (conservative simplification); algo limits
 are per-strategy only, no global circuit breaker, config in-memory.
+
+**Correctness fixes, `docs/BUILD_LOG.md` entry 87:** `algolimits`'s
+`strategyLimiter.go` gained a `Release()` (reverses both the rate-limit
+token and daily-notional consumption a rejected order had
+provisionally reserved) and a sub-1 orders/sec rate-limit floor fix —
+`bucketCapacity = max(1.0, rate)` — since a sub-1 rate (e.g. 0.5/sec)
+previously capped its own token refill below 1.0 and could never
+accumulate a full token, permanently blocking every order tagged with
+that strategy. The actual bug enabling both `Release()`s (this one and
+`exposurelimits.ReleaseExposure`, which already existed) to matter was
+missing WIRING in `cmd/server/main.go`'s `processOrderSubmission` — it
+took a reservation on submission but never released it on a downstream
+rejection; a `defer`-based release block now covers both.
 
 ### `internal/strategyfollowing`, §12 risk packages, §15 execution/derivatives packages, §17 DRIP/LAS — new this build
 
@@ -989,7 +1094,13 @@ or auto-copying, disclosed. 18 tests.
 weighted-average-cost-basis unrealized P&L for leveraged accounts only,
 13 tests); `autoliquidation` (real WARNING/URGENT/LIQUIDATION graduated
 thresholds, with real reducing MARKET SELL orders submitted through the
-live order pipeline ONLY at breach, 15 tests); `exposurelimits` (real
+live order pipeline ONLY at breach, 15 tests — **fill-vs-accept
+accounting bug fixed in `docs/BUILD_LOG.md` entry 87**:
+`SubmitReducingOrderFunc` used to let the caller ASSUME
+`quantityToSell * price` was the real proceeds; it now returns the
+ACTUAL executed notional from `TradeExecutionEvents`, so a partially-
+filled or differently-priced liquidation order no longer understates
+remaining shortfall); `exposurelimits` (real
 pre-trade per-account AND per-segment notional caps, 12 tests including
 a 200-goroutine concurrency test); `connectivitykillswitch` (real
 MANUAL + AUTO trading halt on 3 consecutive matching-engine failures —
@@ -1044,7 +1155,12 @@ alongside the existing whole-share quantity. Live (non-paper) fractional
 orders are correctly rejected (matching-engine has no fractional wire
 field yet); paper trading fills fractionally for real via a new, fully
 separate `MilliSharePositionBook`. 30 tests, zero existing
-integer-quantity tests broken.
+integer-quantity tests broken. **Overflow fix, `docs/BUILD_LOG.md`
+entry 87**: `ValidateMilliShareQuantity` gained
+`MaxReasonableMilliShareQuantity`/`ErrMilliShareQuantityExceedsMaximum`,
+checked before `NotionalInMinorUnits`'s uint64→int64 conversion, which
+previously silently wrapped negative for an unreasonably large
+milli-share quantity.
 
 **§19:** `overtradingdetection` (real rapid-fire/elevated-velocity
 pattern detection, a non-blocking nudge with a real cooldown, 15 tests);
@@ -1282,6 +1398,27 @@ JSON-snapshot admin endpoints, unaffected by this change); no
 client-fund segregation at the account-structure level beyond what
 `internal/fundsegregation` already layers on top (FEATURES.md §1); no
 chart-of-accounts semantics.
+
+**Correctness fixes, `docs/BUILD_LOG.md` entry 87:** a real
+custody-pool-overflow bug in `internal/fundsegregation/clientFundSegregation.go`'s
+`PostClientMoneyMovement` (a near-`math.MaxInt64` amount overflowed on
+its internal doubling for the external-cash-suspense leg — now bounded
+by `maxMovementAmountInMinorUnits` and `ErrMovementAmountTooLarge`); a
+genuine TOCTOU withdrawal race in `internal/withdrawalworkflow/withdrawalWorkflow.go`'s
+`RequestWithdrawal` (the balance lookup and the hold-insert used to be
+two separate critical sections — now one, via a lock-already-held
+`heldAmountInMinorUnitsLocked` helper); a matching TOCTOU race in
+`internal/multicurrencywallet/multiCurrencyWallet.go`'s
+`WithdrawFromCurrencyWallet`/`ConvertBetweenCurrencyWallets`, closed by
+a new `mutexGuardingBalanceMutations sync.Mutex`, plus that same
+file's FX rate table moving from `float64` to exact `math/big`
+round-half-up integer arithmetic (`convertMinorUnitsRoundHalfUp`,
+`fxRateScale`); and a SIP-mandate silent-failure fix in
+`internal/paymentmandate/paymentMandate.go` — `SweepDueMandates` used
+to advance `NextDebitDate` even when the debit failed, so a
+permanently-undebitable mandate looked like it was running forever
+without ever moving money; it now suspends after 3 consecutive
+failures (`MandateStatusSuspended`) instead.
 
 ### `internal/withdrawalworkflow/withdrawalWorkflow.go` — new this build
 
@@ -1646,6 +1783,22 @@ own coupon rate, a genuine correctness proof, 17 tests);
 real coupon calendar computed from each bond's actual schedule — a
 truncation-vs-rounding bug was caught and fixed here, 18 tests).
 
+**Two further correctness fixes, `docs/BUILD_LOG.md` entry 87:**
+`primarymarketbidding/primaryAuctionEngine.go`'s `CloseAuction`
+computed pro-rata allotment as
+`int64(float64(bid.Qty)/float64(groupTotal)*float64(remaining))` —
+float64 precision loss once values exceed its 52-bit mantissa (real
+G-Sec auctions run into the trillions of paise); replaced with
+`proRataAllotmentInMinorUnits`, an exact `math/big.Int`
+multiply-then-divide. `bondladderbuilder/couponCalendar.go`'s
+`monthsPerPeriod := 12 / bond.PaymentsPerYear` silently truncated for
+any non-divisor payment frequency (5, 7, 8, 9, 11/year) — the new
+`monthsPerCouponPeriodOrPanic` does not make those frequencies compute
+correctly (the month-stepping design needs a real rewrite for that);
+it converts the previous silent wrong output into a loud panic
+instead, which is a real improvement but not a complete fix — those
+frequencies still don't work.
+
 **§17 P4 remainder:** `globalmarketsaccess` (illustrative ADR/GDR-style
 routing state machine, real currency conversion math), `retirementaccounts`
 (real contribution-limit + lock-in rules engine, exact-boundary tested),
@@ -1729,6 +1882,32 @@ not a complete commercial BaaS product (needs separate legal/compliance
 entities per tenant); the DR runbook proves recovery primitives, not
 true multi-region failover.
 
+**Correctness fixes, `docs/BUILD_LOG.md` entry 87 — three real bugs,
+two of them regressions from this repo's own entry-84 auth pass:**
+(1) `internal/accountaggregator`'s handler called oms-gateway's (now
+`RequireAuth`-gated as of entry 84) `/positions` with a bare,
+unauthenticated `httpClient.Get(...)` — meaning the account-aggregator
+had been silently broken (401s) since entry 84 shipped. New
+`fetchOmsGatewayPositions`/`fetchMutualFundsHoldings` forward the
+caller's own `Authorization` header. (2) Found as a side effect of
+fixing (1): `omsPositionsWireResponse` was typed as
+`[]struct{InstrumentSymbol string; MarketValueInMinorUnits int64}` — a
+shape oms-gateway's real `/positions` (`{AccountIdentifier,
+NetQuantityByInstrumentSymbol}`) has never actually returned; decoding
+silently zero-valued instead of erroring, so this data was WRONG even
+before the auth bug — a genuinely pre-existing bug, not invented by
+this pass. The equivalent mutual-funds `/holdings` wire-shape bug was
+fixed the same way. (3) The catch-all reverse-proxy route
+(`httpRequestMultiplexer.Handle("/", backendProxy)`) had NO
+authentication at all — every other route got `RequireAuth`/
+`RequireRole` in entry 84, this one was missed. New
+`buildProxyAccessGate` closes it (accepts a validated `X-Api-Key` OR a
+bearer token). Also fixed: `buildRateLimitingMiddleware` keyed every
+anonymous request under one shared `"anonymous"` bucket — any single
+anonymous client could exhaust it for everyone — now keyed per caller
+IP via `remoteAddressKey` (same `X-Forwarded-For` caveat as
+`services/auth`'s equivalent helper, not solved here either).
+
 ### Auth/RBAC wiring + first-ever CORS — new this build (`docs/BUILD_LOG.md` entry 84)
 
 This closes a real, previously-documented gap (`docs/BUILD_LOG.md`
@@ -1811,7 +1990,17 @@ ledger/oms-gateway processes.
 real calculator is unreachable; no PDF generation (JSON/CSV only);
 withdrawal timestamps use `eligibleForPayoutAt` as a proxy (ledger
 exposes no completion timestamp); the AIS mock is loudly labeled as
-not a real government feed.
+not a real government feed. **Data race fixed, `docs/BUILD_LOG.md`
+entry 87:** `internal/omsgatewayclient.OmsGatewayClient`'s
+`chargesCalculatorReachable`/`chargesCalculatorProbed` fields were
+plain, unsynchronized `bool`s written from concurrently-called
+`EstimateCharges` — now guarded by a new `mutexGuardingChargesCalculatorState`,
+written only via `recordChargesCalculatorProbeResult` and read only via
+the new `ChargesCalculatorProbeState()`. **That reader is still dead
+code, not fixed in this pass:** nothing anywhere in this service
+actually calls `ChargesCalculatorProbeState()` to short-circuit a
+retry or skip a call known to be doomed — the race is closed, but the
+probe result still isn't consulted for anything.
 
 ---
 
@@ -1983,6 +2172,20 @@ with the same allow-listed-origin-echo pattern
 (`CORS_ALLOWED_ORIGINS`) every other gated service in this build uses.
 `gofmt`/`go vet`/`go build`/`go test -race` clean, zero regressions.
 
+**A real, exploitable ownership-check bypass was found and fixed
+(`docs/BUILD_LOG.md` entry 87):** `requireOwnAccountFromJsonBody`
+fell through to the wrapped handler whenever its own `json.Unmarshal`
+of the request body failed, on the assumption the wrapped handler's
+own decode would also fail closed. That assumption was wrong — most
+handlers decode via `json.NewDecoder(...).Decode(...)`, which reads
+only the first JSON value and silently ignores trailing bytes, so a
+body shaped like `{"accountIdentifier":"someone-elses-account",...}<garbage>`
+would fail `Unmarshal` (skipping the ownership check, fail-OPEN) while
+still decoding successfully in the wrapped handler — a real
+authorization bypass on every owner-only self-service route, not a
+theoretical one. Fixed by returning `400` instead of falling through
+to `next` on a body-decode failure.
+
 **Verified live**: a real `acct-001` JWT successfully fetched `GET
 /kyc/status?accountId=acct-001` (200); the same route with no token →
 401; the same route with `acct-002`'s token and `accountId=acct-001` →
@@ -2024,6 +2227,15 @@ intervention, corporate actions, support tickets) is still just a TODO.
 
 FEATURES.md §19's copy-trading leaderboard and §21's family/joint
 account views + nominee succession (`docs/BUILD_LOG.md` entry 70).
+
+**Correctness fix, `docs/BUILD_LOG.md` entry 87 (regression from this
+repo's own entry-84 auth pass):** `main.go`'s family-access and
+referral-qualification handlers both called `omsgatewayclient.FetchPositions`
+with no `Authorization` header — silently broken (401s from
+oms-gateway) since entry 84 gated oms-gateway's `/positions` behind
+`RequireAuth`. `FetchPositions` gained a `callerAuthorizationHeaderValue`
+parameter, threaded through from both call sites, forwarding the
+caller's own bearer token.
 
 `strategyleaderboard` reads real data from `oms-gateway`'s
 `internal/strategyfollowing` and `internal/algolimits` via a new
@@ -2432,6 +2644,20 @@ T=1y → 10.4506), the IV solver recovering σ≈0.2 from that same price, the
 400/422 error paths, and the CORS header — all via real `curl` requests,
 not just `pytest`.
 
+**Correctness fixes, `docs/BUILD_LOG.md` entry 87:** a `bool("false")`
+gotcha at both `_handlePriceAndGreeksRequest` and
+`_handleImpliedVolatilityRequest` — `bool(requestBody["isCallOptionNotPut"])`
+turned the JSON string `"false"` into Python `True` silently; both now
+require an actual JSON boolean via `isinstance` and raise otherwise.
+Separately, a new `_requireDictField` helper closes a systemic
+null-field crash: 6 call sites across 5 endpoint handlers
+(`_handleCorrelationMatrixRequest`, `_handleFactorRiskRequest` — 2
+call sites, `_handleLatencyBenchmarkRequest`,
+`_handlePortfolioHealthCheckRequest`,
+`_handleAlternativeDataFilingAnomalyRequest`) previously let a `None`/
+missing dict-shaped request field raise an uncaught `AttributeError`
+(→ opaque 500) instead of a clean, caught `ValueError` (→ 422).
+
 ### `riskStatistics.py`, `arbitrageScanner.py`, `backtesting/` — new this build
 
 FEATURES.md §6: "Sharpe Ratio / Sortino Ratio / max drawdown" and
@@ -2463,6 +2689,25 @@ instrument rather than sizing two real hedge-ratio legs; formulas are
 real math, not tuned against live market data. (Paper trading was
 subsequently built in `oms-gateway` — see its section above — and
 strategy deployment gates were subsequently built here, below.)
+
+**Correctness fixes, `docs/BUILD_LOG.md` entry 87:**
+`arbitrageScanner.py`'s `scanManyLivePricesForDeviationAlerts` used to
+let one symbol's bad (non-positive) theoretical price raise and abort
+the ENTIRE batch scan; now wraps each symbol in
+`try/except ValueError: continue`, so one bad input no longer takes
+down every other symbol's result. New shared module
+`backtesting/positionTolerance.py` (`POSITION_FLAT_EPSILON = 1e-9`,
+`isPositionFlat(quantity)`) replaces exact `== 0` float-equality checks
+at 3 sites in `backtestRunner.py` (`PortfolioState.calculateUnrealizedProfitAndLoss`,
+`applySignedQuantityChangeToPortfolio`'s same-direction check and its
+`newPositionQuantity == 0` check) and 1 site in
+`pairsTradingStrategy.py` (the `isFlat`/`isLong`/`isShort` entry-rule
+logic). A third, related float-equality fix in
+`realisticBacktestCostModel.py` (`isFullyFilled=(totalFilledQuantity
+== orderQuantity)` → an epsilon comparison) fixes the same class of
+bug but does NOT import `positionTolerance` — it defines its own
+local, duplicate `_FULLY_FILLED_QUANTITY_EPSILON = 1e-9` instead; a
+real follow-up should route it through the shared module.
 
 ### `garchVolatilityForecaster.py`, `correlationMatrixEngine.py`, `valueAtRiskCalculator.py`, `volatilitySurfaceBuilder.py`, `strategyLifecycle.py`, `marketMakingSandbox.py`, `illustrativeSentimentTradingHook.py` — new this build
 
@@ -2580,6 +2825,15 @@ a converged, very-tight-variance state's Gaussian emission density
 underflowed to exactly `0.0` for a distant observation — fixed with a
 genuine log-space density helper instead of composing `log(exp(...))`.
 
+**A second, related bug in the FORWARD algorithm (not Viterbi) was
+found and fixed, `docs/BUILD_LOG.md` entry 87:** `runForwardAlgorithm`
+materialized raw probabilities and divided to normalize at each step —
+the same converged/tight-variance + distant-observation scenario above
+could underflow that normalization to `ZeroDivisionError`/`math domain
+error`. Rewritten to genuine log-space accumulation (new `_logSumExp`
+helper, log-space transition/emission throughout) — the underflow is
+now structurally impossible, not just less likely.
+
 **Verified live over HTTP:** factor risk, latency benchmark, and both
 corporate-action endpoints all matched hand-worked values exactly.
 Walk-forward, the macro dashboard, and the HMM itself are pytest-
@@ -2593,6 +2847,14 @@ thresholds are real literature conventions, not empirically
 recalibrated; the HMM uses single-restart quantile initialization (a
 real local-optimum risk); the early-exercise check omits transaction
 costs/tax weighting and American put early-exercise.
+
+**Correctness fix, `docs/BUILD_LOG.md` entry 87:**
+`syntheticPositionBuilder.py`'s `validateProposedCombinationAgainstSyntheticStructure`
+validated each leg's ratio independently, so two DUPLICATE legs of the
+same type could each individually pass a per-leg check while the
+combined exposure was actually double the structure's definition —
+rewritten to aggregate quantity BY leg type (`aggregatedQuantityByLegType`)
+before comparing against the expected ratio.
 
 ### FEATURES.md §16 "AI, Data & Research" — all 7 items, new this build
 
@@ -2648,6 +2910,14 @@ identical security" as same-symbol only; the custom-index item's
 licensing/entitlement system — only the real construction-and-backtest
 engine was in scope.
 
+**Correctness fix, `docs/BUILD_LOG.md` entry 87:**
+`portfolioHealthCheckDiversificationAnalyzer.py`'s `performPortfolioHealthCheck`
+crashed on an all-zero-weight portfolio — `calculateHerfindahlHirschmanIndex`
+correctly computed exactly `0`, which then broke a downstream
+precondition in `calculateEffectiveNumberOfHoldings`. A new explicit
+`if positionHhi == 0: raise ValueError(...)` guard turns that into a
+clean 422 instead of an opaque 500.
+
 ---
 
 ## apps/web (Next.js) — one page, now covering most of oms-gateway's surface plus a live price chart
@@ -2659,7 +2929,7 @@ Router). Real dependency tree, not hand-rolled.
 |---|---|
 | `app/page.tsx` — `RetailTradingDashboardPage` | Top-level page, composes the six sections below. |
 | `app/page.tsx` — `AccountSection` | Register/login/logout against the NEW `services/auth` (`NEXT_PUBLIC_AUTH_BASE_URL`, default `127.0.0.1:8086`) — real JWT access token + refresh token displayed on login, logout calls `/auth/logout`. Deliberately NOT wired into `OrderTicketSection`'s account field: auth mints its own `acct-<random hex>` identifier space, disconnected from oms-gateway's/ledger's seeded demo accounts — see `services/auth/README.md`. |
-| `app/page.tsx` — `OrderTicketSection` | Submits to `/orders/submit` or (if the Cover Order toggle is on) `/orders/cover-submit`. Order-type dropdown selects Limit/Market/SL/SL-M, mapping to the right `orderIsMarketOrderNotLimit`/`orderIsStopLossVariant`/`stopTriggerPriceInMinorUnits` combination. Idempotency key auto-generated via `crypto.randomUUID()` (editable, regeneratable) so a real double-click exercises the idempotency guard rather than defeating it. AMO checkbox and Cover Order toggle are mutually exclusive in the UI (an AMO can't also be a cover order in this skeleton). |
+| `app/page.tsx` — `OrderTicketSection` | Submits to `/orders/submit` or (if the Cover Order toggle is on) `/orders/cover-submit`. Order-type dropdown selects Limit/Market/SL/SL-M, mapping to the right `orderIsMarketOrderNotLimit`/`orderIsStopLossVariant`/`stopTriggerPriceInMinorUnits` combination. Idempotency key auto-generated via `crypto.randomUUID()` (editable, regeneratable) so a real double-click exercises the idempotency guard rather than defeating it — **and, as of `docs/BUILD_LOG.md` entry 87, auto-REGENERATED on every successful submission** (`setIdempotencyKey(generateIdempotencyKey())` right after a successful ack), closing a real bug where a second, genuinely distinct order submitted before the user manually clicked "generate a new key" would reuse the already-consumed key and silently get back oms-gateway's cached response for the FIRST order instead of actually submitting. AMO checkbox and Cover Order toggle are mutually exclusive in the UI (an AMO can't also be a cover order in this skeleton). |
 | `app/page.tsx` — `OrderAcknowledgementCard` | Renders one `OrderAcknowledgementResponse`: a distinct amber state for `isQueuedAsAfterMarketOrder`, green/red for accepted/rejected, surfaces `matchingEngineOrderSequenceNumber`, `matchingEngineHandoffError`, and any `tradeExecutionEvents`. |
 | `app/page.tsx` — `PriceChartSection` / `CandlestickChart` | Polls `market-data`'s HTTP query API directly (`NEXT_PUBLIC_MARKET_DATA_BASE_URL`, default `127.0.0.1:9103`) every 5s (toggleable) for `GET /candles` and the latest `GET /trades` tick, and renders hand-rolled SVG candlesticks — no charting library dependency, same "don't reach for a framework" convention as elsewhere in this repo. |
 | `app/page.tsx` — `MarketSessionSection` | Status/open/close against `/market-session/*`, shows queued-AMO count. |
@@ -2720,7 +2990,18 @@ driven backend trigger (oms-gateway's margin state isn't event-driven)
 — shipped as an explicitly-labeled best-effort heuristic, not a real
 margin call. `apps/web` has no test runner (no Jest/Vitest/Playwright in
 `package.json`) — `tsc --noEmit`/`lint`/`build` all clean, live
-verification substitutes for automated frontend tests.
+verification substitutes for automated frontend tests. Still true as
+of `docs/BUILD_LOG.md` entry 87 — that pass's `apps/web` fixes were
+also verified by `tsc`/`lint`/`build` plus logic review, not an
+automated test.
+
+**Correctness fix, `docs/BUILD_LOG.md` entry 87:**
+`notificationCenterSection.tsx`'s `recentNotificationLog` (a
+prepended, truncated-to-20 `string[]`) was rendered via `key={logIndex}`
+— since every entry's index shifts on each new arrival, this was a
+textbook stale-key bug (React reusing/misapplying DOM nodes across
+reorders). Fixed with a real monotonic `logEntryId` per entry, keyed
+on that instead of the array index.
 
 ### `app/volumeProfile/`, `app/orderFlowFootprint/`, `app/domReplay/` — new this build
 
@@ -2755,7 +3036,12 @@ seed a holding, process a corporate action, view the processed log
 repo — that's the separate `corporateactionexplainer` surface, not
 yet linked here). `app/referrals/` — code generation, referral
 recording, qualify-check. `app/screener/` — AND/OR filter builder,
-results table, saved-screen save/get/list/delete. `app/researchCopilot/`
+results table, saved-screen save/get/list/delete (its `"in"`/`"not_in"`
+list-membership operators were selectable but had no way to actually
+enter a list until `docs/BUILD_LOG.md` entry 87 added a
+comma/newline-separated value input, `parseListMembershipValues`, that
+swaps in when one of those operators is selected).
+`app/researchCopilot/`
 — question box, cited answer, non-advisory disclaimer. `app/portfolioHealth/`
 — holdings editor, HHI metrics, severity-colored nudges.
 `app/taxLossHarvesting/` — lot editor, eligible/excluded (wash-sale)
@@ -2796,6 +3082,19 @@ polling market-data's real `GET /pnl/live` every 7s and honestly
 showing a "no live cost basis yet" state rather than a fake number
 when oms-gateway hasn't had a price pushed for that instrument yet.
 `tsc --noEmit`/`eslint`/`next build` all clean — 16 total routes.
+
+**Stale-response race fixed, `docs/BUILD_LOG.md` entry 87:** a new
+shared `app/hooks/useSequencedFetch.ts` hook — a pure incrementing-
+sequence-counter (`startNextRequest()`/`isStillMostRecentRequest()`,
+not an `AbortController` wrapper) — closes 3 real stale-response races
+where a slower, older in-flight poll response could overwrite state a
+newer response already set: `homeScreenLivePnlWidget.tsx`'s
+`refreshPnl` (a stale account's P&L overwriting the current one),
+`page.tsx`'s `PriceChartSection.refreshChartData` (a stale
+instrument's chart data), and `watchlist/page.tsx`'s
+`refreshFullWatchlist` (a stale account's watchlist). These are the
+only 3 sites using the hook; `notificationCenterSection.tsx` and
+`screener/page.tsx` were not migrated to it.
 
 ### `app/portfolioGreeks/`, `app/ivRank/`, `app/developerApi/` — new this build
 
@@ -2979,6 +3278,32 @@ window-detach config) + 6 Rust tests (2 unit + 4 integration), all
 passing. `cargo fmt --check` / `cargo clippy --all-targets -D
 warnings` / `cargo build` clean; `npm install` from a clean
 `node_modules` + `npm run build` (tsc + vite) clean.
+
+**Four correctness fixes, `docs/BUILD_LOG.md` entry 87 — now 73 Vitest
+tests (up from 64), plus the same 6 Rust tests unchanged:**
+`src-tauri/src/lib.rs`'s `.run(tauri::generate_context!()).expect(...)`
+was a bare panic on any Tauri startup failure (missing WebView2/
+webkit2gtk); now matches on the `Result`, prints an actionable message,
+and calls `std::process::exit(1)` instead of panicking. New
+`src/shared/minorUnitsPriceFormatting.ts` (`formatMinorUnitsAsDisplayPrice`)
+fixes `src/domLadder/DomLadderWidget.tsx`, which had been rendering
+raw minor-units integers directly in both the price-ladder cells and
+the order-acknowledgement toast. `CandlestickChartCanvas.tsx` gained
+an exported `shouldRenderFibonacciOverlay` guard, checked before
+`calculateFibonacciRetracementLevels` (which throws on a flat/inverted
+`swingHigh <= swingLow` window) — a flat price range now shows an
+on-canvas note instead of crashing the chart. Two poll races —
+`ChartTileContainer.tsx`'s `refreshChartData` and
+`DomLadderWidget.tsx`'s `refreshLadder` — each gained a
+`latestRequestSequenceNumberRef`, so a slower/older in-flight response
+can no longer overwrite state a newer response already set (on top of
+the pre-existing unmount guard). **Honest limitation on the poll-race
+fixes specifically:** this app still has no component-rendering test
+infrastructure (no `@testing-library/react` or equivalent — all 9
+`*.test.ts` files are pure-logic unit tests, none mount a component
+tree), so these two fixes were verified by logic trace plus a clean
+`tsc`/`vite build`, not by a test that actually races two responses
+against a mounted component.
 
 ## infra/docker — local dev infra, now resource-capped
 

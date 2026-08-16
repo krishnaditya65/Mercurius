@@ -136,6 +136,47 @@ func (registry *Registry) CheckAndReserve(strategyId string, orderNotionalInMino
 	return nil
 }
 
+// Release reverses a prior CheckAndReserve reservation for an order that
+// was ultimately rejected downstream (KYC/freeze/pledge/disclosure/risk/
+// matching-engine-handoff failures in cmd/server/main.go's
+// processOrderSubmission) AFTER already having been reserved here —
+// mirrors internal/marginfunding.FundingBook.RollbackReservation's
+// pattern exactly. Without this, a strategy's rate-limit token and
+// daily-notional usage would be permanently and incorrectly consumed by
+// an order that never actually reached the market. Gives back both the
+// consumed rate-limit token (capped at the bucket's own capacity — see
+// bucketCapacity) and the reserved notional (floored at zero). A no-op,
+// safe call for an unrecognized strategyId (nothing to release).
+func (registry *Registry) Release(strategyId string, orderNotionalInMinorUnits int64, now time.Time) {
+	registry.mutexGuardingState.Lock()
+	defer registry.mutexGuardingState.Unlock()
+
+	state, exists := registry.stateByStrategyId[strategyId]
+	if !exists {
+		return
+	}
+
+	if state.config.MaxOrdersPerSecond > 0 {
+		state.tokensAvailable += 1.0
+		capacity := bucketCapacity(state.config.MaxOrdersPerSecond)
+		if state.tokensAvailable > capacity {
+			state.tokensAvailable = capacity
+		}
+	}
+
+	today := truncateToUtcCalendarDay(now)
+	if !today.Equal(state.currentDayStart) {
+		// The reservation being released was made on a now-past calendar
+		// day whose usage has already reset — nothing to give back
+		// against today's (already-zero) usage.
+		return
+	}
+	state.notionalUsedTodayInMinorUnits -= orderNotionalInMinorUnits
+	if state.notionalUsedTodayInMinorUnits < 0 {
+		state.notionalUsedTodayInMinorUnits = 0
+	}
+}
+
 func (registry *Registry) stateForStrategyLocked(strategyId string, now time.Time) *strategyState {
 	if existing, exists := registry.stateByStrategyId[strategyId]; exists {
 		return existing
@@ -148,7 +189,7 @@ func (registry *Registry) stateForStrategyLocked(strategyId string, now time.Tim
 
 	newState := &strategyState{
 		config:          config,
-		tokensAvailable: config.MaxOrdersPerSecond,
+		tokensAvailable: bucketCapacity(config.MaxOrdersPerSecond),
 		lastRefillTime:  now,
 		currentDayStart: truncateToUtcCalendarDay(now),
 	}
@@ -169,11 +210,12 @@ func checkAndConsumeRateLimitLocked(state *strategyState, now time.Time) error {
 		return nil
 	}
 
+	capacity := bucketCapacity(state.config.MaxOrdersPerSecond)
 	elapsedSeconds := now.Sub(state.lastRefillTime).Seconds()
 	if elapsedSeconds > 0 {
 		state.tokensAvailable += elapsedSeconds * state.config.MaxOrdersPerSecond
-		if state.tokensAvailable > state.config.MaxOrdersPerSecond {
-			state.tokensAvailable = state.config.MaxOrdersPerSecond
+		if state.tokensAvailable > capacity {
+			state.tokensAvailable = capacity
 		}
 		state.lastRefillTime = now
 	}
@@ -213,6 +255,21 @@ func checkAndReserveNotionalLocked(state *strategyState, orderNotionalInMinorUni
 
 	state.notionalUsedTodayInMinorUnits = prospectiveTotal
 	return nil
+}
+
+// bucketCapacity is the token bucket's capacity for a given configured
+// rate: max(1.0, maxOrdersPerSecond). Capping capacity at
+// maxOrdersPerSecond itself (the pre-fix behavior) meant a sub-1 rate
+// (e.g. 0.5, "1 order per 2 seconds") could never accumulate a full
+// token and would PERMANENTLY block that strategy from ever placing an
+// order. Flooring capacity at 1.0 guarantees a sub-1-rate strategy can
+// still burst a single order once it's accumulated enough elapsed time,
+// while a rate >= 1 keeps its exact configured capacity unchanged.
+func bucketCapacity(maxOrdersPerSecond float64) float64 {
+	if maxOrdersPerSecond < 1.0 {
+		return 1.0
+	}
+	return maxOrdersPerSecond
 }
 
 func truncateToUtcCalendarDay(t time.Time) time.Time {

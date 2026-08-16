@@ -13,6 +13,7 @@
 // per project convention.
 
 import { useCallback, useEffect, useState } from "react";
+import { useSequencedFetch } from "./hooks/useSequencedFetch";
 
 const marketDataBaseUrl = process.env.NEXT_PUBLIC_MARKET_DATA_BASE_URL ?? "http://localhost:9103";
 
@@ -48,8 +49,13 @@ export default function HomeScreenLivePnlWidget() {
   const [snapshot, setSnapshot] = useState<LivePnlSnapshot | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [isAutoRefreshing, setIsAutoRefreshing] = useState(true);
+  const startNextPnlRequest = useSequencedFetch();
 
   const refreshPnl = useCallback(async () => {
+    // Financially sensitive display — guard against a stale, slower
+    // response (e.g. for the PREVIOUS account identifier) resolving after
+    // a newer request already rendered and showing the wrong account's P&L.
+    const isStillMostRecentRequest = startNextPnlRequest();
     try {
       const httpResponse = await fetch(
         `${marketDataBaseUrl}/pnl/live?accountIdentifier=${encodeURIComponent(accountIdentifier)}`
@@ -59,16 +65,18 @@ export default function HomeScreenLivePnlWidget() {
         throw new Error(parsedError?.errorMessage ?? `HTTP ${httpResponse.status}`);
       }
       const parsed: LivePnlSnapshot = await httpResponse.json();
+      if (!isStillMostRecentRequest()) return;
       setSnapshot(parsed);
       setErrorMessage(null);
     } catch (thrownError) {
+      if (!isStillMostRecentRequest()) return;
       setErrorMessage(
         thrownError instanceof Error
           ? `Couldn't compute live P&L: ${thrownError.message}. Is market-data running on ${marketDataBaseUrl} (and oms-gateway reachable from it)?`
           : "Unknown error fetching live P&L."
       );
     }
-  }, [accountIdentifier]);
+  }, [accountIdentifier, startNextPnlRequest]);
 
   useEffect(() => {
     // eslint-disable-next-line react-hooks/set-state-in-effect

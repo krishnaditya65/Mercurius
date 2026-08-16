@@ -149,27 +149,41 @@ def validateProposedCombinationAgainstSyntheticStructure(
                 None, False, "all option legs in a synthetic structure must share exactly one strike price"
             )
 
-    # Determine the implied "unit multiplier" from the first leg, then
-    # require every other leg's quantity to be exactly that multiplier
-    # times the structure's defined ratio for its leg type.
-    firstLeg = legs[0]
-    definedRatioForFirstLeg = structureDefinition[firstLeg.legType]
-    if definedRatioForFirstLeg == 0.0:
+    # Aggregate (sum) quantities BY LEG TYPE first, rather than checking
+    # each leg independently — checking legs independently against a
+    # per-type ratio can be fooled by a duplicate leg of the same type
+    # (e.g. two CALL legs + one PUT leg against a structure that expects
+    # exactly one CALL leg): each individual CALL leg can independently
+    # "match" the CALL ratio while the combination's TOTAL CALL exposure
+    # is actually double what the structure defines. Aggregating first
+    # and comparing the aggregate per type against the expected total
+    # correctly catches that mismatch (see module/audit notes).
+    aggregatedQuantityByLegType: dict[OptionLegType, float] = {}
+    for leg in legs:
+        aggregatedQuantityByLegType[leg.legType] = aggregatedQuantityByLegType.get(leg.legType, 0.0) + leg.quantity
+
+    # Determine the implied "unit multiplier" from the first leg's TYPE
+    # aggregate, then require every leg type's aggregated quantity to be
+    # exactly that multiplier times the structure's defined ratio for
+    # that type.
+    firstLegType = legs[0].legType
+    definedRatioForFirstLegType = structureDefinition[firstLegType]
+    if definedRatioForFirstLegType == 0.0:
         return SyntheticStructureValidationResult(None, False, "malformed structure definition")
-    unitMultiplier = firstLeg.quantity / definedRatioForFirstLeg
+    unitMultiplier = aggregatedQuantityByLegType[firstLegType] / definedRatioForFirstLegType
     if unitMultiplier <= 0.0:
         return SyntheticStructureValidationResult(
             None, False, "implied unit multiplier is not strictly positive — quantities/signs don't match"
         )
 
-    for leg in legs:
-        definedRatio = structureDefinition[leg.legType]
+    for legType, definedRatio in structureDefinition.items():
         expectedQuantity = definedRatio * unitMultiplier
-        if abs(leg.quantity - expectedQuantity) > 1e-9:
+        aggregatedQuantity = aggregatedQuantityByLegType[legType]
+        if abs(aggregatedQuantity - expectedQuantity) > 1e-9:
             return SyntheticStructureValidationResult(
                 None,
                 False,
-                f"leg {leg.legType.value} quantity {leg.quantity} does not match expected "
+                f"aggregated {legType.value} quantity {aggregatedQuantity} does not match expected "
                 f"{expectedQuantity} for {unitMultiplier}x {candidateStructureName.value}",
             )
 

@@ -124,7 +124,14 @@ def scanManyLivePricesForDeviationAlerts(
     for symbol, theoreticalFairPrice in theoreticalFairPricesBySymbol.items():
         if symbol not in liveMarketPricesBySymbol:
             continue
-        alertsBySymbol[symbol] = scanForTheoreticalVersusLivePriceDeviation(
-            theoreticalFairPrice, liveMarketPricesBySymbol[symbol], deviationThresholdPercentage
-        )
+        try:
+            alertsBySymbol[symbol] = scanForTheoreticalVersusLivePriceDeviation(
+                theoreticalFairPrice, liveMarketPricesBySymbol[symbol], deviationThresholdPercentage
+            )
+        except ValueError:
+            # A non-positive theoreticalFairPrice for one symbol (e.g. a
+            # bad upstream pricing input) shouldn't fail the whole batch
+            # scan — same "skip this symbol, keep going" contract already
+            # documented above for a missing live quote.
+            continue
     return alertsBySymbol

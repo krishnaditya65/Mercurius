@@ -44,15 +44,33 @@ type RiskCheckOutcome struct {
 
 // EvaluateOrderAgainstAvailableMargin is the sub-millisecond synchronous
 // check every incoming order must pass before it is ever routed to the
-// matching engine. It does NOT mutate the cached balance — margin is only
-// actually debited once a fill event comes back from the matching engine
-// (TODO(real build): wire that reconciliation path).
+// matching engine.
+//
+// ATOMIC CHECK-AND-RESERVE (fixes a confirmed TOCTOU race): on approval,
+// this immediately DEBITS (reserves) orderNotionalValueInMinorUnits from
+// the account's cached available margin, in the SAME write-locked
+// operation as the check itself — not a separate read-only check
+// followed by a later, out-of-band debit. Without this, two concurrent
+// orders for the same account could both read the same pre-debit balance
+// and both be approved, together committing more than the account
+// actually has available. The caller MUST pair every approval with
+// exactly one of:
+//   - ReleaseReservedMargin, if the order is ultimately rejected
+//     downstream (KYC/freeze/pledge/disclosure gates all run BEFORE this
+//     check in cmd/server/main.go's processOrderSubmission, so nothing
+//     to release there — but matching-engine-handoff failure/rejection,
+//     and paper-trading orders which never reach real settlement, both
+//     must release); or
+//   - AdjustAvailableMarginInMinorUnits with the real executed delta
+//     once the order actually settles, alongside releasing the
+//     reservation (see cmd/server/main.go's processOrderSubmission for
+//     the exact reserve -> release-or-settle wiring).
 func (riskEngine *PreTradeRiskEngine) EvaluateOrderAgainstAvailableMargin(
 	clientAccountIdentifier string,
 	orderNotionalValueInMinorUnits int64,
 ) RiskCheckOutcome {
-	riskEngine.mutexGuardingAvailableMarginCache.RLock()
-	defer riskEngine.mutexGuardingAvailableMarginCache.RUnlock()
+	riskEngine.mutexGuardingAvailableMarginCache.Lock()
+	defer riskEngine.mutexGuardingAvailableMarginCache.Unlock()
 
 	availableMargin, accountIsKnown := riskEngine.availableMarginInMinorUnitsByAccountId[clientAccountIdentifier]
 	if !accountIsKnown {
@@ -75,7 +93,25 @@ func (riskEngine *PreTradeRiskEngine) EvaluateOrderAgainstAvailableMargin(
 		}
 	}
 
+	riskEngine.availableMarginInMinorUnitsByAccountId[clientAccountIdentifier] = availableMargin - orderNotionalValueInMinorUnits
 	return RiskCheckOutcome{IsOrderApproved: true}
+}
+
+// ReleaseReservedMargin reverses a reservation EvaluateOrderAgainstAvailableMargin
+// made on approval, for an order that ultimately never settles (rejected
+// downstream after approval, e.g. a matching-engine hand-off failure, or
+// a paper-trading order which never reaches real settlement at all) —
+// mirrors internal/marginfunding.FundingBook.RollbackReservation's
+// pattern exactly. Safe to call for an unknown account (a no-op, same
+// convention as every other method here).
+func (riskEngine *PreTradeRiskEngine) ReleaseReservedMargin(
+	clientAccountIdentifier string,
+	reservedAmountInMinorUnits int64,
+) {
+	riskEngine.mutexGuardingAvailableMarginCache.Lock()
+	defer riskEngine.mutexGuardingAvailableMarginCache.Unlock()
+
+	riskEngine.availableMarginInMinorUnitsByAccountId[clientAccountIdentifier] += reservedAmountInMinorUnits
 }
 
 // AvailableMarginInMinorUnits returns the account's current cached

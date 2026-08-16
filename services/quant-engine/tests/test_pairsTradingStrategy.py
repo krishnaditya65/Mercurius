@@ -2,7 +2,11 @@ import math
 
 import pytest
 
-from quantengine.backtesting.backtestRunner import TradeAction, runDeterministicEventDrivenBacktest
+from quantengine.backtesting.backtestRunner import (
+    PortfolioState,
+    TradeAction,
+    runDeterministicEventDrivenBacktest,
+)
 from quantengine.backtesting.pairsTradingStrategy import (
     ZScoreMeanReversionPairsTradingStrategy,
     calculateRollingMeanAndStandardDeviation,
@@ -117,3 +121,37 @@ def test_endToEndPairsTradingStrategyIsDeterministicAcrossRepeatedRuns():
 
     assert firstResult.equityCurve == secondResult.equityCurve
     assert firstResult.finalTotalEquity == secondResult.finalTotalEquity
+
+
+def test_strategyTreatsFloatDustResidualPositionAsFlatInsteadOfPermanentlyHolding():
+    # A float-dust residual positionQuantity (e.g. left over from a
+    # backtest's earlier float accumulation error — see
+    # test_backtestRunner.py's matching regression test) must still be
+    # treated as FLAT by the strategy's entry rule. An exact
+    # `positionQuantity == 0` check would misclassify this tiny non-zero
+    # residual as "still long"/"still short" and, since this strategy
+    # only ever opens a new position while flat, would wedge it into
+    # perpetual HOLD forever even when the z-score clearly signals entry.
+    strategy = ZScoreMeanReversionPairsTradingStrategy(
+        lookbackWindowSize=5, entryZScoreThreshold=1.0, exitZScoreThreshold=0.3, tradeQuantity=1.0
+    )
+    # Warm up the rolling window with flat prices, then a sharp spike so
+    # the z-score clearly exceeds entryZScoreThreshold on the final tick.
+    warmupTicks = [
+        HistoricalPriceTick(timestamp=float(i), price=100.0) for i in range(4)
+    ]
+    spikeTick = HistoricalPriceTick(timestamp=4.0, price=200.0)
+
+    portfolioState = PortfolioState(cashBalance=100_000.0, positionQuantity=1e-16)
+
+    decisions = [strategy(tick, portfolioState) for tick in warmupTicks]
+    finalDecision = strategy(spikeTick, portfolioState)
+
+    # A correct FRESH ENTRY trades the full tradeQuantity (1.0). A buggy
+    # exact `== 0` flat-check instead misreads the 1e-16 dust as an
+    # already-open long position (1e-16 > 0 is True in Python) and
+    # "exits" it — a SELL of only abs(positionQuantity) ~= 1e-16, not a
+    # real entry — which this assertion catches even though both are
+    # nominally TradeAction.SELL.
+    assert finalDecision.action == TradeAction.SELL
+    assert finalDecision.quantity == pytest.approx(strategy.tradeQuantity)

@@ -95,6 +95,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"math/big"
 	"sort"
 	"sync"
 
@@ -112,6 +113,15 @@ var ErrInsufficientCurrencyWalletBalance = errors.New("amount exceeds that curre
 var ErrUnknownCurrencyPair = errors.New("no static FX rate is configured for this currency pair")
 var ErrCannotConvertSameCurrency = errors.New("fromCurrencyCode and toCurrencyCode must differ")
 
+// fxRateScale is the fixed denominator every configured FX rate is
+// converted to internally: a rate is stored as an integer numerator over
+// this denominator (e.g. 83.0 -> 8_300_000_000 / fxRateScale) so that
+// converting an amount is exact integer multiply-then-divide arithmetic,
+// never float64 multiplication — see ConvertBetweenCurrencyWallets and
+// convertMinorUnitsRoundHalfUp. 1e8 gives 8 decimal digits of rate
+// precision, comfortably more than any real FX quote needs.
+const fxRateScale = 100_000_000
+
 // FxRateTable is a STATIC, ILLUSTRATIVE set of exchange rates — NOT a
 // live market feed. Each entry is a one-directional rate: how many
 // minor-unit-equivalents of toCurrencyCode one minor-unit-equivalent of
@@ -120,18 +130,29 @@ var ErrCannotConvertSameCurrency = errors.New("fromCurrencyCode and toCurrencyCo
 // NOT automatically derived as a reciprocal, since a real FX desk would
 // never assume a flat, spread-free reciprocal either; if you want
 // INR->USD to work, configure it explicitly.
+//
+// Internally each rate is stored as an integer numerator over
+// fxRateScale, NOT as a float64 — so every conversion computed from it is
+// deterministic, exact integer arithmetic, not float64 multiplication
+// drift. The wire/API shape (constructing from and reading back a
+// float64) is unchanged; only the internal representation and the actual
+// per-conversion math changed.
 type FxRateTable struct {
-	rateByOrderedCurrencyPairKey map[string]float64
+	scaledRateByOrderedCurrencyPairKey map[string]int64
 }
 
 // NewStaticFxRateTable builds a rate table from ordered-pair rates keyed
 // "FROM/TO", e.g. map[string]float64{"USD/INR": 83.0, "INR/USD": 1.0 / 83.0}.
+// Each float64 rate is converted ONCE, here, to a fixed-point integer
+// (rate * fxRateScale, rounded to the nearest integer) — the one-time,
+// non-money-moving conversion this package's TODO explicitly allows,
+// unlike doing float64 math per-transaction against real balances.
 func NewStaticFxRateTable(rateByOrderedCurrencyPairKey map[string]float64) *FxRateTable {
-	copiedRates := make(map[string]float64, len(rateByOrderedCurrencyPairKey))
+	scaledRates := make(map[string]int64, len(rateByOrderedCurrencyPairKey))
 	for pairKey, rate := range rateByOrderedCurrencyPairKey {
-		copiedRates[pairKey] = rate
+		scaledRates[pairKey] = int64(math.Round(rate * fxRateScale))
 	}
-	return &FxRateTable{rateByOrderedCurrencyPairKey: copiedRates}
+	return &FxRateTable{scaledRateByOrderedCurrencyPairKey: scaledRates}
 }
 
 func orderedCurrencyPairKey(fromCurrencyCode, toCurrencyCode CurrencyCode) string {
@@ -139,11 +160,39 @@ func orderedCurrencyPairKey(fromCurrencyCode, toCurrencyCode CurrencyCode) strin
 }
 
 // Rate looks up the static illustrative rate for converting FROM
-// fromCurrencyCode TO toCurrencyCode. found is false if that exact
-// ordered pair was never configured.
+// fromCurrencyCode TO toCurrencyCode, as a float64 for callers/reporting
+// (e.g. CurrencyConversionResult.RateApplied) — found is false if that
+// exact ordered pair was never configured. Actual money conversions use
+// scaledRate below instead, never this float64 value.
 func (fxRateTable *FxRateTable) Rate(fromCurrencyCode, toCurrencyCode CurrencyCode) (rate float64, found bool) {
-	rate, found = fxRateTable.rateByOrderedCurrencyPairKey[orderedCurrencyPairKey(fromCurrencyCode, toCurrencyCode)]
-	return rate, found
+	scaledRate, found := fxRateTable.scaledRateByOrderedCurrencyPairKey[orderedCurrencyPairKey(fromCurrencyCode, toCurrencyCode)]
+	if !found {
+		return 0, false
+	}
+	return float64(scaledRate) / float64(fxRateScale), true
+}
+
+// scaledRate returns the raw integer-numerator-over-fxRateScale rate used
+// for actual money-moving arithmetic — see convertMinorUnitsRoundHalfUp.
+func (fxRateTable *FxRateTable) scaledRate(fromCurrencyCode, toCurrencyCode CurrencyCode) (scaledRateNumerator int64, found bool) {
+	scaledRateNumerator, found = fxRateTable.scaledRateByOrderedCurrencyPairKey[orderedCurrencyPairKey(fromCurrencyCode, toCurrencyCode)]
+	return scaledRateNumerator, found
+}
+
+// convertMinorUnitsRoundHalfUp computes
+// round_half_up(amountInMinorUnits * scaledRateNumerator / fxRateScale)
+// using exact integer (big.Int) arithmetic — never float64 — so the
+// result is deterministic and auditable regardless of amount/rate
+// magnitude. "Round half up" (a fraction of exactly .5 always rounds
+// AWAY FROM ZERO) is the explicit, documented rounding rule; every input
+// here is guaranteed non-negative by the caller.
+func convertMinorUnitsRoundHalfUp(amountInMinorUnits int64, scaledRateNumerator int64, scaleDenominator int64) int64 {
+	numerator := new(big.Int).Mul(big.NewInt(amountInMinorUnits), big.NewInt(scaledRateNumerator))
+	denominator := big.NewInt(scaleDenominator)
+	halfDenominator := new(big.Int).Rsh(denominator, 1) // denominator/2, for round-half-up
+	numerator.Add(numerator, halfDenominator)
+	result := new(big.Int).Div(numerator, denominator)
+	return result.Int64()
 }
 
 // CurrencyWalletBalance is one currency's real balance for one account,
@@ -180,6 +229,16 @@ type MultiCurrencyWalletRegistry struct {
 
 	mutexGuardingOpenedWallets sync.Mutex
 	openedCurrenciesByAccount  map[string]map[CurrencyCode]bool
+
+	// mutexGuardingBalanceMutations serializes every check-then-post
+	// balance mutation (WithdrawFromCurrencyWallet,
+	// ConvertBetweenCurrencyWallets) so a balance check and the journal
+	// entry that acts on it happen atomically — without this, two
+	// concurrent calls could both read a sufficient balance before either
+	// posted, overdrawing a currency wallet. This is deliberately a
+	// SEPARATE mutex from mutexGuardingOpenedWallets above, which guards
+	// only the openedCurrenciesByAccount bookkeeping map, not balances.
+	mutexGuardingBalanceMutations sync.Mutex
 }
 
 // NewMultiCurrencyWalletRegistry wires a new wallet layer on top of an
@@ -317,6 +376,14 @@ func (registry *MultiCurrencyWalletRegistry) WithdrawFromCurrencyWallet(accountI
 	}
 
 	ledgerAccountIdentifier := registry.ledgerAccountIdentifierFor(accountIdentifier, currencyCode)
+
+	// The balance check and the debit posting MUST be atomic — see
+	// mutexGuardingBalanceMutations' doc comment. Without this lock, two
+	// concurrent withdrawals could both read a sufficient balance before
+	// either one's debit posted, overdrawing the wallet.
+	registry.mutexGuardingBalanceMutations.Lock()
+	defer registry.mutexGuardingBalanceMutations.Unlock()
+
 	if registry.currentWalletBalance(ledgerAccountIdentifier) < amountInMinorUnits {
 		return ErrInsufficientCurrencyWalletBalance
 	}
@@ -343,12 +410,11 @@ func (registry *MultiCurrencyWalletRegistry) WithdrawFromCurrencyWallet(accountI
 // CLIENT-classified native-currency legs).
 //
 // The converted amount is computed as
-// round(amountInFromCurrencyMinorUnits * rate) — exact whenever the rate
-// and amount combine to a whole number (e.g. 10,000 minor units at an
-// 83.0 rate is exactly 830,000, no rounding at all), and rounded to the
-// nearest minor unit otherwise. This is illustrative float64 arithmetic,
-// not the fixed-point/rational math a real money-moving system should
-// use — see the package doc's TODO section.
+// round_half_up(amountInFromCurrencyMinorUnits * scaledRate / fxRateScale)
+// using exact integer (big.Int) arithmetic — see
+// convertMinorUnitsRoundHalfUp — NOT float64 multiplication, so the
+// result is deterministic and auditable rather than subject to IEEE754
+// binary-fraction rounding drift.
 func (registry *MultiCurrencyWalletRegistry) ConvertBetweenCurrencyWallets(
 	accountIdentifier string,
 	fromCurrencyCode CurrencyCode,
@@ -372,15 +438,24 @@ func (registry *MultiCurrencyWalletRegistry) ConvertBetweenCurrencyWallets(
 	if !rateFound {
 		return CurrencyConversionResult{}, ErrUnknownCurrencyPair
 	}
+	scaledRate, _ := registry.fxRateTable.scaledRate(fromCurrencyCode, toCurrencyCode)
 
 	fromLedgerAccountIdentifier := registry.ledgerAccountIdentifierFor(accountIdentifier, fromCurrencyCode)
 	toLedgerAccountIdentifier := registry.ledgerAccountIdentifierFor(accountIdentifier, toCurrencyCode)
+
+	// The balance check and the conversion's journal entry MUST be
+	// atomic — see mutexGuardingBalanceMutations' doc comment. Without
+	// this lock, two concurrent conversions (or a conversion racing a
+	// withdrawal) could both read a sufficient source-currency balance
+	// before either posted, overdrawing the wallet.
+	registry.mutexGuardingBalanceMutations.Lock()
+	defer registry.mutexGuardingBalanceMutations.Unlock()
 
 	if registry.currentWalletBalance(fromLedgerAccountIdentifier) < amountInFromCurrencyMinorUnits {
 		return CurrencyConversionResult{}, ErrInsufficientCurrencyWalletBalance
 	}
 
-	convertedAmountInMinorUnits := int64(math.Round(float64(amountInFromCurrencyMinorUnits) * rate))
+	convertedAmountInMinorUnits := convertMinorUnitsRoundHalfUp(amountInFromCurrencyMinorUnits, scaledRate, fxRateScale)
 	if convertedAmountInMinorUnits <= 0 {
 		return CurrencyConversionResult{}, ErrInvalidWalletAmount
 	}

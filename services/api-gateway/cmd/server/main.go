@@ -14,7 +14,9 @@ package main
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"strconv"
@@ -189,8 +191,11 @@ func main() {
 
 	// Everything else (any path not matched above) is proxied through
 	// to the real backend services, gated by rate limiting + API-key
-	// validation.
-	httpRequestMultiplexer.Handle("/", backendProxy)
+	// validation, AND (see buildProxyAccessGate) either a valid JWT or a
+	// valid API key -- this was previously the one route in this file
+	// with no authentication check at all, a live bypass around every
+	// other route's auth.
+	httpRequestMultiplexer.Handle("/", buildProxyAccessGate(signingSecret, apiKeyManager, backendProxy))
 
 	rateLimitedHandler := buildRateLimitingMiddleware(globalRateLimiter, apiKeyManager, httpRequestMultiplexer)
 	corsWrappedHandler := withAllowListedCorsForDevelopment(rateLimitedHandler)
@@ -210,21 +215,22 @@ func main() {
 // `X-Api-Key` header are rate-limited per that key's own issued tier;
 // requests with no API key (e.g. the platform's own web/desktop client
 // traffic, or unauthenticated calls to endpoints like /health) are
-// rate-limited under a shared RETAIL-tier bucket keyed by a constant —
-// generous enough for normal traffic, but still a real limit rather
-// than unlimited passthrough. An INVALID (present but unrecognized or
-// revoked) API key is rejected outright with 401 — failing closed,
-// never silently falling back to the anonymous bucket.
+// rate-limited per SOURCE IP ADDRESS (see remoteAddressKey) rather than
+// one shared bucket for all anonymous traffic — a single constant key
+// meant every anonymous caller on the internet shared one RETAIL-tier
+// bucket, so any one anonymous client could exhaust everyone else's
+// quota. Still generous enough for normal traffic, but now a real
+// per-source limit rather than a global one. An INVALID (present but
+// unrecognized or revoked) API key is rejected outright with 401 —
+// failing closed, never silently falling back to the anonymous bucket.
 func buildRateLimitingMiddleware(limiter *ratelimiter.TokenBucketRateLimiter, keyManager *apikeymanager.ApiKeyManager, next http.Handler) http.Handler {
-	const anonymousRateLimitKey = "anonymous"
-
 	return http.HandlerFunc(func(responseWriter http.ResponseWriter, request *http.Request) {
 		if request.URL.Path == "/health" {
 			next.ServeHTTP(responseWriter, request)
 			return
 		}
 
-		rateLimitKey := anonymousRateLimitKey
+		rateLimitKey := remoteAddressKey(request)
 		tier := ratelimiter.RateLimitTierRetail
 
 		if apiKeyValue := request.Header.Get("X-Api-Key"); apiKeyValue != "" {
@@ -247,6 +253,61 @@ func buildRateLimitingMiddleware(limiter *ratelimiter.TokenBucketRateLimiter, ke
 		}
 
 		next.ServeHTTP(responseWriter, request)
+	})
+}
+
+// remoteAddressKey strips the port off request.RemoteAddr (host:port) so
+// the rate limiter keys on just the address — falls back to the raw
+// value if it doesn't parse as host:port (e.g. in some test harnesses).
+// Matches services/auth's cmd/server/main.go remoteAddressKey exactly,
+// including its documented limitation: this reads request.RemoteAddr
+// directly, which is the load balancer's/reverse proxy's own address in
+// any real deployment, not the actual client — needs real
+// X-Forwarded-For handling (with the trusted-proxy-hop caveats that come
+// with it) before this is meaningful behind anything but a direct
+// connection.
+func remoteAddressKey(request *http.Request) string {
+	host, _, splitError := net.SplitHostPort(request.RemoteAddr)
+	if splitError != nil {
+		return request.RemoteAddr
+	}
+	return host
+}
+
+// buildProxyAccessGate closes the one route in this file that used to
+// have zero authentication: the reverse-proxy catch-all ("/"). Every
+// other route in this file is wrapped in authmiddleware.RequireAuth/
+// RequireRole; this one previously had only the OPTIONAL X-Api-Key
+// rate-limit check from buildRateLimitingMiddleware, so a fully
+// anonymous request (no JWT, no API key at all) could reach every
+// backend service proxied through here.
+//
+// The proxy's access model isn't purely JWT-based, though — README.md
+// documents X-Api-Key as this gateway's actual developer/API-management
+// mechanism (issued via /developer/api-keys, rate-limited per its own
+// tier), and buildRateLimitingMiddleware's own doc comment already
+// distinguishes "the platform's own web/desktop client traffic" (which
+// authenticates with a JWT, not an API key) from developer/programmatic
+// API traffic (which authenticates with an API key, and may have no
+// user JWT at all). So this gate accepts EITHER:
+//   - a request carrying X-Api-Key: by the time this gate runs,
+//     buildRateLimitingMiddleware (which wraps the whole mux, including
+//     this route) has already called keyManager.ValidateApiKey and
+//     rejected an invalid/revoked key with 401 -- so a present X-Api-Key
+//     here is already known-valid, and this gate just lets it through.
+//   - a request with no X-Api-Key: this is where the actual bypass was
+//     -- it now runs the same authmiddleware.RequireAuth every other
+//     route uses, so an anonymous request with neither an API key nor a
+//     JWT gets a 401, not a free pass to every backend service.
+func buildProxyAccessGate(signingSecret []byte, keyManager *apikeymanager.ApiKeyManager, next http.Handler) http.Handler {
+	requireJwtAuth := authmiddleware.RequireAuth(signingSecret, next.ServeHTTP)
+
+	return http.HandlerFunc(func(responseWriter http.ResponseWriter, request *http.Request) {
+		if request.Header.Get("X-Api-Key") != "" {
+			next.ServeHTTP(responseWriter, request)
+			return
+		}
+		requireJwtAuth(responseWriter, request)
 	})
 }
 
@@ -428,14 +489,26 @@ func buildTcaReportHandler() http.HandlerFunc {
 	}
 }
 
-type omsPositionsWireResponse []struct {
-	InstrumentSymbol        string `json:"instrumentSymbol"`
-	MarketValueInMinorUnits int64  `json:"marketValueInMinorUnits"`
+// omsPositionsWireResponse mirrors oms-gateway's real GET /positions
+// response shape exactly (see that service's buildPositionsHandler /
+// backoffice's omsgatewayclient.PositionsWireResponse, which mirrors the
+// same thing): a net QUANTITY per instrument symbol. oms-gateway's
+// /positions response has no market-value field at all.
+type omsPositionsWireResponse struct {
+	AccountIdentifier             string           `json:"accountIdentifier"`
+	NetQuantityByInstrumentSymbol map[string]int64 `json:"netQuantityByInstrumentSymbol"`
 }
 
-type mutualFundsHoldingsWireResponse []struct {
-	SchemeName               string `json:"schemeName"`
-	CurrentValueInMinorUnits int64  `json:"currentValueInMinorUnits"`
+// mutualFundsHoldingWireResponse mirrors mutual-funds' real GET
+// /holdings response shape exactly (see that service's
+// holdingWireFormat) — unit counts per scheme, keyed by schemeId. There
+// is no schemeName or currentValueInMinorUnits field: mutual-funds
+// never returns a priced value for a holding, only units.
+type mutualFundsHoldingWireResponse struct {
+	SchemeId                   string  `json:"schemeId"`
+	TotalUnits                 float64 `json:"totalUnits"`
+	UnitsReservedForRedemption float64 `json:"unitsReservedForRedemption"`
+	AvailableUnits             float64 `json:"availableUnits"`
 }
 
 func buildAccountAggregatorHandler(omsGatewayBaseUrl, mutualFundsBaseUrl string) http.HandlerFunc {
@@ -452,43 +525,116 @@ func buildAccountAggregatorHandler(omsGatewayBaseUrl, mutualFundsBaseUrl string)
 			return
 		}
 
-		var platformHoldings []accountaggregator.PlatformHolding
+		// oms-gateway's /positions route requires authmiddleware.RequireAuth
+		// — forward the caller's own bearer token verbatim (same
+		// "acting as the authenticated user" fix as backoffice's
+		// omsgatewayclient.FetchPositions) rather than calling anonymously.
+		callerAuthorizationHeader := request.Header.Get("Authorization")
 
-		if response, err := httpClient.Get(omsGatewayBaseUrl + "/positions?accountId=" + accountIdentifier); err == nil {
-			defer response.Body.Close()
-			var positions omsPositionsWireResponse
-			if json.NewDecoder(response.Body).Decode(&positions) == nil {
-				for _, position := range positions {
-					platformHoldings = append(platformHoldings, accountaggregator.PlatformHolding{
-						SourceService:            "oms-gateway",
-						InstrumentDescription:    position.InstrumentSymbol,
-						CurrentValueInMinorUnits: position.MarketValueInMinorUnits,
-					})
-				}
+		var platformHoldings []accountaggregator.PlatformHolding
+		var dataSourceCaveats []string
+
+		if positions, err := fetchOmsGatewayPositions(httpClient, omsGatewayBaseUrl, accountIdentifier, callerAuthorizationHeader); err != nil {
+			log.Printf("accountaggregator: failed to fetch oms-gateway positions for account %s: %v", accountIdentifier, err)
+			dataSourceCaveats = append(dataSourceCaveats, "oms-gateway positions unavailable: "+err.Error())
+		} else if len(positions.NetQuantityByInstrumentSymbol) > 0 {
+			for instrumentSymbol, netQuantity := range positions.NetQuantityByInstrumentSymbol {
+				platformHoldings = append(platformHoldings, accountaggregator.PlatformHolding{
+					SourceService:         "oms-gateway",
+					InstrumentDescription: instrumentSymbol,
+					UnitsHeld:             float64(netQuantity),
+					ValuationUnavailable:  true,
+				})
 			}
-		} else {
-			log.Printf("accountaggregator: failed reaching oms-gateway positions: %v", err)
+			dataSourceCaveats = append(dataSourceCaveats, "oms-gateway positions report unit quantities only; market value is not yet available from that endpoint")
 		}
 
-		if response, err := httpClient.Get(mutualFundsBaseUrl + "/holdings?accountId=" + accountIdentifier); err == nil {
-			defer response.Body.Close()
-			var holdings mutualFundsHoldingsWireResponse
-			if json.NewDecoder(response.Body).Decode(&holdings) == nil {
-				for _, holding := range holdings {
-					platformHoldings = append(platformHoldings, accountaggregator.PlatformHolding{
-						SourceService:            "mutual-funds",
-						InstrumentDescription:    holding.SchemeName,
-						CurrentValueInMinorUnits: holding.CurrentValueInMinorUnits,
-					})
-				}
+		if holdings, err := fetchMutualFundsHoldings(httpClient, mutualFundsBaseUrl, accountIdentifier, callerAuthorizationHeader); err != nil {
+			log.Printf("accountaggregator: failed to fetch mutual-funds holdings for account %s: %v", accountIdentifier, err)
+			dataSourceCaveats = append(dataSourceCaveats, "mutual-funds holdings unavailable: "+err.Error())
+		} else if len(holdings) > 0 {
+			for _, holding := range holdings {
+				platformHoldings = append(platformHoldings, accountaggregator.PlatformHolding{
+					SourceService:         "mutual-funds",
+					InstrumentDescription: holding.SchemeId,
+					UnitsHeld:             holding.TotalUnits,
+					ValuationUnavailable:  true,
+				})
 			}
-		} else {
-			log.Printf("accountaggregator: failed reaching mutual-funds holdings: %v", err)
+			dataSourceCaveats = append(dataSourceCaveats, "mutual-funds holdings report unit counts only; market value is not yet available from that endpoint")
 		}
 
 		view := accountaggregator.BuildUnifiedNetWorthView(accountIdentifier, platformHoldings)
+		view.DataSourceCaveats = dataSourceCaveats
 		writeJson(responseWriter, http.StatusOK, view)
 	}
+}
+
+// fetchOmsGatewayPositions is a real GET against oms-gateway's real
+// /positions?accountId=... endpoint. Unlike the old inline call this
+// replaces, it (a) forwards callerAuthorizationHeader so it isn't
+// rejected by oms-gateway's authmiddleware.RequireAuth, and (b) checks
+// the response status BEFORE attempting to decode, so a non-2xx (e.g.
+// the 401 this call used to draw when unauthenticated) is a real,
+// logged Go error rather than a silently-swallowed decode failure.
+func fetchOmsGatewayPositions(httpClient *http.Client, omsGatewayBaseUrl, accountIdentifier, callerAuthorizationHeader string) (omsPositionsWireResponse, error) {
+	httpRequest, buildErr := http.NewRequest(http.MethodGet, omsGatewayBaseUrl+"/positions?accountId="+accountIdentifier, nil)
+	if buildErr != nil {
+		return omsPositionsWireResponse{}, fmt.Errorf("could not build request: %w", buildErr)
+	}
+	if callerAuthorizationHeader != "" {
+		httpRequest.Header.Set("Authorization", callerAuthorizationHeader)
+	}
+
+	response, requestErr := httpClient.Do(httpRequest)
+	if requestErr != nil {
+		return omsPositionsWireResponse{}, fmt.Errorf("could not reach oms-gateway: %w", requestErr)
+	}
+	defer response.Body.Close()
+
+	if response.StatusCode != http.StatusOK {
+		return omsPositionsWireResponse{}, fmt.Errorf("oms-gateway returned HTTP %d for positions of account %s", response.StatusCode, accountIdentifier)
+	}
+
+	var positions omsPositionsWireResponse
+	if decodeErr := json.NewDecoder(response.Body).Decode(&positions); decodeErr != nil {
+		return omsPositionsWireResponse{}, fmt.Errorf("malformed positions response: %w", decodeErr)
+	}
+	return positions, nil
+}
+
+// fetchMutualFundsHoldings is a real GET against mutual-funds' real
+// /holdings?accountId=... endpoint. mutual-funds has no auth middleware
+// today, but callerAuthorizationHeader is still forwarded (harmless if
+// ignored, and correct forward-compatible behavior if that ever
+// changes) — see fetchOmsGatewayPositions for the same pattern where it
+// matters today. Same explicit-status-check-before-decode discipline as
+// fetchOmsGatewayPositions: a non-2xx or malformed body is a real,
+// logged error, never silently swallowed into an empty holdings list.
+func fetchMutualFundsHoldings(httpClient *http.Client, mutualFundsBaseUrl, accountIdentifier, callerAuthorizationHeader string) ([]mutualFundsHoldingWireResponse, error) {
+	httpRequest, buildErr := http.NewRequest(http.MethodGet, mutualFundsBaseUrl+"/holdings?accountId="+accountIdentifier, nil)
+	if buildErr != nil {
+		return nil, fmt.Errorf("could not build request: %w", buildErr)
+	}
+	if callerAuthorizationHeader != "" {
+		httpRequest.Header.Set("Authorization", callerAuthorizationHeader)
+	}
+
+	response, requestErr := httpClient.Do(httpRequest)
+	if requestErr != nil {
+		return nil, fmt.Errorf("could not reach mutual-funds: %w", requestErr)
+	}
+	defer response.Body.Close()
+
+	if response.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("mutual-funds returned HTTP %d for holdings of account %s", response.StatusCode, accountIdentifier)
+	}
+
+	var holdings []mutualFundsHoldingWireResponse
+	if decodeErr := json.NewDecoder(response.Body).Decode(&holdings); decodeErr != nil {
+		return nil, fmt.Errorf("malformed holdings response: %w", decodeErr)
+	}
+	return holdings, nil
 }
 
 func writeJson(responseWriter http.ResponseWriter, statusCode int, payload any) {

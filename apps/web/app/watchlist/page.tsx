@@ -33,6 +33,7 @@
 
 import { useCallback, useEffect, useState } from "react";
 import Link from "next/link";
+import { useSequencedFetch } from "../hooks/useSequencedFetch";
 
 const marketDataBaseUrl = process.env.NEXT_PUBLIC_MARKET_DATA_BASE_URL ?? "http://localhost:9103";
 
@@ -86,6 +87,7 @@ export default function WatchlistPage() {
   const [newSymbolInput, setNewSymbolInput] = useState("DEMO-EQ");
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [isBusy, setIsBusy] = useState(false);
+  const startNextWatchlistRequest = useSequencedFetch();
 
   useEffect(() => {
     // eslint-disable-next-line react-hooks/set-state-in-effect
@@ -93,23 +95,29 @@ export default function WatchlistPage() {
   }, []);
 
   const refreshFullWatchlist = useCallback(async () => {
+    // Guards against a stale, slower response (e.g. for the PREVIOUS
+    // account identifier) resolving after a newer request already
+    // rendered and showing the wrong account's watchlist.
+    const isStillMostRecentRequest = startNextWatchlistRequest();
     try {
       const httpResponse = await fetch(
         `${marketDataBaseUrl}/watchlist?accountIdentifier=${encodeURIComponent(accountIdentifier)}`
       );
       if (!httpResponse.ok) throw new Error(`HTTP ${httpResponse.status}`);
       const parsed: WatchlistSnapshotResponse = await httpResponse.json();
+      if (!isStillMostRecentRequest()) return;
       setSymbols(parsed.symbols);
       setLastModifiedAtEpochMillis(parsed.lastModifiedAtEpochMillis);
       setErrorMessage(null);
     } catch (thrownError) {
+      if (!isStillMostRecentRequest()) return;
       setErrorMessage(
         thrownError instanceof Error
           ? `Couldn't reach market-data: ${thrownError.message}. Is it running on ${marketDataBaseUrl}?`
           : "Unknown error fetching the watchlist."
       );
     }
-  }, [accountIdentifier]);
+  }, [accountIdentifier, startNextWatchlistRequest]);
 
   // Live display: polls the full watchlist on an interval — market-data's
   // HTTP query API is a deliberate polling stopgap (see its README), not

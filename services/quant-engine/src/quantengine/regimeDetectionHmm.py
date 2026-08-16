@@ -111,6 +111,27 @@ def gaussianEmissionProbabilityDensity(observedValue: float, mean: float, varian
         return 0.0
 
 
+def _logSumExp(logValues: list[float]) -> float:
+    """Numerically stable `log(sum(exp(v) for v in logValues))`. Used by
+    `runForwardAlgorithm` to compute its scaling factors directly in
+    log-space — see that function's docstring for why: computing the
+    scaling factor as a raw sum of exponentiated (materialized)
+    probabilities can underflow to an exact `0.0` in double precision
+    once a state's variance has converged very small (e.g. via
+    `runBaumWelchExpectationMaximization`) and a genuine outlier
+    observation lands many standard deviations out, which then causes a
+    `ZeroDivisionError`/`math domain error` downstream. Staying in
+    log-space throughout sidesteps that underflow entirely, the same way
+    `_logGaussianEmissionProbabilityDensity` already does for
+    `runViterbiAlgorithm`.
+    """
+    finiteLogValues = [v for v in logValues if v != -math.inf]
+    if not finiteLogValues:
+        return -math.inf
+    maximumLogValue = max(finiteLogValues)
+    return maximumLogValue + math.log(sum(math.exp(v - maximumLogValue) for v in finiteLogValues))
+
+
 def _logGaussianEmissionProbabilityDensity(observedValue: float, mean: float, variance: float) -> float:
     """Same Gaussian log-density as `gaussianEmissionProbabilityDensity`,
     computed directly in log-space so an observation many standard
@@ -213,6 +234,21 @@ def runForwardAlgorithm(
     is `c_t`; `logLikelihood` is `sum(log(c_t))`, the log-probability of
     the ENTIRE observed sequence under `hmm`. Raises `ValueError` on an
     empty `observations` list.
+
+    The scaling factor at each step is computed in LOG-SPACE (via
+    `_logSumExp` over `_logGaussianEmissionProbabilityDensity` terms,
+    the same log-domain emission density `runViterbiAlgorithm` already
+    uses) rather than by materializing raw probabilities and summing/
+    dividing them directly. A state whose variance has converged very
+    small can make every state's Gaussian emission density underflow to
+    an exact `0.0` in double precision for a genuine outlier
+    observation; summing/dividing raw probabilities in that case raises
+    `ZeroDivisionError` (dividing by a scaling factor of `0.0`) and then
+    `math domain error` (taking `log(0.0)` for the log-likelihood).
+    Staying in log-space throughout — computing `scaledAlpha[t]` via
+    `exp(logUnscaled - logScalingFactor)` and the log-likelihood as a
+    direct sum of per-step log-scaling-factors rather than
+    `log(scalingFactor)` — avoids both failure modes.
     """
     if not observations:
         raise ValueError("observations must contain at least one value")
@@ -221,29 +257,40 @@ def runForwardAlgorithm(
     timeStepCount = len(observations)
     scaledAlpha: list[list[float]] = [[0.0] * numberOfStates for _ in range(timeStepCount)]
     scalingFactors: list[float] = [0.0] * timeStepCount
+    logScalingFactors: list[float] = [0.0] * timeStepCount
 
-    unscaledFirst = [
-        hmm.initialStateProbabilities[i]
-        * gaussianEmissionProbabilityDensity(observations[0], hmm.stateMeans[i], hmm.stateVariances[i])
+    logInitial = [math.log(p) if p > 0 else -math.inf for p in hmm.initialStateProbabilities]
+    logTransition = [
+        [math.log(p) if p > 0 else -math.inf for p in row] for row in hmm.transitionMatrix
+    ]
+
+    logEmissionFirst = [
+        _logGaussianEmissionProbabilityDensity(observations[0], hmm.stateMeans[i], hmm.stateVariances[i])
         for i in range(numberOfStates)
     ]
-    scalingFactors[0] = sum(unscaledFirst)
-    scaledAlpha[0] = [value / scalingFactors[0] for value in unscaledFirst]
+    logUnscaledFirst = [logInitial[i] + logEmissionFirst[i] for i in range(numberOfStates)]
+    logScalingFactors[0] = _logSumExp(logUnscaledFirst)
+    scaledAlpha[0] = [math.exp(value - logScalingFactors[0]) for value in logUnscaledFirst]
+    scalingFactors[0] = math.exp(logScalingFactors[0]) if logScalingFactors[0] != -math.inf else 0.0
 
     for t in range(1, timeStepCount):
-        emissionProbabilities = [
-            gaussianEmissionProbabilityDensity(observations[t], hmm.stateMeans[j], hmm.stateVariances[j])
+        logEmission = [
+            _logGaussianEmissionProbabilityDensity(observations[t], hmm.stateMeans[j], hmm.stateVariances[j])
             for j in range(numberOfStates)
         ]
-        unscaled = [
-            sum(scaledAlpha[t - 1][i] * hmm.transitionMatrix[i][j] for i in range(numberOfStates))
-            * emissionProbabilities[j]
+        logScaledAlphaPrevious = [
+            math.log(value) if value > 0 else -math.inf for value in scaledAlpha[t - 1]
+        ]
+        logUnscaled = [
+            _logSumExp([logScaledAlphaPrevious[i] + logTransition[i][j] for i in range(numberOfStates)])
+            + logEmission[j]
             for j in range(numberOfStates)
         ]
-        scalingFactors[t] = sum(unscaled)
-        scaledAlpha[t] = [value / scalingFactors[t] for value in unscaled]
+        logScalingFactors[t] = _logSumExp(logUnscaled)
+        scaledAlpha[t] = [math.exp(value - logScalingFactors[t]) for value in logUnscaled]
+        scalingFactors[t] = math.exp(logScalingFactors[t]) if logScalingFactors[t] != -math.inf else 0.0
 
-    logLikelihood = sum(math.log(c) for c in scalingFactors)
+    logLikelihood = sum(logScalingFactors)
     return ForwardAlgorithmResult(scaledAlpha=scaledAlpha, scalingFactors=scalingFactors, logLikelihood=logLikelihood)
 
 

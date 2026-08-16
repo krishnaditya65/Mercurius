@@ -37,11 +37,30 @@ fn runSandboxedPythonHook(
         .map_err(|ioError| format!("failed to spawn sandboxed python hook: {ioError}"))
 }
 
+// NOTE on graceful degradation: this is a demo-grade internal terminal
+// app, not a shipped consumer product, so we stop short of building a
+// full native error-dialog/recovery flow around Tauri's own generated
+// bootstrap. The minimum reasonable fix applied here: never let the
+// process die with a raw Rust panic backtrace on startup failure. We log
+// a clear, actionable message — including the most common real-world
+// failure mode (WebView2 missing on Windows) — before exiting with a
+// non-zero status, so whoever's staring at the terminal output knows what
+// to do next instead of parsing a panic trace.
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let runResult = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![runSandboxedPythonHook])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .run(tauri::generate_context!());
+
+    if let Err(tauriError) = runResult {
+        eprintln!(
+            "Mercurius terminal failed to start: {tauriError}\n\
+             This usually means the platform WebView runtime isn't available \
+             (on Windows: install the WebView2 runtime from Microsoft; on \
+             Linux: install webkit2gtk; on macOS this should be preinstalled). \
+             Exiting."
+        );
+        std::process::exit(1);
+    }
 }

@@ -29,6 +29,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Callable
 
+from quantengine.backtesting.positionTolerance import isPositionFlat
 from quantengine.backtesting.tickStore import HistoricalPriceTick
 
 
@@ -63,7 +64,7 @@ class PortfolioState:
     realizedProfitAndLoss: float = 0.0
 
     def calculateUnrealizedProfitAndLoss(self, currentPrice: float) -> float:
-        if self.positionQuantity == 0:
+        if isPositionFlat(self.positionQuantity):
             return 0.0
         return self.positionQuantity * (currentPrice - self.averageEntryPrice)
 
@@ -100,7 +101,7 @@ def applySignedQuantityChangeToPortfolio(
     newPositionQuantity = oldPositionQuantity + signedQuantityChange
 
     isOpeningOrAddingInSameDirection = (
-        oldPositionQuantity == 0
+        isPositionFlat(oldPositionQuantity)
         or (oldPositionQuantity > 0 and signedQuantityChange > 0)
         or (oldPositionQuantity < 0 and signedQuantityChange < 0)
     )
@@ -116,7 +117,7 @@ def applySignedQuantityChangeToPortfolio(
             closingQuantityMagnitude * (tradePrice - portfolioState.averageEntryPrice) * positionDirectionSign
         )
 
-        if newPositionQuantity == 0:
+        if isPositionFlat(newPositionQuantity):
             portfolioState.averageEntryPrice = 0.0
         elif (newPositionQuantity > 0) != (oldPositionQuantity > 0):
             # Flipped through zero — the remainder is a brand-new position

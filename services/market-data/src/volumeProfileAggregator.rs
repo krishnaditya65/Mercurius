@@ -102,6 +102,7 @@ pub fn computeVolumeProfile(
         pointOfControlPriceBucketStart,
         totalVolume,
         valueAreaVolumeFraction,
+        priceBucketSizeInMinorUnits,
     );
 
     let levels = volumeByBucket
@@ -139,25 +140,23 @@ fn bucketStartForPrice(priceInMinorUnits: i64, bucketSize: i64) -> i64 {
 /// accumulated volume reaches `valueAreaVolumeFraction * totalVolume`
 /// (rounded up — reaching "at least" the target, matching the standard
 /// definition). Returns `(low, high)`, both inclusive bucket-start prices.
+///
+/// `bucketStep` MUST be the actual `priceBucketSizeInMinorUnits` the ticks
+/// were bucketed with (threaded through from `computeVolumeProfile`'s own
+/// parameter), NOT inferred from the minimum gap between occupied buckets:
+/// when a bucket between the POC and the next occupied bucket carries zero
+/// volume (so it's simply absent from `volumeByBucket`), the gap between
+/// two occupied keys can be a multiple of the real bucket size, and
+/// inferring the step from that gap silently understates it — walking the
+/// wrong-sized step from then on skips over real, occupied buckets
+/// entirely and can end the Value Area (or start it) at the wrong price.
 fn computeValueAreaRange(
     volumeByBucket: &BTreeMap<i64, u64>,
     pocPrice: i64,
     totalVolume: u64,
     valueAreaVolumeFraction: f64,
+    bucketStep: i64,
 ) -> (i64, i64) {
-    let sortedPrices: Vec<i64> = volumeByBucket.keys().copied().collect();
-    // Bucket keys are always exact multiples of the (positive) bucket
-    // size that produced them, so adjacent occupied buckets differ by
-    // that same fixed step — safe to infer the step from any two
-    // consecutive keys, or fall back to "no other buckets" when there's
-    // only one.
-    let bucketStep = sortedPrices
-        .windows(2)
-        .map(|pair| pair[1] - pair[0])
-        .min()
-        .unwrap_or(1)
-        .max(1);
-
     let targetVolume = (totalVolume as f64 * valueAreaVolumeFraction).ceil() as u64;
 
     let mut lowPrice = pocPrice;
@@ -165,37 +164,89 @@ fn computeValueAreaRange(
     let mut accumulatedVolume = *volumeByBucket.get(&pocPrice).unwrap_or(&0);
 
     while accumulatedVolume < targetVolume {
-        let belowPrice = lowPrice - bucketStep;
-        let abovePrice = highPrice + bucketStep;
-        let belowVolume = volumeByBucket.get(&belowPrice).copied();
-        let aboveVolume = volumeByBucket.get(&abovePrice).copied();
+        // Walk outward in real `bucketStep` increments past any
+        // intervening EMPTY (zero-volume, hence absent-from-the-map)
+        // buckets until the next OCCUPIED bucket is found on that side,
+        // or the map's own known extent is exceeded — rather than giving
+        // up on a side after a single empty immediate neighbor, which
+        // would wrongly treat "the next bucket over is empty" as "nothing
+        // left on this side" even when a farther occupied bucket with
+        // real volume exists.
+        let belowCandidate = nextOccupiedBucketOutward(volumeByBucket, lowPrice, bucketStep, Direction::Down);
+        let aboveCandidate = nextOccupiedBucketOutward(volumeByBucket, highPrice, bucketStep, Direction::Up);
 
-        match (belowVolume, aboveVolume) {
+        match (belowCandidate, aboveCandidate) {
             (None, None) => break, // nothing left to add on either side
-            (Some(below), None) => {
+            (Some((belowPrice, belowVolume)), None) => {
                 lowPrice = belowPrice;
-                accumulatedVolume += below;
+                accumulatedVolume += belowVolume;
             }
-            (None, Some(above)) => {
+            (None, Some((abovePrice, aboveVolume))) => {
                 highPrice = abovePrice;
-                accumulatedVolume += above;
+                accumulatedVolume += aboveVolume;
             }
-            (Some(below), Some(above)) => {
+            (Some((belowPrice, belowVolume)), Some((abovePrice, aboveVolume))) => {
                 // Larger volume wins; a tie prefers extending downward
                 // (an arbitrary, documented, deterministic tie-break,
                 // same posture as the POC tie-break above).
-                if below >= above {
+                if belowVolume >= aboveVolume {
                     lowPrice = belowPrice;
-                    accumulatedVolume += below;
+                    accumulatedVolume += belowVolume;
                 } else {
                     highPrice = abovePrice;
-                    accumulatedVolume += above;
+                    accumulatedVolume += aboveVolume;
                 }
             }
         }
     }
 
     (lowPrice, highPrice)
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Direction {
+    Down,
+    Up,
+}
+
+/// Steps outward from `currentEdgePrice` by `bucketStep` increments,
+/// looking for the nearest OCCUPIED bucket strictly beyond it in the
+/// given direction — skipping over any empty (absent-from-the-map)
+/// buckets in between rather than stopping at the first one. Returns
+/// `None` once stepping goes past the map's own lowest/highest occupied
+/// key (there is nothing farther out to find).
+fn nextOccupiedBucketOutward(
+    volumeByBucket: &BTreeMap<i64, u64>,
+    currentEdgePrice: i64,
+    bucketStep: i64,
+    direction: Direction,
+) -> Option<(i64, u64)> {
+    let boundaryKey = match direction {
+        Direction::Down => *volumeByBucket.keys().next()?,
+        Direction::Up => *volumeByBucket.keys().next_back()?,
+    };
+
+    let mut candidatePrice = match direction {
+        Direction::Down => currentEdgePrice - bucketStep,
+        Direction::Up => currentEdgePrice + bucketStep,
+    };
+
+    loop {
+        let pastBoundary = match direction {
+            Direction::Down => candidatePrice < boundaryKey,
+            Direction::Up => candidatePrice > boundaryKey,
+        };
+        if pastBoundary {
+            return None;
+        }
+        if let Some(&volume) = volumeByBucket.get(&candidatePrice) {
+            return Some((candidatePrice, volume));
+        }
+        candidatePrice = match direction {
+            Direction::Down => candidatePrice - bucketStep,
+            Direction::Up => candidatePrice + bucketStep,
+        };
+    }
 }
 
 /// One "letter" (fixed time interval) of a TPO (Time Price Opportunity)
@@ -406,6 +457,35 @@ mod tests {
         let result = computeVolumeProfile(&ticks, 10, 0.7);
         assert_eq!(result.valueAreaLowPriceBucketStart, Some(100));
         assert_eq!(result.valueAreaHighPriceBucketStart, Some(110));
+    }
+
+    #[test]
+    fn valueAreaExpansionSkipsOverEmptyBucketsToReachAFartherOccupiedBucketRatherThanStoppingShort() {
+        // Exact audit repro: ticks at 100 (qty 10), 130 (qty 100, POC), 140
+        // (qty 40), bucket size 10, valueAreaVolumeFraction = 1.0 (target =
+        // 150 = all the volume). Buckets 110 and 120 are EMPTY (no ticks
+        // landed there), so they're simply absent from volumeByBucket —
+        // two consecutive empty buckets separate the POC (130) from the
+        // next occupied bucket below it (100).
+        //
+        // The buggy version's inferred bucketStep (min gap between
+        // occupied keys: min(130-100=30, 140-130=10) = 10) happens to
+        // match the real bucket size here, so that specific inference
+        // isn't what fails — it's the `(None, None) => break` early exit:
+        // after taking 140 (immediate neighbor, step 10, occupied), the
+        // NEXT below-candidate at a single step (130-10=120) is empty AND
+        // the next above-candidate (140+10=150) is empty too, so the old
+        // code gives up right there at accumulated=140 (<150), leaving
+        // valueAreaLowPriceBucketStart stuck at the POC (130) — never
+        // walking two steps further down to the real, occupied,
+        // volume-10 bucket at 100 that would complete the target.
+        let ticks = vec![tick(100, 10, 1_000), tick(130, 100, 1_010), tick(140, 40, 1_020)];
+        let result = computeVolumeProfile(&ticks, 10, 1.0);
+
+        assert_eq!(result.totalVolume, 150);
+        assert_eq!(result.pointOfControlPriceBucketStart, Some(130));
+        assert_eq!(result.valueAreaLowPriceBucketStart, Some(100));
+        assert_eq!(result.valueAreaHighPriceBucketStart, Some(140));
     }
 
     #[test]

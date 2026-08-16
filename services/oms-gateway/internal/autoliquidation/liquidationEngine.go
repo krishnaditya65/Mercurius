@@ -161,12 +161,18 @@ func ClassifyUtilization(utilizationPercent float64, thresholds Thresholds) Risk
 // SubmittedReducingOrder records one real reducing order a liquidation
 // pass actually submitted.
 type SubmittedReducingOrder struct {
-	InstrumentSymbol            string
-	QuantitySold                int64
-	ReferencePriceInMinorUnits  int64
+	InstrumentSymbol           string
+	QuantitySold               int64 // the quantity the engine ATTEMPTED to sell -- not necessarily what actually filled
+	ReferencePriceInMinorUnits int64
+	// NotionalReducedInMinorUnits is the REAL executed notional this
+	// order actually filled, as reported by SubmitReducingOrderFunc —
+	// NOT the assumed (QuantitySold * ReferencePriceInMinorUnits)
+	// estimate. This is what remainingShortfall is actually decremented
+	// by (see the fix on this bug in SubmitReducingOrderFunc's doc
+	// comment).
 	NotionalReducedInMinorUnits int64
 	SubmissionError             string // empty if the submission itself succeeded (the order may still have been risk/KYC/freeze-rejected downstream — see SubmissionError vs WasAccepted below)
-	WasAccepted                 bool
+	WasAccepted                 bool   // true if the ORDER-SUBMISSION pipeline accepted the order -- NOT proof it filled; see NotionalReducedInMinorUnits for what actually happened
 }
 
 // LiquidationOutcome is the full result of one evaluate-and-act pass.
@@ -183,8 +189,31 @@ type LiquidationOutcome struct {
 // caller wires this to the exact same processOrderSubmission pipeline
 // every other order path in this service uses (see the package doc).
 // Implementations should submit a real SELL order for quantityToSell of
-// instrumentSymbol and report whether it was accepted.
-type SubmitReducingOrderFunc func(clientAccountIdentifier string, instrumentSymbol string, quantityToSell int64) (wasAccepted bool, submissionError error)
+// instrumentSymbol and report:
+//   - wasAccepted: whether the order-submission pipeline itself accepted
+//     the order (passed KYC/freeze/risk/etc and was handed to the
+//     matching engine) — NOT whether it actually filled. An accepted
+//     order can rest, partially fill, or fill nothing at all.
+//   - actualExecutedNotionalInMinorUnits: the REAL notional that
+//     actually filled (e.g. summed from
+//     OrderAcknowledgementResponse.TradeExecutionEvents), NOT the
+//     assumedNotionalInMinorUnits the engine sized the order from. This
+//     is the figure EvaluateAndLiquidateIfBreached uses to decrement
+//     remainingShortfall — an accepted-but-unfilled (or
+//     partially-filled) order must NOT be treated as having closed the
+//     full assumed shortfall.
+//   - submissionError: non-nil if the submission itself failed.
+//
+// assumedNotionalInMinorUnits is quantityToSell *
+// position.CurrentMarketPriceInMinorUnits — the estimate the engine used
+// to size this order — passed through so an implementation MAY report it
+// back verbatim for the common "filled exactly as assumed" case.
+type SubmitReducingOrderFunc func(
+	clientAccountIdentifier string,
+	instrumentSymbol string,
+	quantityToSell int64,
+	assumedNotionalInMinorUnits int64,
+) (wasAccepted bool, actualExecutedNotionalInMinorUnits int64, submissionError error)
 
 // LiquidationEngine is the mutex-guarded evaluator. Mutex-guarded even
 // though it holds no mutable state of its own beyond the callback,
@@ -265,12 +294,15 @@ func (engine *LiquidationEngine) EvaluateAndLiquidateIfBreached(snapshot Account
 			continue
 		}
 
-		wasAccepted, submissionError := engine.submitReducingOrder(snapshot.ClientAccountIdentifier, position.InstrumentSymbol, quantityToSell)
+		assumedNotionalInMinorUnits := quantityToSell * position.CurrentMarketPriceInMinorUnits
+		wasAccepted, actualExecutedNotionalInMinorUnits, submissionError := engine.submitReducingOrder(
+			snapshot.ClientAccountIdentifier, position.InstrumentSymbol, quantityToSell, assumedNotionalInMinorUnits,
+		)
 		submittedOrder := SubmittedReducingOrder{
 			InstrumentSymbol:            position.InstrumentSymbol,
 			QuantitySold:                quantityToSell,
 			ReferencePriceInMinorUnits:  position.CurrentMarketPriceInMinorUnits,
-			NotionalReducedInMinorUnits: quantityToSell * position.CurrentMarketPriceInMinorUnits,
+			NotionalReducedInMinorUnits: actualExecutedNotionalInMinorUnits,
 			WasAccepted:                 wasAccepted,
 		}
 		if submissionError != nil {
@@ -278,8 +310,12 @@ func (engine *LiquidationEngine) EvaluateAndLiquidateIfBreached(snapshot Account
 		}
 		outcome.SubmittedReducingOrders = append(outcome.SubmittedReducingOrders, submittedOrder)
 
-		if wasAccepted {
-			remainingShortfall -= submittedOrder.NotionalReducedInMinorUnits
+		// Only the REAL executed notional closes the shortfall — mere
+		// acceptance (wasAccepted) does not: an accepted order can rest,
+		// partially fill, or fill nothing at all (see this bug's fix in
+		// SubmitReducingOrderFunc's doc comment above).
+		if actualExecutedNotionalInMinorUnits > 0 {
+			remainingShortfall -= actualExecutedNotionalInMinorUnits
 		}
 	}
 

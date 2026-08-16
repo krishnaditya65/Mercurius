@@ -312,3 +312,57 @@ func TestWeeklyFrequencyAdvancesBySevenDays(t *testing.T) {
 		t.Fatalf("expected NextDebitDate advanced by 7 days to %v, got %v", expected, reloaded.NextDebitDate)
 	}
 }
+
+// TestSweepDueMandatesDoesNotAdvanceNextDebitDateOnPermanentFailure
+// reproduces the bug: a mandate hitting a permanent failure (e.g. its
+// account isn't CLIENT-classified, ErrUnclassifiedAccount) must NOT have
+// its NextDebitDate silently advanced — that would make it "run" forever
+// without ever actually investing, with no way for anyone to notice.
+func TestSweepDueMandatesDoesNotAdvanceNextDebitDateOnPermanentFailure(t *testing.T) {
+	registry, _, _ := newTestRegistry(t, 100_000)
+	// firm-clearing-acct is not CLIENT-classified, so every sweep attempt
+	// against it permanently fails via ErrUnclassifiedAccount.
+	mandate, _ := registry.RegisterMandate("firm-clearing-acct", 1_000, FrequencyDaily, testNow, testNow)
+
+	results := registry.SweepDueMandates(testNow)
+	if len(results) != 1 || results[0].WasPosted {
+		t.Fatalf("expected the sweep to fail, got %+v", results)
+	}
+
+	reloaded, _ := registry.LookupMandate(mandate.MandateId)
+	if !reloaded.NextDebitDate.Equal(testNow) {
+		t.Fatalf("expected NextDebitDate to remain at %v after a permanent failure, got %v", testNow, reloaded.NextDebitDate)
+	}
+}
+
+// TestSweepDueMandatesSuspendsAfterRepeatedConsecutiveFailures reproduces
+// the "no signal" half of the bug: a mandate that keeps permanently
+// failing must eventually stop being retried silently forever — it needs
+// to flip to a terminal, surfaced state after some small threshold of
+// consecutive failures.
+func TestSweepDueMandatesSuspendsAfterRepeatedConsecutiveFailures(t *testing.T) {
+	registry, _, _ := newTestRegistry(t, 100_000)
+	mandate, _ := registry.RegisterMandate("firm-clearing-acct", 1_000, FrequencyDaily, testNow, testNow)
+
+	// Sweep several times in a row (NextDebitDate never advances on
+	// failure, so it's still due each time).
+	var lastResults []SweptMandate
+	for i := 0; i < 10; i++ {
+		lastResults = registry.SweepDueMandates(testNow)
+		reloaded, _ := registry.LookupMandate(mandate.MandateId)
+		if reloaded.Status != MandateStatusActive {
+			break
+		}
+	}
+
+	reloaded, _ := registry.LookupMandate(mandate.MandateId)
+	if reloaded.Status != MandateStatusSuspended {
+		t.Fatalf("expected the mandate to eventually become SUSPENDED after repeated consecutive failures, got status=%v after results=%+v", reloaded.Status, lastResults)
+	}
+
+	// And a SUSPENDED mandate must no longer be swept at all.
+	resultsAfterSuspension := registry.SweepDueMandates(testNow)
+	if len(resultsAfterSuspension) != 0 {
+		t.Fatalf("expected a SUSPENDED mandate to be skipped by SweepDueMandates, got %+v", resultsAfterSuspension)
+	}
+}

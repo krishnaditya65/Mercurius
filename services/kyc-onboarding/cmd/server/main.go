@@ -149,11 +149,23 @@ func requireOwnAccountFromQueryParam(queryParamName string, signingSecret []byte
 // for POST-style routes that identify the target account via an
 // "accountIdentifier" field in the JSON body. It peeks the body just far
 // enough to read that one field, then rewinds request.Body so the wrapped
-// handler's own decode sees the exact same bytes it always has. A body
-// that fails to decode even that far is passed through untouched — the
-// wrapped handler's own decode will produce its normal "malformed
-// payload" 400, rather than this wrapper masking that with a different
-// error.
+// handler's own decode sees the exact same bytes it always has.
+//
+// A body that fails to decode even that far is REJECTED here with a 400,
+// rather than passed through to the wrapped handler. This is deliberately
+// fail-closed: earlier code called next(...) on a decode failure, on the
+// theory that the wrapped handler's own (stricter) decode would produce
+// an equivalent 400. That reasoning was wrong — this wrapper decodes with
+// json.Unmarshal (which errors on trailing/malformed data after the first
+// JSON value), while most wrapped handlers decode with
+// json.NewDecoder(request.Body).Decode(...) (which reads only the first
+// JSON value off the stream and silently ignores anything after it). A
+// body like `{"accountIdentifier":"someone-elses-account",...}<garbage>`
+// therefore failed this wrapper's json.Unmarshal (trailing data), skipped
+// the ownership check entirely, and then decoded successfully in the
+// wrapped handler — letting a caller act on an account that is not their
+// own. Rejecting here, without ever calling next, closes that gap: no
+// malformed body reaches the wrapped handler unchecked.
 func requireOwnAccountFromJsonBody(signingSecret []byte, next http.HandlerFunc) http.HandlerFunc {
 	return authmiddleware.RequireAuth(signingSecret, func(responseWriter http.ResponseWriter, request *http.Request) {
 		bodyBytes, readError := io.ReadAll(request.Body)
@@ -166,7 +178,7 @@ func requireOwnAccountFromJsonBody(signingSecret []byte, next http.HandlerFunc) 
 
 		var envelope accountIdentifierWireEnvelope
 		if decodeError := json.Unmarshal(bodyBytes, &envelope); decodeError != nil {
-			next(responseWriter, request)
+			http.Error(responseWriter, "malformed request payload", http.StatusBadRequest)
 			return
 		}
 

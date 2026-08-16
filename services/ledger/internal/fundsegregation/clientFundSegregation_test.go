@@ -1,6 +1,7 @@
 package fundsegregation
 
 import (
+	"math"
 	"errors"
 	"testing"
 
@@ -224,5 +225,23 @@ func TestAccountKindOfReportsClassification(t *testing.T) {
 	}
 	if _, isClassified := guard.AccountKindOf("nonexistent-acct"); isClassified {
 		t.Errorf("expected nonexistent-acct to be unclassified")
+	}
+}
+
+// TestPostClientMoneyMovementRejectsAmountThatWouldOverflowOnDoubling
+// reproduces the integer-overflow bug: PostClientMoneyMovement doubles
+// absoluteAmount internally (twiceTheAmount := absoluteAmount * 2) with
+// no upper-bound check, so a caller-supplied amount close to
+// math.MaxInt64 silently wraps around to a negative/garbage number
+// instead of being rejected.
+func TestPostClientMoneyMovementRejectsAmountThatWouldOverflowOnDoubling(t *testing.T) {
+	_, guard := newTestGuard()
+
+	postError := guard.PostClientMoneyMovement("acct-001", math.MaxInt64, "overflow attempt")
+	if postError == nil {
+		t.Fatal("expected an error for an amount that would overflow when doubled, got nil")
+	}
+	if errors.Is(postError, ErrWouldBreakSegregation) {
+		t.Fatalf("expected a validation error about the amount being too large, not a segregation error: %v", postError)
 	}
 }

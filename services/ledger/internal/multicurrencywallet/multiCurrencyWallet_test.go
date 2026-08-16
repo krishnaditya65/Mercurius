@@ -1,6 +1,7 @@
 package multicurrencywallet
 
 import (
+	"sync"
 	"errors"
 	"testing"
 
@@ -370,5 +371,128 @@ func TestFxRateTableReturnsFalseForUnconfiguredPair(t *testing.T) {
 	rate, found := fxRateTable.Rate("USD", "INR")
 	if !found || rate != 83.0 {
 		t.Fatalf("expected configured USD/INR rate 83.0, got %v (found=%v)", rate, found)
+	}
+}
+
+// --- Concurrency ---
+
+// TestConcurrentWithdrawalsFromSameCurrencyWalletCannotOverdraw reproduces
+// the unlocked check-then-post race in WithdrawFromCurrencyWallet: two
+// concurrent withdrawals for more than half the wallet balance each must
+// not BOTH succeed.
+func TestConcurrentWithdrawalsFromSameCurrencyWalletCannotOverdraw(t *testing.T) {
+	const trials = 100
+	for trial := 0; trial < trials; trial++ {
+		ledgerBook, _, registry := newTestRegistry()
+		if depositError := registry.DepositIntoCurrencyWallet("acct-001", "USD", 10_000); depositError != nil {
+			t.Fatalf("unexpected deposit error: %v", depositError)
+		}
+
+		var wg sync.WaitGroup
+		results := make([]error, 2)
+		for i := 0; i < 2; i++ {
+			wg.Add(1)
+			go func(idx int) {
+				defer wg.Done()
+				results[idx] = registry.WithdrawFromCurrencyWallet("acct-001", "USD", 6_000)
+			}(i)
+		}
+		wg.Wait()
+
+		successCount := 0
+		for _, err := range results {
+			if err == nil {
+				successCount++
+			}
+		}
+		if successCount > 1 {
+			t.Fatalf("trial %d: expected at most 1 of 2 concurrent 6000 withdrawals against a 10000 balance to succeed, got %d", trial, successCount)
+		}
+
+		usdBalance, _ := ledgerBook.CurrentBalanceInMinorUnits("acct-001:USD")
+		if usdBalance < 0 {
+			t.Fatalf("trial %d: USD wallet balance went negative: %d", trial, usdBalance)
+		}
+	}
+}
+
+// TestConcurrentConversionsFromSameCurrencyWalletCannotOverdraw reproduces
+// the identical unlocked check-then-post race in
+// ConvertBetweenCurrencyWallets.
+func TestConcurrentConversionsFromSameCurrencyWalletCannotOverdraw(t *testing.T) {
+	const trials = 100
+	for trial := 0; trial < trials; trial++ {
+		ledgerBook, _, registry := newTestRegistry()
+		if depositError := registry.DepositIntoCurrencyWallet("acct-001", "USD", 10_000); depositError != nil {
+			t.Fatalf("unexpected deposit error: %v", depositError)
+		}
+
+		var wg sync.WaitGroup
+		results := make([]error, 2)
+		for i := 0; i < 2; i++ {
+			wg.Add(1)
+			go func(idx int) {
+				defer wg.Done()
+				_, err := registry.ConvertBetweenCurrencyWallets("acct-001", "USD", "INR", 6_000)
+				results[idx] = err
+			}(i)
+		}
+		wg.Wait()
+
+		successCount := 0
+		for _, err := range results {
+			if err == nil {
+				successCount++
+			}
+		}
+		if successCount > 1 {
+			t.Fatalf("trial %d: expected at most 1 of 2 concurrent 6000 USD->INR conversions against a 10000 balance to succeed, got %d", trial, successCount)
+		}
+
+		usdBalance, _ := ledgerBook.CurrentBalanceInMinorUnits("acct-001:USD")
+		if usdBalance < 0 {
+			t.Fatalf("trial %d: USD wallet balance went negative: %d", trial, usdBalance)
+		}
+	}
+}
+
+// TestConvertBetweenCurrencyWalletsUsesExactRoundHalfUpNotFloat64Drift
+// reproduces the float64-arithmetic rounding bug: 50 minor units at a
+// 0.29 rate is EXACTLY 14.5, which should round HALF UP to 15 under a
+// documented, deterministic rounding rule. Naive float64 multiplication
+// (50 * 0.29) actually produces 14.499999999999996 in IEEE754 double
+// precision (0.29 has no exact binary representation), which rounds DOWN
+// to 14 — a silent, non-obvious one-minor-unit rounding error in real
+// money math.
+func TestConvertBetweenCurrencyWalletsUsesExactRoundHalfUpNotFloat64Drift(t *testing.T) {
+	ledgerBook := doubleentry.NewInMemoryDoubleEntryLedgerBookWithAccounts([]string{
+		"acct-001", "firm-clearing-acct", "client-money-custody-pool", "external-cash-suspense",
+	})
+	guard := fundsegregation.NewSegregationGuard(
+		ledgerBook,
+		"client-money-custody-pool",
+		"external-cash-suspense",
+		[]string{"acct-001"},
+		[]string{"firm-clearing-acct"},
+	)
+	fxRateTable := NewStaticFxRateTable(map[string]float64{"USD/INR": 0.29})
+	registry := NewMultiCurrencyWalletRegistry(
+		ledgerBook, guard,
+		"client-money-custody-pool", "wallet-external-cash-suspense", "fx-conversion-clearing-acct",
+		"INR", fxRateTable,
+	)
+
+	if depositError := registry.DepositIntoCurrencyWallet("acct-001", "USD", 50); depositError != nil {
+		t.Fatalf("unexpected deposit error: %v", depositError)
+	}
+
+	result, convertError := registry.ConvertBetweenCurrencyWallets("acct-001", "USD", "INR", 50)
+	if convertError != nil {
+		t.Fatalf("unexpected conversion error: %v", convertError)
+	}
+
+	// 50 * 0.29 = 14.5 EXACTLY — round-half-up must yield 15, not 14.
+	if result.AmountCreditedToDestinationInMinorUnits != 15 {
+		t.Fatalf("expected exact round-half-up result 15 for 50 minor units at rate 0.29, got %d (float64 drift bug)", result.AmountCreditedToDestinationInMinorUnits)
 	}
 }

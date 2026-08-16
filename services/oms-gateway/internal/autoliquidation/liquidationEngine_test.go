@@ -6,10 +6,16 @@ import (
 	"testing"
 )
 
+// alwaysAcceptSubmit accepts every order AND reports it as fully filled
+// at EXACTLY the assumed notional the engine computed the order size
+// from (quantity * referencePrice) -- the common case most existing
+// tests below want, distinct from the new partial-fill-aware tests
+// further down which report a DIFFERENT actual-filled notional than
+// what was assumed.
 func alwaysAcceptSubmit(callLog *[]string) SubmitReducingOrderFunc {
-	return func(accountId string, symbol string, quantity int64) (bool, error) {
+	return func(accountId string, symbol string, quantity int64, assumedNotionalInMinorUnits int64) (bool, int64, error) {
 		*callLog = append(*callLog, accountId+":"+symbol)
-		return true, nil
+		return true, assumedNotionalInMinorUnits, nil
 	}
 }
 
@@ -241,8 +247,8 @@ func TestEvaluateAndLiquidateIfBreached_PartialCoverageLeavesRemainingShortfall(
 }
 
 func TestEvaluateAndLiquidateIfBreached_RejectedSubmissionDoesNotReduceShortfall(t *testing.T) {
-	rejectingSubmit := func(accountId string, symbol string, quantity int64) (bool, error) {
-		return false, errors.New("simulated downstream rejection")
+	rejectingSubmit := func(accountId string, symbol string, quantity int64, assumedNotionalInMinorUnits int64) (bool, int64, error) {
+		return false, 0, errors.New("simulated downstream rejection")
 	}
 	engine, _ := NewLiquidationEngine(DefaultThresholds(), rejectingSubmit)
 
@@ -270,6 +276,80 @@ func TestEvaluateAndLiquidateIfBreached_RejectedSubmissionDoesNotReduceShortfall
 	}
 }
 
+// TestEvaluateAndLiquidateIfBreached_ShortfallReflectsActualFillNotNotAssumed
+// is the reproduction for the confirmed bug: a reducing order can be
+// ACCEPTED by the order-submission pipeline (wasAccepted=true) yet only
+// PARTIALLY fill (e.g. resting, or filled at a worse price than the
+// reference price used to size it) -- remainingShortfall must be
+// decremented by the REAL executed notional the callback reports, not
+// the assumed (quantity * referencePrice) notional the engine sized the
+// order from.
+func TestEvaluateAndLiquidateIfBreached_ShortfallReflectsActualFillNotAssumed(t *testing.T) {
+	// Accepted, but only HALF the assumed notional actually filled (e.g.
+	// a partial fill against a thin book).
+	partiallyFillingSubmit := func(accountId string, symbol string, quantity int64, assumedNotionalInMinorUnits int64) (bool, int64, error) {
+		return true, assumedNotionalInMinorUnits / 2, nil
+	}
+	engine, _ := NewLiquidationEngine(DefaultThresholds(), partiallyFillingSubmit)
+
+	// Same hand-worked setup as the fully-filling test: shortfall 45,000,
+	// one position of 100 shares @ 1,000 -> sizes a 45-share order,
+	// assumed notional 45,000. Only 22,500 of it actually fills.
+	snapshot := AccountLeverageSnapshot{
+		ClientAccountIdentifier:          "acct-1",
+		OutstandingPrincipalInMinorUnits: 120000,
+		PledgedMarginValueInMinorUnits:   100000,
+		Positions: []PositionForLiquidation{
+			{InstrumentSymbol: "DEMO-EQ", NetQuantity: 100, CurrentMarketPriceInMinorUnits: 1000, MarketPriceIsKnown: true},
+		},
+	}
+
+	outcome := engine.EvaluateAndLiquidateIfBreached(snapshot)
+	if len(outcome.SubmittedReducingOrders) != 1 {
+		t.Fatalf("expected exactly 1 reducing order, got %d", len(outcome.SubmittedReducingOrders))
+	}
+	order := outcome.SubmittedReducingOrders[0]
+	if !order.WasAccepted {
+		t.Fatalf("expected the order to be reported accepted")
+	}
+	if order.NotionalReducedInMinorUnits != 22500 {
+		t.Fatalf("expected NotionalReducedInMinorUnits to reflect the REAL fill (22500), got %d", order.NotionalReducedInMinorUnits)
+	}
+	// The bug: shortfall was 45,000, engine wrongly treated the order as
+	// having closed the full 45,000 assumed notional just because it was
+	// accepted, leaving remaining shortfall at 0. The fix: only 22,500
+	// actually filled, so 22,500 of shortfall genuinely remains.
+	if outcome.RemainingShortfallInMinorUnits != 22500 {
+		t.Fatalf("expected remaining shortfall of 22500 (45000 shortfall - 22500 actually filled), got %d", outcome.RemainingShortfallInMinorUnits)
+	}
+}
+
+// TestEvaluateAndLiquidateIfBreached_AcceptedButZeroActualFillLeavesFullShortfall
+// is the sharpest form of the same bug: an order can be "accepted" by
+// the pipeline (e.g. queued as a resting limit / AMO) while genuinely
+// filling NOTHING yet -- the old wasAccepted-only logic would have
+// wrongly zeroed out the shortfall entirely.
+func TestEvaluateAndLiquidateIfBreached_AcceptedButZeroActualFillLeavesFullShortfall(t *testing.T) {
+	acceptedButUnfilledSubmit := func(accountId string, symbol string, quantity int64, assumedNotionalInMinorUnits int64) (bool, int64, error) {
+		return true, 0, nil // accepted, but genuinely filled nothing (yet)
+	}
+	engine, _ := NewLiquidationEngine(DefaultThresholds(), acceptedButUnfilledSubmit)
+
+	snapshot := AccountLeverageSnapshot{
+		ClientAccountIdentifier:          "acct-1",
+		OutstandingPrincipalInMinorUnits: 120000,
+		PledgedMarginValueInMinorUnits:   100000,
+		Positions: []PositionForLiquidation{
+			{InstrumentSymbol: "DEMO-EQ", NetQuantity: 100, CurrentMarketPriceInMinorUnits: 1000, MarketPriceIsKnown: true},
+		},
+	}
+
+	outcome := engine.EvaluateAndLiquidateIfBreached(snapshot)
+	if outcome.RemainingShortfallInMinorUnits != 45000 {
+		t.Fatalf("expected the FULL 45000 shortfall to remain since nothing actually filled, got %d", outcome.RemainingShortfallInMinorUnits)
+	}
+}
+
 func TestUtilizationPercent_ZeroPledgedZeroOutstandingIsZero(t *testing.T) {
 	snapshot := AccountLeverageSnapshot{}
 	if got := snapshot.UtilizationPercent(); got != 0.0 {
@@ -287,11 +367,11 @@ func TestUtilizationPercent_ZeroPledgedWithOutstandingIsMaximallyBreached(t *tes
 func TestConcurrentEvaluateAndLiquidateIfBreached_NoRace(t *testing.T) {
 	var mutex sync.Mutex
 	var totalCalls int
-	submit := func(accountId string, symbol string, quantity int64) (bool, error) {
+	submit := func(accountId string, symbol string, quantity int64, assumedNotionalInMinorUnits int64) (bool, int64, error) {
 		mutex.Lock()
 		totalCalls++
 		mutex.Unlock()
-		return true, nil
+		return true, assumedNotionalInMinorUnits, nil
 	}
 	engine, _ := NewLiquidationEngine(DefaultThresholds(), submit)
 

@@ -1,6 +1,7 @@
 package withdrawalworkflow
 
 import (
+	"sync"
 	"testing"
 	"time"
 
@@ -213,5 +214,49 @@ func TestLookupRequestReturnsNotFoundForAnUnknownId(t *testing.T) {
 	_, wasFound := workflow.LookupRequest("never-requested")
 	if wasFound {
 		t.Fatal("expected not found for an unknown withdrawal id")
+	}
+}
+
+// TestConcurrentWithdrawalRequestsCannotOverdrawTheAccount reproduces the
+// check-then-act race: two concurrent RequestWithdrawal calls for more
+// than half the balance each must not BOTH succeed, since only one of
+// them can actually be available. Before the fix, the balance check and
+// the hold insertion happened in separate critical sections, so both
+// goroutines could read the same available balance before either
+// inserted its hold.
+func TestConcurrentWithdrawalRequestsCannotOverdrawTheAccount(t *testing.T) {
+	const trials = 200
+	for trial := 0; trial < trials; trial++ {
+		workflow, _ := newTestWorkflowWithFundedAccount(t, 100_000)
+
+		var wg sync.WaitGroup
+		results := make([]error, 2)
+		for i := 0; i < 2; i++ {
+			wg.Add(1)
+			go func(idx int) {
+				defer wg.Done()
+				_, err := workflow.RequestWithdrawal("acct-001", 60_000, testNow)
+				results[idx] = err
+			}(i)
+		}
+		wg.Wait()
+
+		successCount := 0
+		for _, err := range results {
+			if err == nil {
+				successCount++
+			}
+		}
+		if successCount > 1 {
+			t.Fatalf("trial %d: expected at most 1 of 2 concurrent 60000 withdrawal requests against a 100000 balance to succeed, got %d successes", trial, successCount)
+		}
+
+		available, availErr := workflow.AvailableBalanceInMinorUnits("acct-001")
+		if availErr != nil {
+			t.Fatalf("unexpected error: %v", availErr)
+		}
+		if available < 0 {
+			t.Fatalf("trial %d: available balance went negative: %d", trial, available)
+		}
 	}
 }

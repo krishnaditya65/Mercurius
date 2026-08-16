@@ -13,6 +13,7 @@ import (
 
 	"mercurius/apiGateway/internal/apikeymanager"
 	"mercurius/apiGateway/internal/authmiddleware"
+	"mercurius/apiGateway/internal/ratelimiter"
 	"mercurius/apiGateway/internal/sloalerting"
 	"mercurius/apiGateway/internal/tenantconfig"
 	"mercurius/apiGateway/internal/webhookdelivery"
@@ -273,6 +274,180 @@ func TestAccountAggregatorRequiresOwnAccount(t *testing.T) {
 	}
 }
 
+// TestAccountAggregatorForwardsCallersBearerTokenToOmsGateway is a
+// REGRESSION test for the bug where the aggregator called oms-gateway's
+// /positions completely unauthenticated: it stands up a fake oms-gateway
+// that requires the exact Authorization header the incoming
+// /account-aggregator/net-worth request carried (mirroring oms-gateway's
+// real authmiddleware.RequireAuth on /positions) and asserts the
+// resulting view actually contains the oms-gateway holding -- before the
+// fix, oms-gateway always 401s here and the holding silently never
+// appears.
+func TestAccountAggregatorForwardsCallersBearerTokenToOmsGateway(t *testing.T) {
+	ownAccountToken := issueTestToken(t, "acct-001", authmiddleware.RoleRetail)
+	expectedAuthorizationHeader := "Bearer " + ownAccountToken
+
+	omsGatewayStub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != expectedAuthorizationHeader {
+			http.Error(w, `{"errorMessage":"missing or malformed Authorization header"}`, http.StatusUnauthorized)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"accountIdentifier":"acct-001","netQuantityByInstrumentSymbol":{"AAPL":10}}`))
+	}))
+	defer omsGatewayStub.Close()
+
+	mutualFundsStub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`[]`))
+	}))
+	defer mutualFundsStub.Close()
+
+	handler := authmiddleware.RequireAuth(testSigningSecret, buildAccountAggregatorHandler(omsGatewayStub.URL, mutualFundsStub.URL))
+
+	request := httptest.NewRequest(http.MethodGet, "/account-aggregator/net-worth?accountId=acct-001", nil)
+	bearer(request, ownAccountToken)
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", recorder.Code, recorder.Body.String())
+	}
+
+	var body struct {
+		PlatformHoldings []struct {
+			SourceService         string `json:"sourceService"`
+			InstrumentDescription string `json:"instrumentDescription"`
+		} `json:"platformHoldings"`
+		DataSourceCaveats []string `json:"dataSourceCaveats"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
+		t.Fatalf("expected valid JSON body, got %s: %v", recorder.Body.String(), err)
+	}
+	found := false
+	for _, holding := range body.PlatformHoldings {
+		if holding.SourceService == "oms-gateway" && holding.InstrumentDescription == "AAPL" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected the oms-gateway AAPL holding to be present once the caller's bearer token is forwarded, got %+v", body.PlatformHoldings)
+	}
+}
+
+// TestAccountAggregatorSurfacesOmsGatewayFailureInsteadOfSilentZero is a
+// REGRESSION test for the swallowed-failure half of the same bug: when
+// oms-gateway returns a non-2xx, the old code's
+// `if json.Decode(...) == nil { ... }` with no else/log meant the
+// failure vanished completely -- the response looked identical to "the
+// account genuinely has zero positions", with nothing in the response
+// or logs to tell the two apart. The fix must surface it via
+// DataSourceCaveats.
+func TestAccountAggregatorSurfacesOmsGatewayFailureInsteadOfSilentZero(t *testing.T) {
+	ownAccountToken := issueTestToken(t, "acct-001", authmiddleware.RoleRetail)
+
+	omsGatewayStub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, `{"errorMessage":"missing or malformed Authorization header"}`, http.StatusUnauthorized)
+	}))
+	defer omsGatewayStub.Close()
+
+	mutualFundsStub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`[]`))
+	}))
+	defer mutualFundsStub.Close()
+
+	handler := authmiddleware.RequireAuth(testSigningSecret, buildAccountAggregatorHandler(omsGatewayStub.URL, mutualFundsStub.URL))
+
+	request := httptest.NewRequest(http.MethodGet, "/account-aggregator/net-worth?accountId=acct-001", nil)
+	bearer(request, ownAccountToken)
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected 200 with a caveat rather than an error status, got %d body=%s", recorder.Code, recorder.Body.String())
+	}
+
+	var body struct {
+		DataSourceCaveats []string `json:"dataSourceCaveats"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
+		t.Fatalf("expected valid JSON body, got %s: %v", recorder.Body.String(), err)
+	}
+	if len(body.DataSourceCaveats) == 0 {
+		t.Fatalf("expected a non-empty dataSourceCaveats explaining the oms-gateway failure, got none")
+	}
+}
+
+// TestAccountAggregatorReportsMutualFundsHoldingsInTheRealWireShape is a
+// regression test for the wire-shape mismatch: the real mutual-funds
+// GET /holdings response carries schemeId/totalUnits, never
+// schemeName/currentValueInMinorUnits. Before the fix, decoding the
+// real shape into the old (wrong) struct always failed, so mutual-funds
+// holdings never appeared no matter what mutual-funds returned.
+func TestAccountAggregatorReportsMutualFundsHoldingsInTheRealWireShape(t *testing.T) {
+	ownAccountToken := issueTestToken(t, "acct-001", authmiddleware.RoleRetail)
+	expectedAuthorizationHeader := "Bearer " + ownAccountToken
+
+	omsGatewayStub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != expectedAuthorizationHeader {
+			http.Error(w, `{"errorMessage":"missing or malformed Authorization header"}`, http.StatusUnauthorized)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"accountIdentifier":"acct-001","netQuantityByInstrumentSymbol":{}}`))
+	}))
+	defer omsGatewayStub.Close()
+
+	// The REAL mutual-funds /holdings wire shape (see
+	// services/mutual-funds/cmd/server/main.go's holdingWireFormat) --
+	// schemeId/totalUnits/unitsReservedForRedemption/availableUnits, no
+	// schemeName or currentValueInMinorUnits field.
+	mutualFundsStub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`[{"schemeId":"scheme-nifty-index","totalUnits":125.5,"unitsReservedForRedemption":0,"availableUnits":125.5}]`))
+	}))
+	defer mutualFundsStub.Close()
+
+	handler := authmiddleware.RequireAuth(testSigningSecret, buildAccountAggregatorHandler(omsGatewayStub.URL, mutualFundsStub.URL))
+
+	request := httptest.NewRequest(http.MethodGet, "/account-aggregator/net-worth?accountId=acct-001", nil)
+	bearer(request, ownAccountToken)
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", recorder.Code, recorder.Body.String())
+	}
+
+	var body struct {
+		PlatformHoldings []struct {
+			SourceService         string  `json:"sourceService"`
+			InstrumentDescription string  `json:"instrumentDescription"`
+			UnitsHeld             float64 `json:"unitsHeld"`
+			ValuationUnavailable  bool    `json:"valuationUnavailable"`
+		} `json:"platformHoldings"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
+		t.Fatalf("expected valid JSON body, got %s: %v", recorder.Body.String(), err)
+	}
+	found := false
+	for _, holding := range body.PlatformHoldings {
+		if holding.SourceService == "mutual-funds" && holding.InstrumentDescription == "scheme-nifty-index" {
+			found = true
+			if holding.UnitsHeld != 125.5 {
+				t.Fatalf("expected units held 125.5, got %v", holding.UnitsHeld)
+			}
+			if !holding.ValuationUnavailable {
+				t.Fatalf("expected mutual-funds holding to be marked ValuationUnavailable rather than fabricating a 0 value")
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("expected the real-shaped mutual-funds holding to decode and appear, got %+v", body.PlatformHoldings)
+	}
+}
+
 func TestHealthStaysPublic(t *testing.T) {
 	// /health itself is a trivial inline handler with no auth wrapper —
 	// this just documents that expectation stays true structurally by
@@ -356,5 +531,152 @@ func TestCorsDefaultsWhenEnvVarUnset(t *testing.T) {
 
 	if got := recorder.Header().Get("Access-Control-Allow-Origin"); got != "http://localhost:3100" {
 		t.Fatalf("expected the default allow-list to include http://localhost:3100, got header %q", got)
+	}
+}
+
+// TestProxyAccessGateRejectsFullyAnonymousRequests is a REGRESSION test
+// for the bug where the reverse-proxy catch-all route ("/") had no
+// authentication at all: neither a JWT nor an API key. Before the fix,
+// a request with neither reaches the backend proxy untouched; after the
+// fix it must be rejected before ever reaching next.
+func TestProxyAccessGateRejectsFullyAnonymousRequests(t *testing.T) {
+	gate := buildProxyAccessGate(testSigningSecret, apikeymanager.NewApiKeyManager(), http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		t.Fatal("the backend proxy must not be reached for a fully anonymous request")
+	}))
+
+	request := httptest.NewRequest(http.MethodGet, "/oms/positions?accountId=acct-1", nil)
+	recorder := httptest.NewRecorder()
+	gate.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 for a fully anonymous proxy request, got %d body=%s", recorder.Code, recorder.Body.String())
+	}
+}
+
+// TestProxyAccessGateAllowsAValidJwt covers the "platform's own
+// web/desktop client traffic" access path this route must keep
+// supporting: a caller with a valid JWT and no API key at all.
+func TestProxyAccessGateAllowsAValidJwt(t *testing.T) {
+	reached := false
+	gate := buildProxyAccessGate(testSigningSecret, apikeymanager.NewApiKeyManager(), http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		reached = true
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	request := httptest.NewRequest(http.MethodGet, "/oms/positions?accountId=acct-1", nil)
+	bearer(request, issueTestToken(t, "acct-1", authmiddleware.RoleRetail))
+	recorder := httptest.NewRecorder()
+	gate.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusOK || !reached {
+		t.Fatalf("expected a valid JWT to reach the proxy, got %d reached=%v", recorder.Code, reached)
+	}
+}
+
+// TestProxyAccessGateAllowsAValidApiKeyWithNoJwt covers the developer
+// API-key access path: an API-key holder has no user JWT at all, and
+// must still be allowed through.
+func TestProxyAccessGateAllowsAValidApiKeyWithNoJwt(t *testing.T) {
+	keyManager := apikeymanager.NewApiKeyManager()
+	issued, err := keyManager.IssueApiKey(apikeymanager.ApiKeyIssuanceRequest{AccountIdentifier: "acct-1"})
+	if err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+
+	reached := false
+	gate := buildProxyAccessGate(testSigningSecret, keyManager, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		reached = true
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	request := httptest.NewRequest(http.MethodGet, "/oms/positions?accountId=acct-1", nil)
+	request.Header.Set("X-Api-Key", issued.ApiKeyValue)
+	recorder := httptest.NewRecorder()
+	gate.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusOK || !reached {
+		t.Fatalf("expected a valid API key with no JWT to reach the proxy, got %d reached=%v", recorder.Code, reached)
+	}
+}
+
+// TestProxyAccessGateAppliedThroughTheFullMiddlewareChainRejectsAnonymous
+// exercises the gate the way main() actually wires it: through
+// buildRateLimitingMiddleware first (which validates X-Api-Key, or
+// falls back to the per-IP anonymous bucket), then buildProxyAccessGate.
+// A fully anonymous request must still be rejected end-to-end, not just
+// in isolation.
+func TestProxyAccessGateAppliedThroughTheFullMiddlewareChainRejectsAnonymous(t *testing.T) {
+	keyManager := apikeymanager.NewApiKeyManager()
+	limiter := ratelimiter.NewTokenBucketRateLimiter(ratelimiter.DefaultTierLimits)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
+	mux.Handle("/", buildProxyAccessGate(testSigningSecret, keyManager, http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		t.Fatal("the backend proxy must not be reached for a fully anonymous request")
+	})))
+	fullChain := buildRateLimitingMiddleware(limiter, keyManager, mux)
+
+	request := httptest.NewRequest(http.MethodGet, "/oms/positions?accountId=acct-1", nil)
+	recorder := httptest.NewRecorder()
+	fullChain.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 end-to-end for a fully anonymous proxy request, got %d body=%s", recorder.Code, recorder.Body.String())
+	}
+}
+
+// TestRateLimitingMiddlewareKeysAnonymousTrafficByClientIp is a
+// REGRESSION test for the bug where every anonymous (no API key)
+// request shared one hardcoded rate-limit bucket ("anonymous"): two
+// different source IPs must each get their own bucket, so one client
+// exhausting its burst must not affect the other's.
+func TestRateLimitingMiddlewareKeysAnonymousTrafficByClientIp(t *testing.T) {
+	// RETAIL tier's real burst size (see ratelimiter.DefaultTierLimits) —
+	// exhaust it from one IP and confirm a second IP is unaffected.
+	limiter := ratelimiter.NewTokenBucketRateLimiter(ratelimiter.DefaultTierLimits)
+	handler := buildRateLimitingMiddleware(limiter, apikeymanager.NewApiKeyManager(), http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	burst := int(ratelimiter.DefaultTierLimits[ratelimiter.RateLimitTierRetail].BurstCapacity)
+
+	firstIpExhausted := false
+	for i := 0; i < burst+1; i++ {
+		request := httptest.NewRequest(http.MethodGet, "/some-route", nil)
+		request.RemoteAddr = "203.0.113.10:5555"
+		recorder := httptest.NewRecorder()
+		handler.ServeHTTP(recorder, request)
+		if recorder.Code == http.StatusTooManyRequests {
+			firstIpExhausted = true
+		}
+	}
+	if !firstIpExhausted {
+		t.Fatalf("expected the first IP's burst to eventually be exhausted (429)")
+	}
+
+	// A second, different source IP must still get through on its own
+	// fresh bucket -- this is exactly what broke when every anonymous
+	// request shared one constant key.
+	secondIpRequest := httptest.NewRequest(http.MethodGet, "/some-route", nil)
+	secondIpRequest.RemoteAddr = "198.51.100.20:6666"
+	secondIpRecorder := httptest.NewRecorder()
+	handler.ServeHTTP(secondIpRecorder, secondIpRequest)
+	if secondIpRecorder.Code != http.StatusOK {
+		t.Fatalf("expected a different source IP to be unaffected by the first IP's exhausted bucket, got %d", secondIpRecorder.Code)
+	}
+}
+
+func TestRemoteAddressKeyStripsThePort(t *testing.T) {
+	request := httptest.NewRequest(http.MethodGet, "/", nil)
+	request.RemoteAddr = "203.0.113.10:54321"
+	if got := remoteAddressKey(request); got != "203.0.113.10" {
+		t.Fatalf("expected the port stripped, got %q", got)
+	}
+}
+
+func TestRemoteAddressKeyFallsBackToRawValueWhenNotHostPort(t *testing.T) {
+	request := httptest.NewRequest(http.MethodGet, "/", nil)
+	request.RemoteAddr = "not-a-host-port"
+	if got := remoteAddressKey(request); got != "not-a-host-port" {
+		t.Fatalf("expected the raw RemoteAddr as a fallback, got %q", got)
 	}
 }

@@ -125,6 +125,19 @@ function renderChartOntoCanvas(
   }
 }
 
+/** `calculateFibonacciRetracementLevels` throws when the visible range is
+ * flat (swingHigh <= swingLow, e.g. every candle in this window traded at
+ * the exact same price). Callers must check this BEFORE calling into it
+ * rather than wrapping in try/catch, so a render pass never calls a
+ * function known to throw — pure function, exported for unit testing. */
+export function shouldRenderFibonacciOverlay(
+  showFibonacciRetracement: boolean,
+  swingHigh: number,
+  swingLow: number
+): boolean {
+  return showFibonacciRetracement && swingHigh > swingLow;
+}
+
 function drawPricePane(
   ctx: CanvasRenderingContext2D,
   candles: CandleBar[],
@@ -136,7 +149,12 @@ function drawPricePane(
 
   const swingHigh = Math.max(...candles.map((c) => c.highPriceInMinorUnits));
   const swingLow = Math.min(...candles.map((c) => c.lowPriceInMinorUnits));
-  const fibonacciLevels = overlays.showFibonacciRetracement
+  const canRenderFibonacciOverlay = shouldRenderFibonacciOverlay(
+    overlays.showFibonacciRetracement,
+    swingHigh,
+    swingLow
+  );
+  const fibonacciLevels = canRenderFibonacciOverlay
     ? calculateFibonacciRetracementLevels(swingHigh, swingLow, "uptrend")
     : null;
 
@@ -186,6 +204,15 @@ function drawPricePane(
 
   if (fibonacciLevels) {
     drawFibonacciLevels(ctx, fibonacciLevels, paneWidth, priceToY);
+  } else if (overlays.showFibonacciRetracement) {
+    // Fib was requested but skipped (flat price range) — a small,
+    // non-intrusive note rather than silently doing nothing, so it's
+    // clear the overlay isn't just slow to appear.
+    ctx.save();
+    ctx.fillStyle = AXIS_TEXT_COLOR;
+    ctx.font = "10px monospace";
+    ctx.fillText("Fib unavailable for flat price range", 6, paneHeight - 6);
+    ctx.restore();
   }
 }
 

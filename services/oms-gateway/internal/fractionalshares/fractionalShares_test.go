@@ -2,6 +2,7 @@ package fractionalshares
 
 import (
 	"errors"
+	"math"
 	"testing"
 )
 
@@ -34,6 +35,45 @@ func TestValidateMilliShareQuantity_PaperOrderAccepted(t *testing.T) {
 	quantity := uint64(500)
 	if err := ValidateMilliShareQuantity(&quantity, true); err != nil {
 		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestValidateMilliShareQuantity_OverflowingQuantityRejected(t *testing.T) {
+	// A milliShareQuantity near uint64 max wraps negative when converted
+	// to int64 in NotionalInMinorUnits, producing a near-zero/negative
+	// notional that would sail through margin checks. This MUST be
+	// rejected before it ever reaches the conversion.
+	huge := uint64(math.MaxInt64) + 1000
+	err := ValidateMilliShareQuantity(&huge, true)
+	if !errors.Is(err, ErrMilliShareQuantityExceedsMaximum) {
+		t.Fatalf("expected ErrMilliShareQuantityExceedsMaximum, got %v", err)
+	}
+}
+
+func TestValidateMilliShareQuantity_MaxInt64QuantityRejected(t *testing.T) {
+	// Exactly math.MaxInt64 does not itself overflow the int64
+	// conversion, but it is a wildly unreasonable share quantity (far
+	// beyond MaxReasonableMilliShareQuantity) and must still be
+	// rejected by the sane ceiling, not just a bare overflow check.
+	maxVal := uint64(math.MaxInt64)
+	err := ValidateMilliShareQuantity(&maxVal, true)
+	if !errors.Is(err, ErrMilliShareQuantityExceedsMaximum) {
+		t.Fatalf("expected ErrMilliShareQuantityExceedsMaximum, got %v", err)
+	}
+}
+
+func TestValidateMilliShareQuantity_AtCeilingAccepted(t *testing.T) {
+	ceiling := uint64(MaxReasonableMilliShareQuantity)
+	if err := ValidateMilliShareQuantity(&ceiling, true); err != nil {
+		t.Fatalf("expected ceiling value to be accepted, got %v", err)
+	}
+}
+
+func TestValidateMilliShareQuantity_JustAboveCeilingRejected(t *testing.T) {
+	overCeiling := uint64(MaxReasonableMilliShareQuantity) + 1
+	err := ValidateMilliShareQuantity(&overCeiling, true)
+	if !errors.Is(err, ErrMilliShareQuantityExceedsMaximum) {
+		t.Fatalf("expected ErrMilliShareQuantityExceedsMaximum, got %v", err)
 	}
 }
 

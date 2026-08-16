@@ -26,6 +26,7 @@ from __future__ import annotations
 import math
 
 from quantengine.backtesting.backtestRunner import PortfolioState, TradeAction, TradeDecision
+from quantengine.backtesting.positionTolerance import POSITION_FLAT_EPSILON, isPositionFlat
 from quantengine.backtesting.tickStore import HistoricalPriceTick
 
 
@@ -123,9 +124,18 @@ class ZScoreMeanReversionPairsTradingStrategy:
 
         currentZScore = (currentTick.price - windowMean) / windowStandardDeviation
 
-        isFlat = portfolioState.positionQuantity == 0
-        isLong = portfolioState.positionQuantity > 0
-        isShort = portfolioState.positionQuantity < 0
+        # Tolerance-based, not exact-equality, position-flat/long/short
+        # checks — positionQuantity is accumulated via repeated float
+        # add/subtract across the whole backtest (see
+        # backtestRunner.applySignedQuantityChangeToPortfolio), so a
+        # genuinely fully-closed position can land at a float-dust
+        # residual like 1e-14 instead of exactly 0.0. An exact `== 0`
+        # check there would misclassify that as still long/short and,
+        # since this strategy only ever opens a NEW position while flat,
+        # would then wedge it into perpetual HOLD.
+        isFlat = isPositionFlat(portfolioState.positionQuantity)
+        isLong = portfolioState.positionQuantity > POSITION_FLAT_EPSILON
+        isShort = portfolioState.positionQuantity < -POSITION_FLAT_EPSILON
 
         if isFlat and currentZScore > self.entryZScoreThreshold:
             return TradeDecision(TradeAction.SELL, self.tradeQuantity)

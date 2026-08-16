@@ -1,6 +1,7 @@
 package marginpledge
 
 import (
+	"errors"
 	"sync"
 	"testing"
 )
@@ -271,5 +272,96 @@ func TestConcurrentPledgeAndUnpledgeCallsAreRaceFree(t *testing.T) {
 
 	if got := pledgeBookUnderTest.PledgedQuantity("acct-concurrent", "DEMO-EQ"); got != 0 {
 		t.Fatalf("expected 0 pledged after unpledging everything, got %d", got)
+	}
+}
+
+// TestReserveUnpledgedQuantityForSell_ConcurrentSellsCannotBothOversell is
+// the direct reproduction of the confirmed TOCTOU bug: two concurrent
+// sell checks against the SAME unpledged holding, each individually
+// within the available (unpledged) quantity but together exceeding it,
+// must NOT both be allowed to reserve. A separate PledgedQuantity() read
+// followed by an independent PositionsForAccount() read (the old
+// pattern) has no way to prevent this; an atomic check-and-reserve does.
+func TestReserveUnpledgedQuantityForSell_ConcurrentSellsCannotBothOversell(t *testing.T) {
+	pledgeBookUnderTest := NewPledgeBook()
+	const netHolding = int64(100) // nothing pledged -- all 100 unpledged
+
+	var waitGroup sync.WaitGroup
+	var mutexGuardingSuccessCount sync.Mutex
+	successCount := 0
+
+	// 3 concurrent sell checks of 60 shares each against a 100-share
+	// unpledged holding: only ONE can succeed (60 <= 100), a second
+	// would need 120 > 100.
+	for i := 0; i < 3; i++ {
+		waitGroup.Add(1)
+		go func() {
+			defer waitGroup.Done()
+			if err := pledgeBookUnderTest.ReserveUnpledgedQuantityForSell("acct-1", "DEMO-EQ", 60, netHolding); err == nil {
+				mutexGuardingSuccessCount.Lock()
+				successCount++
+				mutexGuardingSuccessCount.Unlock()
+			}
+		}()
+	}
+	waitGroup.Wait()
+
+	if successCount != 1 {
+		t.Fatalf("expected exactly 1 of 3 concurrent 60-share sell reservations to succeed against a 100-share holding, got %d", successCount)
+	}
+}
+
+func TestReserveUnpledgedQuantityForSell_RejectsWhenPledgedQuantityLeavesInsufficientUnpledged(t *testing.T) {
+	pledgeBookUnderTest := NewPledgeBook()
+	_, _, err := pledgeBookUnderTest.PledgeHolding("acct-1", "DEMO-EQ", 80, 10_000, 100) // 100 held, 80 pledged -> 20 unpledged
+	if err != nil {
+		t.Fatalf("unexpected pledge error: %v", err)
+	}
+
+	if err := pledgeBookUnderTest.ReserveUnpledgedQuantityForSell("acct-1", "DEMO-EQ", 21, 100); !errors.Is(err, ErrInsufficientUnpledgedHoldingQuantity) {
+		t.Fatalf("expected ErrInsufficientUnpledgedHoldingQuantity selling 21 of only 20 unpledged, got %v", err)
+	}
+	if err := pledgeBookUnderTest.ReserveUnpledgedQuantityForSell("acct-1", "DEMO-EQ", 20, 100); err != nil {
+		t.Fatalf("expected exactly the unpledged quantity to be reservable, got %v", err)
+	}
+}
+
+func TestReserveUnpledgedQuantityForSell_SecondReservationStacksAgainstFirst(t *testing.T) {
+	pledgeBookUnderTest := NewPledgeBook()
+	const netHolding = int64(100)
+
+	if err := pledgeBookUnderTest.ReserveUnpledgedQuantityForSell("acct-1", "DEMO-EQ", 70, netHolding); err != nil {
+		t.Fatalf("unexpected error on first reservation: %v", err)
+	}
+	// 70 already reserved, 100 held -> only 30 left; a second 40-share
+	// reservation must be rejected even though NO pledge exists at all.
+	if err := pledgeBookUnderTest.ReserveUnpledgedQuantityForSell("acct-1", "DEMO-EQ", 40, netHolding); !errors.Is(err, ErrInsufficientUnpledgedHoldingQuantity) {
+		t.Fatalf("expected the second reservation to be rejected (70+40 > 100 net holding), got %v", err)
+	}
+}
+
+func TestReleaseSellReservation_GivesBackCapacityFlooredAtZero(t *testing.T) {
+	pledgeBookUnderTest := NewPledgeBook()
+	const netHolding = int64(100)
+
+	if err := pledgeBookUnderTest.ReserveUnpledgedQuantityForSell("acct-1", "DEMO-EQ", 100, netHolding); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if err := pledgeBookUnderTest.ReserveUnpledgedQuantityForSell("acct-1", "DEMO-EQ", 1, netHolding); err == nil {
+		t.Fatal("expected no capacity left after fully reserving the holding")
+	}
+
+	pledgeBookUnderTest.ReleaseSellReservation("acct-1", "DEMO-EQ", 100)
+
+	if err := pledgeBookUnderTest.ReserveUnpledgedQuantityForSell("acct-1", "DEMO-EQ", 100, netHolding); err != nil {
+		t.Fatalf("expected full capacity restored after release, got %v", err)
+	}
+
+	// Releasing more than was ever reserved must floor at zero, not
+	// panic or underflow into a negative reservation that would
+	// incorrectly grant MORE than the real holding.
+	pledgeBookUnderTest.ReleaseSellReservation("acct-1", "DEMO-EQ", 99999)
+	if err := pledgeBookUnderTest.ReserveUnpledgedQuantityForSell("acct-1", "DEMO-EQ", 100, netHolding); err != nil {
+		t.Fatalf("expected full capacity still available (floored, not over-released), got %v", err)
 	}
 }

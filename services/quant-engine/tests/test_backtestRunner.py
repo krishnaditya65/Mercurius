@@ -151,3 +151,31 @@ def test_addingToExistingLongPositionBlendsAverageEntryPrice():
     # blended average: (10*100 + 10*120) / 20 = 2200/20 = 110
     assert state.averageEntryPrice == pytest.approx(110.0)
     assert state.positionQuantity == pytest.approx(20.0)
+
+
+def test_positionFlatChecksToleratesFloatDustResidualAfterFullRoundTrip():
+    # Ten BUYs of 0.1 accumulated via repeated float += land at
+    # 0.9999999999999999 (not exactly 1.0); selling exactly that back
+    # then lands positionQuantity at a tiny float-dust residual like
+    # -1.1102230246251565e-16 (not exactly 0.0) rather than a clean zero.
+    # A genuinely fully-closed position must still be treated as FLAT:
+    # averageEntryPrice reset to 0.0, and zero unrealized P&L regardless
+    # of the current market price.
+    portfolioState = PortfolioState(cashBalance=100_000.0)
+    for _ in range(10):
+        applySignedQuantityChangeToPortfolio(portfolioState, 0.1, 100.0)
+    # Sell the economically-correct "1.0" (what ten 0.1 buys SHOULD sum
+    # to), not portfolioState.positionQuantity itself — selling the
+    # literal accumulated float back against itself would trivially net
+    # to exact zero and wouldn't reproduce the accumulation-error dust.
+    applySignedQuantityChangeToPortfolio(portfolioState, -1.0, 100.0)
+
+    assert portfolioState.positionQuantity != 0.0  # genuine float dust, not exactly zero
+    assert portfolioState.averageEntryPrice == 0.0
+    assert portfolioState.calculateUnrealizedProfitAndLoss(500.0) == 0.0
+
+    # Re-opening a brand-new position from this float-dust-flat state
+    # must be treated as OPENING (fresh averageEntryPrice at the new
+    # trade price), not as "reducing" the residual dust position.
+    applySignedQuantityChangeToPortfolio(portfolioState, 5.0, 200.0)
+    assert portfolioState.averageEntryPrice == pytest.approx(200.0)

@@ -134,6 +134,21 @@ _savedScreenStoreLock = threading.Lock()
 _researchCopilotIndex = buildIllustrativeRetrievalIndex()
 
 
+def _requireDictField(value: object, fieldDescription: str) -> dict:
+    """Validates that a request-body field intended to be used as a
+    `{key: value}` mapping is actually a JSON object before any caller
+    does `.items()` on it — a bare `.items()` call on e.g. JSON `null`
+    (which decodes to Python `None`) raises `AttributeError`, which is
+    NOT one of the (KeyError, TypeError, ValueError) types the request
+    handlers catch and turn into a clean 400, so it would otherwise
+    surface as a raw 500. Raises `ValueError` (which IS caught) with a
+    clear message instead.
+    """
+    if not isinstance(value, dict):
+        raise ValueError(f"{fieldDescription} must be an object/dict, got {type(value).__name__}")
+    return value
+
+
 def buildInputParametersFromRequestBody(requestBody: dict) -> BlackScholesInputParameters:
     """Raises `KeyError`/`TypeError` on a malformed body — callers catch
     and turn that into a 400, exactly like a missing/wrong-typed field in
@@ -244,7 +259,12 @@ class QuantEngineRequestHandler(BaseHTTPRequestHandler):
         """
         try:
             inputParameters = buildInputParametersFromRequestBody(requestBody)
-            isCallOptionNotPut = bool(requestBody["isCallOptionNotPut"])
+            isCallOptionNotPut = requestBody["isCallOptionNotPut"]
+            if not isinstance(isCallOptionNotPut, bool):
+                raise ValueError(
+                    "isCallOptionNotPut must be a JSON boolean, "
+                    f"got {type(isCallOptionNotPut).__name__}"
+                )
         except (KeyError, TypeError, ValueError) as validationError:
             self._writeJsonResponse(400, {"errorMessage": f"invalid request body: {validationError}"})
             return
@@ -282,7 +302,12 @@ class QuantEngineRequestHandler(BaseHTTPRequestHandler):
         """
         try:
             observedMarketPrice = float(requestBody["observedMarketPrice"])
-            isCallOptionNotPut = bool(requestBody["isCallOptionNotPut"])
+            isCallOptionNotPut = requestBody["isCallOptionNotPut"]
+            if not isinstance(isCallOptionNotPut, bool):
+                raise ValueError(
+                    "isCallOptionNotPut must be a JSON boolean, "
+                    f"got {type(isCallOptionNotPut).__name__}"
+                )
             inputParametersWithoutVolatility = BlackScholesInputParameters(
                 underlyingSpotPrice=float(requestBody["underlyingSpotPrice"]),
                 optionStrikePrice=float(requestBody["optionStrikePrice"]),
@@ -433,9 +458,12 @@ class QuantEngineRequestHandler(BaseHTTPRequestHandler):
         filter above the threshold (FEATURES.md §6).
         """
         try:
+            rawReturnSeriesBySymbol = _requireDictField(
+                requestBody["returnSeriesBySymbol"], "returnSeriesBySymbol"
+            )
             returnSeriesBySymbol = {
                 symbol: [float(v) for v in series]
-                for symbol, series in requestBody["returnSeriesBySymbol"].items()
+                for symbol, series in rawReturnSeriesBySymbol.items()
             }
             minimumAbsoluteCorrelationThreshold = float(
                 requestBody.get("minimumAbsoluteCorrelationThreshold", 0.7)
@@ -861,14 +889,18 @@ class QuantEngineRequestHandler(BaseHTTPRequestHandler):
                     portfolioWeight=float(oneHolding["portfolioWeight"]),
                     factorExposuresByName={
                         str(factorName): float(exposure)
-                        for factorName, exposure in oneHolding["factorExposuresByName"].items()
+                        for factorName, exposure in _requireDictField(
+                            oneHolding["factorExposuresByName"], "holdings[].factorExposuresByName"
+                        ).items()
                     },
                 )
                 for oneHolding in requestBody["holdings"]
             ]
             factorReturnsByName = {
                 str(factorName): float(factorReturn)
-                for factorName, factorReturn in requestBody["factorReturnsByName"].items()
+                for factorName, factorReturn in _requireDictField(
+                    requestBody["factorReturnsByName"], "factorReturnsByName"
+                ).items()
             }
             actualOrExpectedPortfolioReturn = float(requestBody["actualOrExpectedPortfolioReturn"])
         except (KeyError, TypeError, ValueError) as validationError:
@@ -916,7 +948,10 @@ class QuantEngineRequestHandler(BaseHTTPRequestHandler):
         try:
             samplesByVenue = {
                 str(venueLabel): [float(sample) for sample in samples]
-                for venueLabel, samples in requestBody["roundTripTimeSamplesInMillisecondsByVenue"].items()
+                for venueLabel, samples in _requireDictField(
+                    requestBody["roundTripTimeSamplesInMillisecondsByVenue"],
+                    "roundTripTimeSamplesInMillisecondsByVenue",
+                ).items()
             }
             bucketCount = int(requestBody.get("bucketCount", 10))
         except (KeyError, TypeError, ValueError) as validationError:
@@ -1203,7 +1238,12 @@ class QuantEngineRequestHandler(BaseHTTPRequestHandler):
                     sector=str(oneHolding["sector"]),
                     portfolioWeight=float(oneHolding["portfolioWeight"]),
                     factorExposuresByName=(
-                        {str(k): float(v) for k, v in oneHolding["factorExposuresByName"].items()}
+                        {
+                            str(k): float(v)
+                            for k, v in _requireDictField(
+                                oneHolding["factorExposuresByName"], "holdings[].factorExposuresByName"
+                            ).items()
+                        }
                         if oneHolding.get("factorExposuresByName") is not None
                         else None
                     ),
@@ -1363,7 +1403,7 @@ class QuantEngineRequestHandler(BaseHTTPRequestHandler):
                     [float(v) for v in metricData["historicalValues"]],
                     float(metricData["currentValue"]),
                 )
-                for metricName, metricData in requestBody["metrics"].items()
+                for metricName, metricData in _requireDictField(requestBody["metrics"], "metrics").items()
             }
             zScoreThreshold = float(requestBody.get("zScoreThreshold", 2.0))
         except (KeyError, TypeError, ValueError) as validationError:

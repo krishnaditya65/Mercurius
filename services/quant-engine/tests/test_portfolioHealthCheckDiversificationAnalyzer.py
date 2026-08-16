@@ -150,3 +150,18 @@ def test_performPortfolioHealthCheck_noFactorSummaryWhenNotEveryHoldingSuppliesE
     ]
     result = performPortfolioHealthCheck(holdings)
     assert result.portfolioExposureByFactor is None
+
+
+def test_performPortfolioHealthCheck_allZeroWeightPortfolioRaisesClearValueErrorNotInternalHhiMessage():
+    # Every holding legitimately has 0.0 portfolioWeight (individually
+    # valid per __post_init__, which only rejects NEGATIVE weights) — but
+    # there's no meaningful weight distribution to compute an "effective
+    # number of holdings" over. Should raise a clear, purpose-specific
+    # ValueError rather than calculateEffectiveNumberOfHoldings's
+    # confusing internal "hhi must be strictly positive..." message.
+    holdings = [
+        PortfolioHoldingForHealthCheck(symbol="A", sector="Tech", portfolioWeight=0.0),
+        PortfolioHoldingForHealthCheck(symbol="B", sector="Tech", portfolioWeight=0.0),
+    ]
+    with pytest.raises(ValueError, match="portfolio weights must sum to a positive total"):
+        performPortfolioHealthCheck(holdings)

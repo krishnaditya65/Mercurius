@@ -35,10 +35,23 @@ type ExternalHolding struct {
 // PlatformHolding is one holding this platform itself already knows
 // about (from oms-gateway positions or mutual-funds holdings) —
 // real data, not fixture data.
+//
+// Neither source service's real wire response carries a market value
+// today: oms-gateway's GET /positions reports only a net quantity per
+// instrument symbol, and mutual-funds' GET /holdings reports only unit
+// counts (see cmd/server/main.go's buildAccountAggregatorHandler for
+// exactly which fields each response actually has). Rather than
+// fabricate a false CurrentValueInMinorUnits of 0 for those holdings
+// (indistinguishable from "genuinely worth nothing"), callers that
+// can't price a holding set UnitsHeld and ValuationUnavailable=true
+// instead — see UnifiedNetWorthView.DataSourceCaveats for the
+// human-readable explanation surfaced alongside it.
 type PlatformHolding struct {
-	SourceService            string `json:"sourceService"` // "oms-gateway" or "mutual-funds"
-	InstrumentDescription    string `json:"instrumentDescription"`
-	CurrentValueInMinorUnits int64  `json:"currentValueInMinorUnits"`
+	SourceService            string  `json:"sourceService"` // "oms-gateway" or "mutual-funds"
+	InstrumentDescription    string  `json:"instrumentDescription"`
+	CurrentValueInMinorUnits int64   `json:"currentValueInMinorUnits"`
+	UnitsHeld                float64 `json:"unitsHeld,omitempty"`
+	ValuationUnavailable     bool    `json:"valuationUnavailable,omitempty"`
 }
 
 // UnifiedNetWorthView is the real, computed merge of this platform's own
@@ -51,6 +64,13 @@ type UnifiedNetWorthView struct {
 	TotalExternalValueInMinorUnits  int64             `json:"totalExternalValueInMinorUnits"`
 	TotalNetWorthInMinorUnits       int64             `json:"totalNetWorthInMinorUnits"`
 	IsExternalDataFromRealAaNetwork bool              `json:"isExternalDataFromRealAaNetwork"` // ALWAYS false — see package warning
+	// DataSourceCaveats is a human-readable list of anything that makes
+	// this view incomplete or partially unpriced — e.g. an unreachable
+	// backend, a non-2xx response, or a source holding with
+	// ValuationUnavailable set. Empty when the view is fully live and
+	// fully priced. Set by the caller (cmd/server/main.go), never by
+	// BuildUnifiedNetWorthView itself.
+	DataSourceCaveats []string `json:"dataSourceCaveats,omitempty"`
 }
 
 // MockedExternalInstitutionHoldingsSource returns a fixture set of

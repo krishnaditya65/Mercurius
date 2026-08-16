@@ -159,9 +159,22 @@ impl UdpMulticastPublisher {
     }
 }
 
+/// Length-prefixed string encoding. Uses a `u16` (little-endian) length
+/// prefix — NOT a single `u8` — because a `u8` prefix silently truncates
+/// (`bytes.len() as u8`) for any string longer than 255 bytes while
+/// `extend_from_slice` below still writes the FULL string: the truncated
+/// length no longer matches the bytes actually written, desyncing every
+/// subsequent field a decoder reads from this datagram. This wire format
+/// has no external/frozen consumer yet (this module's own `decodeMessage`
+/// is the only decoder in this codebase), so widening the prefix here is
+/// safe and is preferred over silently rejecting/truncating long inputs.
+/// `instrumentSymbol`s are expected to be short (a handful of ASCII
+/// characters) in practice, but a `u16` prefix (up to 65535 bytes) gives
+/// enormous headroom over a 1-byte prefix's silent-corruption failure mode
+/// for a negligible 1-extra-byte-per-message cost.
 fn writeLengthPrefixedString(buffer: &mut Vec<u8>, value: &str) {
     let bytes = value.as_bytes();
-    buffer.push(bytes.len() as u8);
+    buffer.extend_from_slice(&(bytes.len() as u16).to_le_bytes());
     buffer.extend_from_slice(bytes);
 }
 
@@ -266,8 +279,12 @@ impl<'a> ByteCursor<'a> {
         }
     }
 
+    fn readU16(&mut self) -> Option<u16> {
+        self.readFixedBytes::<2>().map(u16::from_le_bytes)
+    }
+
     fn readLengthPrefixedString(&mut self) -> Option<String> {
-        let length = self.readU8()? as usize;
+        let length = self.readU16()? as usize;
         let slice = self.bytes.get(self.position..self.position + length)?;
         self.position += length;
         String::from_utf8(slice.to_vec()).ok()
@@ -429,6 +446,43 @@ mod tests {
     #[test]
     fn defaultMulticastGroupAddressParsesAsAValidSocketAddr() {
         assert!(DEFAULT_MULTICAST_GROUP_ADDRESS.parse::<SocketAddr>().is_ok());
+    }
+
+    #[test]
+    fn encodeThenDecodeRoundTripsAStringLongerThan255BytesWithoutDesyncingTheDatagram() {
+        // A 1-byte length prefix truncates for any string >255 bytes
+        // (`bytes.len() as u8`) while `extend_from_slice` still writes the
+        // FULL string — so the encoded length no longer matches the bytes
+        // actually written, and every field decoded after this string
+        // comes out corrupted/misaligned. A 300-byte instrument symbol
+        // (implausible in practice, but exactly the case this guards)
+        // reproduces it directly via a real encode -> real decode round
+        // trip over actual multicast, checking the numeric fields AFTER
+        // the string decode correctly, not just the string itself.
+        let longSymbol: String = "X".repeat(300);
+        assert_eq!(longSymbol.len(), 300);
+
+        let receiveSocket = joinedMulticastReceiver("239.5.5.6:19110");
+        let publisher =
+            UdpMulticastPublisher::newPublisherForGroupAddress("239.5.5.6:19110").expect("construct publisher");
+
+        publisher
+            .publishTradeTick(&longSymbol, 1_700_000_000, 10_050, 25)
+            .expect("send trade tick with a long symbol");
+
+        let mut receiveBuffer = [0u8; 4096];
+        let (bytesReceived, _sourceAddr) = receiveSocket.recv_from(&mut receiveBuffer).expect("receive datagram");
+
+        let decoded = decodeMessage(&receiveBuffer[..bytesReceived]).expect("decode received datagram");
+        assert_eq!(
+            decoded,
+            DecodedMulticastMessage::TradeTick(DecodedTradeTick {
+                instrumentSymbol: longSymbol,
+                executedAtEpochSeconds: 1_700_000_000,
+                priceInMinorUnits: 10_050,
+                quantity: 25,
+            })
+        );
     }
 
     #[test]

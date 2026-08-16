@@ -84,7 +84,24 @@ const (
 	MandateStatusActive    MandateStatus = "ACTIVE"
 	MandateStatusPaused    MandateStatus = "PAUSED"
 	MandateStatusCancelled MandateStatus = "CANCELLED"
+	// MandateStatusSuspended is a terminal-until-manually-reviewed state:
+	// a mandate lands here after maxConsecutiveFailuresBeforeSuspension
+	// straight-line failed sweep attempts (e.g. its account was never
+	// properly CLIENT-classified) — see SweepDueMandates. Unlike
+	// MandateStatusPaused (an intentional, reversible user action), this
+	// signals something is actually broken and needs a human to look at
+	// it before the mandate can run again.
+	MandateStatusSuspended MandateStatus = "SUSPENDED"
 )
+
+// maxConsecutiveFailuresBeforeSuspension is the small, documented
+// threshold of consecutive failed sweep attempts after which
+// SweepDueMandates stops retrying a mandate and flips it to
+// MandateStatusSuspended instead — see the package doc: silently retrying
+// a permanently-failing mandate forever, with NextDebitDate never
+// advancing, would otherwise "run" a SIP that never actually invests,
+// with no signal to anyone.
+const maxConsecutiveFailuresBeforeSuspension = 3
 
 var ErrInvalidMandateAmount = fmt.Errorf("mandate amount must be strictly positive")
 var ErrInvalidMandateFrequency = fmt.Errorf("frequency must be one of DAILY, WEEKLY, MONTHLY")
@@ -105,14 +122,27 @@ type PaymentMandate struct {
 	RegisteredAt         time.Time
 	Status               MandateStatus
 	SuccessfulSweepCount int
+	// ConsecutiveFailureCount counts sweep attempts that have failed
+	// back-to-back, most recently — reset to 0 on any successful sweep.
+	// Reaching maxConsecutiveFailuresBeforeSuspension flips Status to
+	// MandateStatusSuspended.
+	ConsecutiveFailureCount int
+	// LastFailureReason is the most recent failed sweep's error message,
+	// for a compliance/ops reviewer inspecting a suspended (or
+	// currently-failing) mandate — cleared on any successful sweep.
+	LastFailureReason string
 }
 
 // SweptMandate is one line of SweepDueMandates' result — which mandate,
-// and whether its debit for this sweep actually posted.
+// whether its debit for this sweep actually posted, and (on failure) how
+// many consecutive failures it's now accumulated and whether this sweep
+// was the one that suspended it.
 type SweptMandate struct {
-	MandateId string
-	WasPosted bool
-	Error     string
+	MandateId               string
+	WasPosted               bool
+	Error                   string
+	ConsecutiveFailureCount int
+	WasSuspended            bool
 }
 
 // PaymentMandateRegistry is safe for concurrent use. A successfully
@@ -238,13 +268,19 @@ func (registry *PaymentMandateRegistry) CancelMandate(mandateId string) (*Paymen
 
 // SweepDueMandates executes every ACTIVE mandate whose NextDebitDate has
 // arrived: posts a real debit (negative client money movement) via
-// fundsegregation.SegregationGuard.PostClientMoneyMovement, then advances
-// NextDebitDate by one Frequency period regardless of whether the debit
-// succeeded (matching ProcessDueWithdrawals-style behaviour for a
-// permanent failure would starve every later debit; matching a
-// transient one is a real build TODO — see the package doc). A mandate
-// whose debit fails is still reported in the result with WasPosted=false
-// and its Error populated, not silently dropped.
+// fundsegregation.SegregationGuard.PostClientMoneyMovement.
+//
+// NextDebitDate only advances on a SUCCESSFUL sweep — a mandate that
+// fails stays due at the SAME date so the next sweep retries it, rather
+// than silently "running" forever on schedule without ever actually
+// investing. Each failure increments ConsecutiveFailureCount and records
+// LastFailureReason; a successful sweep resets both to zero/empty. Once
+// ConsecutiveFailureCount reaches maxConsecutiveFailuresBeforeSuspension,
+// the mandate is flipped to MandateStatusSuspended and stops being picked
+// up by future sweeps at all — a clear, terminal, surfaced signal instead
+// of an endless silent retry loop. A mandate whose debit fails is still
+// reported in the result with WasPosted=false and its Error populated,
+// not silently dropped.
 func (registry *PaymentMandateRegistry) SweepDueMandates(now time.Time) []SweptMandate {
 	registry.mutexGuardingMandates.Lock()
 	dueMandates := make([]*PaymentMandate, 0)
@@ -266,16 +302,26 @@ func (registry *PaymentMandateRegistry) SweepDueMandates(now time.Time) []SweptM
 		)
 
 		registry.mutexGuardingMandates.Lock()
+		result := SweptMandate{MandateId: mandate.MandateId, WasPosted: postError == nil}
 		if postError == nil {
 			mandate.SuccessfulSweepCount++
+			mandate.ConsecutiveFailureCount = 0
+			mandate.LastFailureReason = ""
+			mandate.NextDebitDate = mandate.Frequency.advance(mandate.NextDebitDate)
+		} else {
+			// Deliberately NOT advancing NextDebitDate here — see the
+			// doc comment above.
+			mandate.ConsecutiveFailureCount++
+			mandate.LastFailureReason = postError.Error()
+			result.Error = postError.Error()
+			result.ConsecutiveFailureCount = mandate.ConsecutiveFailureCount
+			if mandate.ConsecutiveFailureCount >= maxConsecutiveFailuresBeforeSuspension {
+				mandate.Status = MandateStatusSuspended
+				result.WasSuspended = true
+			}
 		}
-		mandate.NextDebitDate = mandate.Frequency.advance(mandate.NextDebitDate)
 		registry.mutexGuardingMandates.Unlock()
 
-		result := SweptMandate{MandateId: mandate.MandateId, WasPosted: postError == nil}
-		if postError != nil {
-			result.Error = postError.Error()
-		}
 		results = append(results, result)
 	}
 

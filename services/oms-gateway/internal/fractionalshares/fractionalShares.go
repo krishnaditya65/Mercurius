@@ -50,10 +50,34 @@ import "errors"
 // fractional-share granularity major brokers actually offer.
 const MilliShareUnitsPerWholeShare = 1000
 
+// MaxReasonableMilliShareQuantity is the documented sane ceiling on
+// milliShareQuantity: 1,000,000,000 whole shares (1,000,000,000,000
+// milli-share units). This is already an absurdly large single-order
+// share quantity for any real account, and it is chosen with an enormous
+// safety margin below math.MaxInt64 (~9.22e18) so that
+// priceInMinorUnits * int64(milliShareQuantity) in NotionalInMinorUnits
+// cannot overflow int64 for any price this system would plausibly carry
+// (a price would need to exceed ~9.22e6 minor units, i.e. ~₹92,200 per
+// share, multiplied against the ceiling, to even approach overflow --
+// and real per-share prices times this ceiling are already far beyond
+// any real notional this system processes). This bound MUST be enforced
+// here, before int64(milliShareQuantity) ever happens, since the uint64
+// -> int64 conversion silently wraps negative for values above
+// math.MaxInt64 with no panic.
+const MaxReasonableMilliShareQuantity = 1_000_000_000_000
+
 var (
 	// ErrMilliShareQuantityMustBePositive is returned when
 	// MilliShareQuantity is present but zero.
 	ErrMilliShareQuantityMustBePositive = errors.New("milliShareQuantity must be greater than zero")
+
+	// ErrMilliShareQuantityExceedsMaximum is returned when
+	// MilliShareQuantity exceeds MaxReasonableMilliShareQuantity -- this
+	// guards against the uint64->int64 conversion in
+	// NotionalInMinorUnits silently wrapping negative for values near
+	// uint64's max, which would flip the sign of the computed notional
+	// and let it sail through margin checks.
+	ErrMilliShareQuantityExceedsMaximum = errors.New("milliShareQuantity exceeds the maximum reasonable quantity")
 
 	// ErrFractionalSharesOnlySupportedForPaperTrading is returned when a
 	// non-paper (live) order sets MilliShareQuantity — see this
@@ -79,6 +103,9 @@ func ValidateMilliShareQuantity(milliShareQuantity *uint64, isPaperTradingOrder 
 	}
 	if *milliShareQuantity == 0 {
 		return ErrMilliShareQuantityMustBePositive
+	}
+	if *milliShareQuantity > MaxReasonableMilliShareQuantity {
+		return ErrMilliShareQuantityExceedsMaximum
 	}
 	if !isPaperTradingOrder {
 		return ErrFractionalSharesOnlySupportedForPaperTrading

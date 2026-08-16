@@ -257,3 +257,31 @@ class TestRunRegimeDetectionEndToEnd:
         result = runRegimeDetection(observations, numberOfStates=2, maximumIterationCount=20)
         assert len(result.regimeLabelSequence) == len(observations)
         assert MarketRegimeLabel.HIGH_VOLATILITY in result.regimeLabelByState.values()
+
+
+def test_runForwardAlgorithm_doesNotCrashWhenEveryStateEmissionDensityUnderflowsToZero():
+    # Both states have a very tight (near variance-floor) variance, and
+    # the observation is many, many standard deviations from either
+    # state's mean — a realistic post-Baum-Welch-convergence situation
+    # for a genuine outlier observation. Every state's raw Gaussian
+    # emission density underflows to an exact 0.0 in double precision,
+    # which previously made the forward algorithm's scaling factor 0.0
+    # and crashed with ZeroDivisionError (dividing by it) / a
+    # subsequent "math domain error" (math.log(0.0) for the
+    # log-likelihood).
+    hmm = GaussianHiddenMarkovModelParameters(
+        numberOfStates=2,
+        initialStateProbabilities=[0.5, 0.5],
+        transitionMatrix=[[0.9, 0.1], [0.1, 0.9]],
+        stateMeans=[0.0, 5.0],
+        stateVariances=[1e-8, 1e-8],
+    )
+    observations = [0.0, 5.0, 1000.0, 0.0, 5.0]
+
+    result = runForwardAlgorithm(observations, hmm)
+
+    assert isinstance(result, ForwardAlgorithmResult)
+    assert len(result.scaledAlpha) == len(observations)
+    assert math.isfinite(result.logLikelihood)
+    for row in result.scaledAlpha:
+        assert math.isclose(sum(row), 1.0, abs_tol=1e-6)

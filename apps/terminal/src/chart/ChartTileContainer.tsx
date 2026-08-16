@@ -5,7 +5,7 @@
 // Naming convention: long, descriptive camelCase identifiers throughout,
 // per project convention.
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { CandlestickChartCanvas, type CandleBar, type IndicatorOverlayToggles } from "./CandlestickChartCanvas";
 
 const CHART_POLL_INTERVAL_MILLISECONDS = 5_000;
@@ -22,21 +22,29 @@ export function ChartTileContainer(props: { marketDataBaseUrl: string; instrumen
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [overlays, setOverlays] = useState<IndicatorOverlayToggles>(DEFAULT_OVERLAYS);
 
+  // Per-request sequence number, same "ignore stale response" pattern as
+  // DomLadderWidget's refreshLadder: guards against an overlapping poll
+  // resolving out of order and overwriting fresher candle data with a
+  // stale response. Additive to, not a replacement for, the `cancelled`
+  // unmount guard below.
+  const latestRequestSequenceNumberRef = useRef(0);
+
   useEffect(() => {
     let cancelled = false;
 
     async function refreshChartData() {
+      const thisRequestSequenceNumber = ++latestRequestSequenceNumberRef.current;
       try {
         const httpResponse = await fetch(
           `${props.marketDataBaseUrl}/candles?instrumentSymbol=${encodeURIComponent(props.instrumentSymbol)}&limit=100`
         );
         if (!httpResponse.ok) throw new Error(`HTTP ${httpResponse.status}`);
         const parsedCandles: CandleBar[] = await httpResponse.json();
-        if (cancelled) return;
+        if (cancelled || thisRequestSequenceNumber !== latestRequestSequenceNumberRef.current) return;
         setCandles(parsedCandles);
         setErrorMessage(null);
       } catch (thrownError) {
-        if (cancelled) return;
+        if (cancelled || thisRequestSequenceNumber !== latestRequestSequenceNumberRef.current) return;
         setErrorMessage(
           thrownError instanceof Error
             ? `Couldn't reach market-data: ${thrownError.message}. Is it running on ${props.marketDataBaseUrl}?`

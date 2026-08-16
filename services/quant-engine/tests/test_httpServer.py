@@ -759,3 +759,117 @@ def testEarlyExerciseRiskEndpointRejectsMalformedBodyWith400(runningServerBaseUr
     statusCode, responseBody = postJson(runningServerBaseUrl, "/options/corporate-action/early-exercise-risk", {})
     assert statusCode == 400
     assert "errorMessage" in responseBody
+
+
+# --- Audit fix regression tests ------------------------------------------
+#
+# Finding 1: unguarded `.items()` on a request field that arrives as JSON
+# `null` (Python `None`) raises AttributeError, which is NOT one of the
+# (KeyError, TypeError, ValueError) types the handlers catch, so it would
+# otherwise surface as a raw 500 instead of a clean 400. Each of these
+# hits one of the four originally-flagged sites (plus the extra
+# `/alternative-data/filing-anomaly` site found by the same-pattern grep)
+# with the offending field set to JSON null and asserts a clean 400 is
+# returned, never a 500.
+
+
+def testCorrelationMatrixEndpointRejectsNullReturnSeriesWith400NotRaw500(runningServerBaseUrl):
+    statusCode, responseBody = postJson(
+        runningServerBaseUrl,
+        "/correlation/matrix",
+        {"returnSeriesBySymbol": None},
+    )
+    assert statusCode == 400
+    assert "errorMessage" in responseBody
+
+
+def testFactorRiskEndpointRejectsNullPerHoldingFactorExposuresWith400NotRaw500(runningServerBaseUrl):
+    statusCode, responseBody = postJson(
+        runningServerBaseUrl,
+        "/portfolio/factor-risk",
+        {
+            "holdings": [
+                {"symbol": "A", "portfolioWeight": 1.0, "factorExposuresByName": None},
+            ],
+            "factorReturnsByName": {"marketBeta": 0.02},
+            "actualOrExpectedPortfolioReturn": 0.02,
+        },
+    )
+    assert statusCode == 400
+    assert "errorMessage" in responseBody
+
+
+def testFactorRiskEndpointRejectsNullFactorReturnsByNameWith400NotRaw500(runningServerBaseUrl):
+    statusCode, responseBody = postJson(
+        runningServerBaseUrl,
+        "/portfolio/factor-risk",
+        {
+            "holdings": [
+                {"symbol": "A", "portfolioWeight": 1.0, "factorExposuresByName": {"marketBeta": 1.0}},
+            ],
+            "factorReturnsByName": None,
+            "actualOrExpectedPortfolioReturn": 0.02,
+        },
+    )
+    assert statusCode == 400
+    assert "errorMessage" in responseBody
+
+
+def testLatencyBenchmarkEndpointRejectsNullSamplesByVenueWith400NotRaw500(runningServerBaseUrl):
+    statusCode, responseBody = postJson(
+        runningServerBaseUrl,
+        "/latency/benchmark",
+        {"roundTripTimeSamplesInMillisecondsByVenue": None},
+    )
+    assert statusCode == 400
+    assert "errorMessage" in responseBody
+
+
+def testAlternativeDataFilingAnomalyEndpointRejectsNullMetricsWith400NotRaw500(runningServerBaseUrl):
+    statusCode, responseBody = postJson(
+        runningServerBaseUrl,
+        "/alternative-data/filing-anomaly",
+        {"metrics": None},
+    )
+    assert statusCode == 400
+    assert "errorMessage" in responseBody
+
+
+# Finding 2: bool("false") / bool("true") on a JSON string sent for
+# isCallOptionNotPut is truthy for ANY non-empty string, including the
+# literal string "false" — silently pricing/solving the wrong option
+# side instead of rejecting the malformed request.
+
+
+def testPriceEndpointRejectsStringFalseForIsCallOptionNotPutWith400(runningServerBaseUrl):
+    statusCode, responseBody = postJson(
+        runningServerBaseUrl,
+        "/options/price",
+        {
+            "underlyingSpotPrice": 100.0,
+            "optionStrikePrice": 100.0,
+            "annualizedRiskFreeInterestRate": 0.05,
+            "annualizedVolatility": 0.2,
+            "timeToExpiryInYears": 1.0,
+            "isCallOptionNotPut": "false",
+        },
+    )
+    assert statusCode == 400
+    assert "errorMessage" in responseBody
+
+
+def testImpliedVolatilityEndpointRejectsStringFalseForIsCallOptionNotPutWith400(runningServerBaseUrl):
+    statusCode, responseBody = postJson(
+        runningServerBaseUrl,
+        "/options/implied-volatility",
+        {
+            "observedMarketPrice": 10.0,
+            "underlyingSpotPrice": 100.0,
+            "optionStrikePrice": 100.0,
+            "annualizedRiskFreeInterestRate": 0.05,
+            "timeToExpiryInYears": 1.0,
+            "isCallOptionNotPut": "false",
+        },
+    )
+    assert statusCode == 400
+    assert "errorMessage" in responseBody

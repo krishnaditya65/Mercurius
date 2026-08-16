@@ -28,6 +28,7 @@ package fundsegregation
 import (
 	"errors"
 	"fmt"
+	"math"
 
 	"mercurius/ledger/internal/doubleentry"
 )
@@ -43,6 +44,14 @@ const (
 var ErrWouldBreakSegregation = errors.New("journal entry would break client fund segregation invariant")
 var ErrUnclassifiedAccount = errors.New("account is not classified as a CLIENT account")
 var ErrInvalidMovementAmount = errors.New("movement amount must be positive")
+var ErrMovementAmountTooLarge = errors.New("movement amount is too large to process safely")
+
+// maxMovementAmountInMinorUnits is the largest absolute amount
+// PostClientMoneyMovement will accept. The entry it builds doubles the
+// absolute amount (twiceTheAmount) for the external-cash-suspense leg, so
+// anything larger than math.MaxInt64/2 would silently overflow int64 on
+// that multiply — reject it outright instead.
+const maxMovementAmountInMinorUnits = math.MaxInt64 / 2
 
 // SegregationGuard classifies accounts and enforces the ring-fencing
 // invariant on top of a shared doubleentry.LedgerBook.
@@ -116,6 +125,9 @@ func (guard *SegregationGuard) PostClientMoneyMovement(
 	absoluteAmount := amountInMinorUnits
 	if amountInMinorUnits < 0 {
 		absoluteAmount = -amountInMinorUnits
+	}
+	if absoluteAmount > maxMovementAmountInMinorUnits {
+		return fmt.Errorf("%w: got %d, max is %d", ErrMovementAmountTooLarge, absoluteAmount, int64(maxMovementAmountInMinorUnits))
 	}
 
 	// Money arriving (positive amount): debit the client account and

@@ -22,6 +22,7 @@ import (
 	"mercurius/backoffice/internal/accountcontrol"
 	"mercurius/backoffice/internal/authmiddleware"
 	"mercurius/backoffice/internal/familyaccountaccess"
+	"mercurius/backoffice/internal/omsgatewayclient"
 )
 
 var testJwtSigningSecret = []byte("test-signing-secret-do-not-use-in-production")
@@ -136,6 +137,49 @@ func TestFamilyAccessLinkAllowsActingOnOwnAccount(t *testing.T) {
 
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("expected 200 when the caller is the owner account, got %d body=%s", recorder.Code, recorder.Body.String())
+	}
+}
+
+// TestFamilyAccessPositionsForwardsCallersBearerTokenToOmsGateway is a
+// REGRESSION test for the bug where omsGatewayClient never attached a
+// bearer token: it stands up a fake oms-gateway that requires the exact
+// Authorization header the incoming /family-access/positions request
+// carried (mirroring oms-gateway's real authmiddleware.RequireAuth on
+// its /positions route) and asserts the end-to-end handler call
+// succeeds -- before the fix this 401s every time regardless of the
+// caller's token.
+func TestFamilyAccessPositionsForwardsCallersBearerTokenToOmsGateway(t *testing.T) {
+	viewerToken := issueTestToken(t, "acct-viewer", authmiddleware.RoleRetail)
+	expectedAuthorizationHeader := "Bearer " + viewerToken
+
+	fakeOmsGateway := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != expectedAuthorizationHeader {
+			http.Error(w, `{"errorMessage":"missing or malformed Authorization header"}`, http.StatusUnauthorized)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(omsgatewayclient.PositionsWireResponse{
+			AccountIdentifier:             "acct-owner",
+			NetQuantityByInstrumentSymbol: map[string]int64{"AAPL": 10},
+		})
+	}))
+	defer fakeOmsGateway.Close()
+
+	registry := familyaccountaccess.NewRegistry()
+	if err := registry.RegisterFamilyLink("acct-owner", "acct-viewer", familyaccountaccess.PermissionViewOnly); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+	omsGatewayClient := omsgatewayclient.NewOmsGatewayClient(fakeOmsGateway.URL)
+
+	handler := authmiddleware.RequireAuth(testJwtSigningSecret, buildFamilyAccessPositionsHandler(registry, omsGatewayClient))
+
+	request := httptest.NewRequest(http.MethodGet, "/family-access/positions?ownerAccountId=acct-owner&viewerAccountId=acct-viewer", nil)
+	request.Header.Set("Authorization", expectedAuthorizationHeader)
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected 200 once the caller's bearer token is forwarded to oms-gateway, got %d body=%s", recorder.Code, recorder.Body.String())
 	}
 }
 

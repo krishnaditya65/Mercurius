@@ -119,7 +119,7 @@ func TestRequireOwnAccountFromJsonBodyRejectsAMissingTokenWith401(t *testing.T) 
 	}
 }
 
-func TestRequireOwnAccountFromJsonBodyPassesThroughMalformedBodyForTheHandlersOwnErrorMessage(t *testing.T) {
+func TestRequireOwnAccountFromJsonBodyRejectsMalformedBodyWithoutCallingNext(t *testing.T) {
 	stateMachine := kycstate.NewKycVerificationStateMachine()
 	handler := requireOwnAccountFromJsonBody(authmiddleware.SigningSecretFromEnv(), buildKycSubmitHandler(stateMachine))
 
@@ -129,7 +129,61 @@ func TestRequireOwnAccountFromJsonBodyPassesThroughMalformedBodyForTheHandlersOw
 	handler.ServeHTTP(recorder, request)
 
 	if recorder.Code != http.StatusBadRequest {
-		t.Fatalf("expected the wrapped handler's own 400 for malformed JSON, got %d body=%s", recorder.Code, recorder.Body.String())
+		t.Fatalf("expected this wrapper's own 400 for malformed JSON, got %d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if status := stateMachine.LookupKycStatus("acct-001"); status.VerificationStage != kycstate.StageNotSubmitted {
+		t.Fatalf("expected the malformed request to never reach the wrapped handler, but state was recorded for acct-001: %+v", status)
+	}
+}
+
+// TestRequireOwnAccountFromJsonBodyRejectsTrailingDataInsteadOfBypassingOwnershipCheck
+// reproduces the confirmed fail-open bug: this wrapper decodes with
+// json.Unmarshal (which errors on trailing garbage after the first JSON
+// value), while buildKycSubmitHandler decodes with
+// json.NewDecoder(...).Decode(...) (which reads only the first JSON value
+// and silently ignores anything after it). Before the fix, a body of
+// exactly this shape — a well-formed JSON object naming a DIFFERENT
+// account, followed by trailing garbage — failed this wrapper's decode,
+// which then called next(...) unchecked; the wrapped handler's own
+// decoder happily parsed just the leading object and processed the
+// request as acct-002 even though the caller authenticated as acct-001.
+// After the fix, the malformed body must be rejected with 400 before
+// next is ever called, and acct-002's state must never be touched.
+func TestRequireOwnAccountFromJsonBodyRejectsTrailingDataInsteadOfBypassingOwnershipCheck(t *testing.T) {
+	stateMachine := kycstate.NewKycVerificationStateMachine()
+	handler := requireOwnAccountFromJsonBody(authmiddleware.SigningSecretFromEnv(), buildKycSubmitHandler(stateMachine))
+
+	maliciousBody := []byte(`{"accountIdentifier":"acct-002","panNumber":"ABCDE1234F","fullName":"Not Acct 001"}{"trailing":"garbage"}`)
+	request := newAuthorizedRequest(t, http.MethodPost, "/kyc/submit", maliciousBody, "acct-001", authmiddleware.RoleRetail)
+	recorder := httptest.NewRecorder()
+
+	handler.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for a malformed (trailing-data) body instead of a silent ownership-check bypass, got %d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if status := stateMachine.LookupKycStatus("acct-002"); status.VerificationStage != kycstate.StageNotSubmitted {
+		t.Fatalf("expected acct-002 to never be touched by a request authenticated as acct-001, but state was recorded: %+v", status)
+	}
+}
+
+// TestRequireOwnAccountFromJsonBodyRejectsAccountIdentifierAsWrongJsonType
+// covers the other malformed-JSON shape called out by the audit finding:
+// accountIdentifier sent as a JSON number instead of a string fails this
+// wrapper's decode (a real type mismatch, not just trailing data) and
+// must also be rejected here rather than silently let through.
+func TestRequireOwnAccountFromJsonBodyRejectsAccountIdentifierAsWrongJsonType(t *testing.T) {
+	stateMachine := kycstate.NewKycVerificationStateMachine()
+	handler := requireOwnAccountFromJsonBody(authmiddleware.SigningSecretFromEnv(), buildKycSubmitHandler(stateMachine))
+
+	badTypeBody := []byte(`{"accountIdentifier":12345,"panNumber":"ABCDE1234F","fullName":"Numeric Id"}`)
+	request := newAuthorizedRequest(t, http.MethodPost, "/kyc/submit", badTypeBody, "acct-001", authmiddleware.RoleRetail)
+	recorder := httptest.NewRecorder()
+
+	handler.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for accountIdentifier sent as a JSON number, got %d body=%s", recorder.Code, recorder.Body.String())
 	}
 }
 

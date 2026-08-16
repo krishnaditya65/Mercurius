@@ -93,3 +93,23 @@ def test_batchScanOnlyScansSymbolsPresentInBothPriceMaps():
     assert set(alerts.keys()) == {"AAPL", "MSFT"}
     assert alerts["AAPL"].isAlertTriggered is True  # 3% > 1%
     assert alerts["MSFT"].isAlertTriggered is False  # 0.5% < 1%
+
+
+def test_scanManyLivePricesForDeviationAlerts_skipsSymbolWithNonPositiveTheoreticalPriceInsteadOfAbortingBatch():
+    # One symbol ("BAD") has a non-positive theoreticalFairPrice, which
+    # scanForTheoreticalVersusLivePriceDeviation raises ValueError for.
+    # Per the module's own documented intent ("a stale/missing live quote
+    # for one symbol shouldn't fail the whole scan"), a bad PRICE for one
+    # symbol should be skipped too, not lose every already-computed alert
+    # for the batch.
+    theoreticalFairPricesBySymbol = {"GOOD": 100.0, "BAD": 0.0, "ALSO_GOOD": 50.0}
+    liveMarketPricesBySymbol = {"GOOD": 102.0, "BAD": 5.0, "ALSO_GOOD": 51.0}
+
+    alertsBySymbol = scanManyLivePricesForDeviationAlerts(
+        theoreticalFairPricesBySymbol, liveMarketPricesBySymbol, deviationThresholdPercentage=1.0
+    )
+
+    assert "BAD" not in alertsBySymbol
+    assert "GOOD" in alertsBySymbol
+    assert "ALSO_GOOD" in alertsBySymbol
+    assert alertsBySymbol["GOOD"].isAlertTriggered is True

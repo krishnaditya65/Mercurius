@@ -30,6 +30,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"math/big"
 	"sort"
 	"sync"
 	"time"
@@ -252,7 +253,7 @@ func (engine *Engine) CloseAuction(auctionId string, now time.Time) ([]*Bid, err
 			if i == len(group)-1 {
 				allotted = remainingCapacity - allottedSoFar
 			} else {
-				allotted = int64(float64(bid.QuantityInMinorUnits) / float64(groupTotalRequested) * float64(remainingCapacity))
+				allotted = proRataAllotmentInMinorUnits(bid.QuantityInMinorUnits, remainingCapacity, groupTotalRequested)
 			}
 			bid.AllottedQuantityInMinorUnits = allotted
 			allottedSoFar += allotted
@@ -312,6 +313,32 @@ func (engine *Engine) BidsForAuction(auctionId string) []*Bid {
 	copy(result, bids)
 	sort.Slice(result, func(i, j int) bool { return result[i].BidId < result[j].BidId })
 	return result
+}
+
+// proRataAllotmentInMinorUnits computes
+// bidQuantity * remainingCapacity / groupTotalRequested exactly, for a
+// non-last tied bid in CloseAuction's oversubscribed-group pro-rata split
+// (the group's last bid, by BidId, instead absorbs the rounding remainder
+// directly in CloseAuction so the group sums exactly to remainingCapacity —
+// see that function).
+//
+// This uses math/big rather than float64 deliberately: float64 has only a
+// 52-bit mantissa, so float64(bidQuantity)/float64(groupTotalRequested)*
+// float64(remainingCapacity) loses exact-integer precision once these
+// values run into the trillions of paise a large G-Sec auction can
+// realistically reach (values above ~2^53 ≈ 9.007e15 are no longer
+// exactly representable), causing allotments to not sum exactly to
+// remainingCapacity. Multiplying first with big.Int (instead of
+// bidQuantity*remainingCapacity as plain int64, which can itself overflow
+// int64 before the divide) keeps the intermediate product exact
+// regardless of magnitude, and integer division (Quo, i.e. truncation
+// toward zero) matches this function's original float64-then-int64-cast
+// truncating behavior for every non-last bid in the group.
+func proRataAllotmentInMinorUnits(bidQuantity, remainingCapacity, groupTotalRequested int64) int64 {
+	numerator := new(big.Int).Mul(big.NewInt(bidQuantity), big.NewInt(remainingCapacity))
+	denominator := big.NewInt(groupTotalRequested)
+	quotient := new(big.Int).Quo(numerator, denominator)
+	return quotient.Int64()
 }
 
 func generateBidId() (string, error) {

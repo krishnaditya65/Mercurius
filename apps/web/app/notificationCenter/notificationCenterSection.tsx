@@ -66,6 +66,23 @@ const marketDataBaseUrl = process.env.NEXT_PUBLIC_MARKET_DATA_BASE_URL ?? "http:
 
 const NOTIFICATION_POLL_INTERVAL_MILLISECONDS = 4_000;
 
+// A stable, unique id per rendered log entry — the log is prepended to
+// (newest first) and truncated to 20 entries on every new arrival, so
+// every entry's array INDEX shifts on the next append. Keying <li> by
+// index would violate React's key-stability contract; this monotonic
+// counter (unique regardless of how fast entries arrive, unlike a bare
+// timestamp) gives each entry a real identity instead.
+let notificationLogEntryIdCounter = 0;
+function nextNotificationLogEntryId(): number {
+  notificationLogEntryIdCounter += 1;
+  return notificationLogEntryIdCounter;
+}
+
+type NotificationLogEntry = {
+  logEntryId: number;
+  message: string;
+};
+
 type AuditTrailEntry = {
   recordedAtTime: string;
   eventType: string;
@@ -105,7 +122,7 @@ export default function NotificationCenterSection() {
   const [accountIdentifier, setAccountIdentifier] = useState("acct-001");
   const [isOrderFillWatchEnabled, setIsOrderFillWatchEnabled] = useState(false);
   const [isMarginCallWatchEnabled, setIsMarginCallWatchEnabled] = useState(false);
-  const [recentNotificationLog, setRecentNotificationLog] = useState<string[]>([]);
+  const [recentNotificationLog, setRecentNotificationLog] = useState<NotificationLogEntry[]>([]);
 
   const [priceAlertSymbol, setPriceAlertSymbol] = useState("DEMO-EQ");
   const [priceAlertIsAbove, setPriceAlertIsAbove] = useState(true);
@@ -129,7 +146,9 @@ export default function NotificationCenterSection() {
   }, []);
 
   function appendToNotificationLog(message: string) {
-    setRecentNotificationLog((previousLog) => [message, ...previousLog].slice(0, 20));
+    setRecentNotificationLog((previousLog) =>
+      [{ logEntryId: nextNotificationLogEntryId(), message }, ...previousLog].slice(0, 20)
+    );
   }
 
   async function requestBrowserNotificationPermission() {
@@ -362,8 +381,8 @@ export default function NotificationCenterSection() {
         <div className="flex flex-col gap-1">
           <p className="text-sm font-medium">Recent notifications fired</p>
           <ul className="max-h-40 overflow-y-auto rounded bg-neutral-50 p-2 text-xs">
-            {recentNotificationLog.map((logLine, logIndex) => (
-              <li key={logIndex}>{logLine}</li>
+            {recentNotificationLog.map((logEntry) => (
+              <li key={logEntry.logEntryId}>{logEntry.message}</li>
             ))}
           </ul>
         </div>

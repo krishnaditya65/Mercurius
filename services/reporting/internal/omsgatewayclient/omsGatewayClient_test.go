@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 )
 
@@ -139,4 +140,43 @@ func TestEstimateChargesFallsBackWhenUnreachable(t *testing.T) {
 	if isLive {
 		t.Fatal("expected isChargesCalculatorLive to be false when oms-gateway is unreachable")
 	}
+}
+
+// TestEstimateChargesConcurrentCallsDoNotRaceOnSharedProbeState reproduces
+// the confirmed data race: a single OmsGatewayClient is a shared instance
+// used across concurrent requests (e.g. concurrent /contract-notes/generate
+// calls, each looping over many fills), and EstimateCharges writes
+// chargesCalculatorReachable/chargesCalculatorProbed on every call. Before
+// the fix, running many goroutines through EstimateCharges concurrently
+// under `go test -race` reliably flags a DATA RACE on those two fields.
+// After the fix (mutexGuardingChargesCalculatorState), this must be race
+// clean. This test also exercises ChargesCalculatorProbeState concurrently
+// with the writers, so both the writer/writer and writer/reader races are
+// covered.
+func TestEstimateChargesConcurrentCallsDoNotRaceOnSharedProbeState(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(ChargesBreakdownWireFormat{
+			TurnoverInMinorUnits:     100000,
+			TotalChargesInMinorUnits: 100,
+			NetAmountInMinorUnits:    100100,
+		})
+	}))
+	defer server.Close()
+
+	client := NewOmsGatewayClient(server.URL)
+
+	const goroutineCount = 50
+	var waitGroup sync.WaitGroup
+	waitGroup.Add(goroutineCount * 2)
+	for i := 0; i < goroutineCount; i++ {
+		go func() {
+			defer waitGroup.Done()
+			client.EstimateCharges(true, 10000, 10, false)
+		}()
+		go func() {
+			defer waitGroup.Done()
+			client.ChargesCalculatorProbeState()
+		}()
+	}
+	waitGroup.Wait()
 }

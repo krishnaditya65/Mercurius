@@ -114,12 +114,22 @@ type PledgeBook struct {
 
 	pledgesByAccountAndSymbol map[string]map[string]*PledgeRecord
 	utilizedMarginByAccount   map[string]int64
+
+	// reservedForPendingSellByAccountAndSymbol: quantity currently
+	// reserved by an in-flight SELL order's pledged-holding check (see
+	// ReserveUnpledgedQuantityForSell) that hasn't yet been released
+	// (order terminally rejected) or consumed (order filled, position
+	// book already decremented for real). Closes the TOCTOU race a bare
+	// PledgedQuantity()+net-holding read pair would otherwise have
+	// between two concurrent sell checks.
+	reservedForPendingSellByAccountAndSymbol map[string]map[string]uint64
 }
 
 func NewPledgeBook() *PledgeBook {
 	return &PledgeBook{
-		pledgesByAccountAndSymbol: make(map[string]map[string]*PledgeRecord),
-		utilizedMarginByAccount:   make(map[string]int64),
+		pledgesByAccountAndSymbol:                make(map[string]map[string]*PledgeRecord),
+		utilizedMarginByAccount:                  make(map[string]int64),
+		reservedForPendingSellByAccountAndSymbol: make(map[string]map[string]uint64),
 	}
 }
 
@@ -265,6 +275,96 @@ func (pledgeBook *PledgeBook) PledgedQuantity(accountIdentifier string, instrume
 		return 0
 	}
 	return record.PledgedQuantity
+}
+
+// ReserveUnpledgedQuantityForSell is the atomic check-and-reserve that
+// closes a TOCTOU race a separate PledgedQuantity()+net-holding-quantity
+// read pair would otherwise have: two concurrent SELL orders could each
+// individually pass a "is this quantity unpledged?" check against the
+// same stale net-holding figure, together selling more than the account
+// actually has free.
+//
+// currentNetHoldingQuantity is caller-supplied (from
+// positions.PositionBook), the same decoupled-package pattern
+// PledgeHolding already uses — this package still never imports
+// internal/positions.
+//
+// On success, sellQuantity is added to the running reservation for this
+// account+symbol in the SAME locked operation as the check, so a second
+// concurrent call sees the updated total immediately. The caller MUST
+// pair every successful reservation with exactly one of:
+//   - ReleaseSellReservation, if the order is ultimately rejected
+//     downstream or never fills; or
+//   - nothing further, once the matching order's real fill has already
+//     decremented positions.PositionBook — but should still eventually
+//     call ReleaseSellReservation for the filled portion so the
+//     reservation total doesn't double-count against the (now lower)
+//     real net holding forever; see cmd/server/main.go's
+//     processOrderSubmission for the exact wiring.
+//
+// Returns ErrInsufficientUnpledgedHoldingQuantity if
+// currentNetHoldingQuantity minus (already-pledged + already-reserved)
+// is less than sellQuantity.
+func (pledgeBook *PledgeBook) ReserveUnpledgedQuantityForSell(
+	accountIdentifier string,
+	instrumentSymbol string,
+	sellQuantity uint64,
+	currentNetHoldingQuantity int64,
+) error {
+	if sellQuantity == 0 {
+		return nil
+	}
+
+	pledgeBook.mutexGuardingPledges.Lock()
+	defer pledgeBook.mutexGuardingPledges.Unlock()
+
+	var pledgedQuantity uint64
+	if record := pledgeBook.pledgesByAccountAndSymbol[accountIdentifier][instrumentSymbol]; record != nil {
+		pledgedQuantity = record.PledgedQuantity
+	}
+	alreadyReserved := pledgeBook.reservedForPendingSellByAccountAndSymbol[accountIdentifier][instrumentSymbol]
+
+	availableToSell := currentNetHoldingQuantity - int64(pledgedQuantity) - int64(alreadyReserved)
+	if availableToSell < 0 || sellQuantity > uint64(availableToSell) {
+		return ErrInsufficientUnpledgedHoldingQuantity
+	}
+
+	if pledgeBook.reservedForPendingSellByAccountAndSymbol[accountIdentifier] == nil {
+		pledgeBook.reservedForPendingSellByAccountAndSymbol[accountIdentifier] = make(map[string]uint64)
+	}
+	pledgeBook.reservedForPendingSellByAccountAndSymbol[accountIdentifier][instrumentSymbol] += sellQuantity
+	return nil
+}
+
+// ReleaseSellReservation reverses a prior
+// ReserveUnpledgedQuantityForSell reservation — for an order terminally
+// rejected downstream, never filled, or (partially) filled for real
+// (see that method's doc comment) — mirroring
+// internal/marginfunding.FundingBook.RollbackReservation's pattern.
+// Floors the running reservation at zero; safe to call for an
+// account/symbol with no active reservation (a no-op).
+func (pledgeBook *PledgeBook) ReleaseSellReservation(accountIdentifier string, instrumentSymbol string, quantity uint64) {
+	pledgeBook.mutexGuardingPledges.Lock()
+	defer pledgeBook.mutexGuardingPledges.Unlock()
+
+	if pledgeBook.reservedForPendingSellByAccountAndSymbol[accountIdentifier] == nil {
+		return
+	}
+	current := pledgeBook.reservedForPendingSellByAccountAndSymbol[accountIdentifier][instrumentSymbol]
+	if quantity > current {
+		quantity = current
+	}
+	pledgeBook.reservedForPendingSellByAccountAndSymbol[accountIdentifier][instrumentSymbol] = current - quantity
+}
+
+// ReservedForPendingSellQuantity returns how much of instrumentSymbol
+// accountIdentifier currently has reserved by an in-flight sell check —
+// exposed for tests/observability, mirroring PledgedQuantity.
+func (pledgeBook *PledgeBook) ReservedForPendingSellQuantity(accountIdentifier string, instrumentSymbol string) uint64 {
+	pledgeBook.mutexGuardingPledges.Lock()
+	defer pledgeBook.mutexGuardingPledges.Unlock()
+
+	return pledgeBook.reservedForPendingSellByAccountAndSymbol[accountIdentifier][instrumentSymbol]
 }
 
 // PledgesForAccount returns a copy of every active pledge record for one

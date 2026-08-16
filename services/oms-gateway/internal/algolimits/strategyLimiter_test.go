@@ -249,6 +249,76 @@ func TestCheckAndReserveRateLimitCheckedBeforeNotionalLimit(t *testing.T) {
 	}
 }
 
+func TestCheckAndReserveSubOneRateAllowsPeriodicSingleOrderBurst(t *testing.T) {
+	// A strategy configured with MaxOrdersPerSecond: 0.5 ("1 order per 2
+	// seconds") must genuinely be able to place an order every 2 seconds
+	// -- not be permanently blocked because the token bucket's capacity
+	// was capped at 0.5, meaning tokensAvailable could never reach 1.0.
+	registry := NewRegistry(StrategyLimitConfig{MaxOrdersPerSecond: 0.5, MaxNotionalPerDayInMinorUnits: 0})
+
+	if err := registry.CheckAndReserve("algo-1", 10, baseTime); err != nil {
+		t.Fatalf("expected the very first order to be allowed (bucket starts at capacity), got: %v", err)
+	}
+	// Immediately after, no tokens left -- correctly rejected.
+	if err := registry.CheckAndReserve("algo-1", 10, baseTime); !errors.Is(err, ErrOrderRateLimitExceeded) {
+		t.Fatalf("expected immediate second order to be rejected, got: %v", err)
+	}
+	// After 2 full seconds (1 token's worth at 0.5/sec), a single order
+	// must be allowed again -- this is the exact bug: with capacity
+	// wrongly capped at 0.5, tokensAvailable would plateau at 0.5 and
+	// this would ALWAYS reject.
+	twoSecondsLater := baseTime.Add(2 * time.Second)
+	if err := registry.CheckAndReserve("algo-1", 10, twoSecondsLater); err != nil {
+		t.Fatalf("expected an order 2 seconds later to be allowed for a 0.5/sec strategy, got: %v", err)
+	}
+}
+
+func TestCheckAndReserveSubOneRateNeverAccumulatesMoreThanOneTokenCapacity(t *testing.T) {
+	// The capacity floor must not let a sub-1 rate strategy burst beyond
+	// 1 order even after a very long idle period.
+	registry := NewRegistry(StrategyLimitConfig{MaxOrdersPerSecond: 0.1, MaxNotionalPerDayInMinorUnits: 0})
+
+	muchLater := baseTime.Add(1 * time.Hour)
+	if err := registry.CheckAndReserve("algo-1", 10, muchLater); err != nil {
+		t.Fatalf("expected first order after long idle to be allowed, got: %v", err)
+	}
+	if err := registry.CheckAndReserve("algo-1", 10, muchLater); !errors.Is(err, ErrOrderRateLimitExceeded) {
+		t.Fatalf("expected the immediate second order to still be rejected (capacity floor is 1, not unbounded), got: %v", err)
+	}
+}
+
+func TestReleaseReturnsRateTokenAndNotionalCapacity(t *testing.T) {
+	registry := NewRegistry(StrategyLimitConfig{MaxOrdersPerSecond: 1, MaxNotionalPerDayInMinorUnits: 1000})
+
+	if err := registry.CheckAndReserve("algo-1", 900, baseTime); err != nil {
+		t.Fatalf("unexpected rejection: %v", err)
+	}
+	// Bucket and notional cap are both now exhausted.
+	if err := registry.CheckAndReserve("algo-1", 900, baseTime); err == nil {
+		t.Fatalf("expected rejection before Release")
+	}
+
+	registry.Release("algo-1", 900, baseTime)
+
+	if used := registry.NotionalUsedTodayInMinorUnits("algo-1", baseTime); used != 0 {
+		t.Errorf("expected notional usage to be floored back to 0 after Release, got %d", used)
+	}
+	if err := registry.CheckAndReserve("algo-1", 900, baseTime); err != nil {
+		t.Fatalf("expected order to succeed after Release gave back both rate token and notional capacity, got: %v", err)
+	}
+}
+
+func TestReleaseFlooredAtZeroNeverGoesNegative(t *testing.T) {
+	registry := NewRegistry(StrategyLimitConfig{MaxOrdersPerSecond: 1, MaxNotionalPerDayInMinorUnits: 1000})
+
+	// Release without any prior reservation must not panic or underflow.
+	registry.Release("never-reserved", 500, baseTime)
+
+	if used := registry.NotionalUsedTodayInMinorUnits("never-reserved", baseTime); used != 0 {
+		t.Errorf("expected 0, got %d", used)
+	}
+}
+
 func TestConcurrentCheckAndReserveNeverExceedsRateLimitCapacity(t *testing.T) {
 	registry := NewRegistry(StrategyLimitConfig{MaxOrdersPerSecond: 10, MaxNotionalPerDayInMinorUnits: 0})
 

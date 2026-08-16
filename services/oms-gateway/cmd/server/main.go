@@ -360,7 +360,7 @@ func main() {
 	// always a real MARKET SELL, so it fills immediately against
 	// whatever's resting on the other side rather than risking never
 	// triggering a limit-price liquidation at all.
-	submitReducingOrderFunc := func(clientAccountIdentifier string, instrumentSymbol string, quantityToSell int64) (bool, error) {
+	submitReducingOrderFunc := func(clientAccountIdentifier string, instrumentSymbol string, quantityToSell int64, assumedNotionalInMinorUnits int64) (bool, int64, error) {
 		acknowledgement := processOrderSubmission(orderSubmissionDeps, orders.OrderSubmissionRequest{
 			ClientAccountIdentifier:    clientAccountIdentifier,
 			InstrumentSymbol:           instrumentSymbol,
@@ -369,9 +369,19 @@ func main() {
 			OrderQuantity:              uint64(quantityToSell),
 		}, "" /* no authenticated human actor — auto-liquidation-engine-triggered */)
 		if !acknowledgement.WasOrderAccepted {
-			return false, errors.New(acknowledgement.HumanReadableRejectionReason)
+			return false, 0, errors.New(acknowledgement.HumanReadableRejectionReason)
 		}
-		return true, nil
+		// Report the REAL executed notional (finding 8's fix), not the
+		// assumed one — an accepted order can still rest, partially
+		// fill, or fill nothing at all (e.g. matching-engine
+		// unreachable/rejected: MatchingEngineHandoffError is set but
+		// WasOrderAccepted stays true — see processOrderSubmission's own
+		// doc comment on that distinction).
+		var actualExecutedNotionalInMinorUnits int64
+		for _, tradeExecutionEvent := range acknowledgement.TradeExecutionEvents {
+			actualExecutedNotionalInMinorUnits += tradeExecutionEvent.ExecutedPriceInMinorUnits * int64(tradeExecutionEvent.ExecutedQuantity)
+		}
+		return true, actualExecutedNotionalInMinorUnits, nil
 	}
 	liquidationEngine, liquidationEngineError := autoliquidation.NewLiquidationEngine(autoliquidation.DefaultThresholds(), submitReducingOrderFunc)
 	if liquidationEngineError != nil {
@@ -1047,11 +1057,51 @@ func processOrderSubmission(
 	// place in this codebase that's appropriate — internal/algolimits
 	// itself takes `now` as an explicit parameter everywhere so its OWN
 	// tests never depend on the wall clock).
+	// RESERVATION-RELEASE BOOKKEEPING (fixes a confirmed audit finding):
+	// internal/algolimits, internal/exposurelimits, and
+	// internal/marginpledge's sell-quantity check all now RESERVE
+	// capacity atomically at check time (see each package's own doc
+	// comment) — but a reservation made here can still be rejected by a
+	// LATER gate (KYC/freeze/pledge/disclosure/risk) or by the
+	// matching-engine hand-off itself. Without releasing those
+	// reservations on every such downstream rejection, they'd leak
+	// permanently, incorrectly consuming real capacity for an order that
+	// never actually reached the market — exactly the bug
+	// internal/marginfunding.FundingBook.RollbackReservation /
+	// internal/loanagainstsecurities.LoanBook.RollbackReservation already
+	// guard against for their own reservations. orderReachedAcceptance
+	// flips to true only once every gate has genuinely passed (right
+	// before this order is sequenced) — every return before that point
+	// triggers this deferred release.
+	algoLimitsReservationActive := false
+	var algoLimitsReservedNotional int64
+	exposureReservationActive := false
+	pledgeSellReservationActive := false
+	orderReachedAcceptance := false
+
+	exposureSegment := exposurelimits.ClassifySegment(incomingOrderSubmissionRequest.InstrumentSymbol)
+	exposureNotionalForLimitCheck := incomingOrderSubmissionRequest.LimitPriceInMinorUnits * int64(incomingOrderSubmissionRequest.OrderQuantity)
+
+	defer func() {
+		if orderReachedAcceptance {
+			return
+		}
+		if algoLimitsReservationActive {
+			dependencies.algoLimitsRegistry.Release(incomingOrderSubmissionRequest.StrategyIdentifier, algoLimitsReservedNotional, time.Now())
+		}
+		if exposureReservationActive {
+			dependencies.exposureLimitsRegistry.ReleaseExposure(incomingOrderSubmissionRequest.ClientAccountIdentifier, exposureSegment, exposureNotionalForLimitCheck)
+		}
+		if pledgeSellReservationActive {
+			dependencies.pledgeBook.ReleaseSellReservation(incomingOrderSubmissionRequest.ClientAccountIdentifier, incomingOrderSubmissionRequest.InstrumentSymbol, incomingOrderSubmissionRequest.OrderQuantity)
+		}
+	}()
+
 	if incomingOrderSubmissionRequest.StrategyIdentifier != "" {
-		orderNotionalForLimitCheck := incomingOrderSubmissionRequest.LimitPriceInMinorUnits * int64(incomingOrderSubmissionRequest.OrderQuantity)
+		algoLimitsReservedNotional = incomingOrderSubmissionRequest.LimitPriceInMinorUnits * int64(incomingOrderSubmissionRequest.OrderQuantity)
 		if limitError := dependencies.algoLimitsRegistry.CheckAndReserve(
 			incomingOrderSubmissionRequest.StrategyIdentifier,
-			orderNotionalForLimitCheck,
+			algoLimitsReservedNotional,
 			time.Now(),
 		); limitError != nil {
 			machineReadableReason := "STRATEGY_RATE_LIMIT_EXCEEDED"
@@ -1071,6 +1121,7 @@ func processOrderSubmission(
 				MachineReadableRejectionReason: machineReadableReason,
 			}
 		}
+		algoLimitsReservationActive = true
 	}
 
 	// FEATURES.md §12 per-user, per-segment exposure limits — a real
@@ -1083,8 +1134,6 @@ func processOrderSubmission(
 	// design choices. An account/segment with no configured limit is
 	// completely unaffected — fully backward compatible with every
 	// pre-existing client and test.
-	exposureSegment := exposurelimits.ClassifySegment(incomingOrderSubmissionRequest.InstrumentSymbol)
-	exposureNotionalForLimitCheck := incomingOrderSubmissionRequest.LimitPriceInMinorUnits * int64(incomingOrderSubmissionRequest.OrderQuantity)
 	if exposureError := dependencies.exposureLimitsRegistry.CheckAndReserveExposure(
 		incomingOrderSubmissionRequest.ClientAccountIdentifier,
 		exposureSegment,
@@ -1107,6 +1156,7 @@ func processOrderSubmission(
 			MachineReadableRejectionReason: machineReadableReason,
 		}
 	}
+	exposureReservationActive = true
 
 	// FEATURES.md §21 large-order friction — checked right after
 	// exposure limits, before KYC: a brief confirm-with-context step for
@@ -1198,35 +1248,51 @@ func processOrderSubmission(
 	// Pledged-holding gate — FEATURES.md §3 margin pledge system: a
 	// SELL order can never draw down more of an instrument than the
 	// account's UNPLEDGED holding covers. Only checked on the sell
-	// side (buying never touches pledged collateral) and only for
-	// instruments with a non-zero pledged quantity, so this is a no-op
-	// for every order that isn't selling something currently pledged.
-	if !incomingOrderSubmissionRequest.OrderSideIsBuyNotSell {
-		pledgedQuantity := dependencies.pledgeBook.PledgedQuantity(
+	// side (buying never touches pledged collateral).
+	//
+	// ATOMIC CHECK-AND-RESERVE (fixes a confirmed TOCTOU race): the old
+	// version read PledgedQuantity() and PositionsForAccount()
+	// independently, with no lock/reservation spanning the two reads —
+	// two concurrent sell orders could each individually pass this check
+	// against the same stale net-holding figure, together selling more
+	// than the account actually has free. pledgeBook.
+	// ReserveUnpledgedQuantityForSell closes that race: the check AND
+	// the reservation happen atomically under the pledge book's own
+	// lock. pledgeSellReservationActive/Quantity feed the deferred
+	// release above for a downstream rejection; the reservation is
+	// released for real once the resulting fill (or lack thereof) is
+	// known (paper-trading branch, matching-engine-handoff failure, or
+	// proportionally as real fills land — see below).
+	if !incomingOrderSubmissionRequest.OrderSideIsBuyNotSell && incomingOrderSubmissionRequest.OrderQuantity > 0 {
+		netHoldingQuantity := dependencies.positionBook.PositionsForAccount(incomingOrderSubmissionRequest.ClientAccountIdentifier)[incomingOrderSubmissionRequest.InstrumentSymbol]
+		reserveError := dependencies.pledgeBook.ReserveUnpledgedQuantityForSell(
 			incomingOrderSubmissionRequest.ClientAccountIdentifier,
 			incomingOrderSubmissionRequest.InstrumentSymbol,
+			incomingOrderSubmissionRequest.OrderQuantity,
+			netHoldingQuantity,
 		)
-		if pledgedQuantity > 0 {
-			netHoldingQuantity := dependencies.positionBook.PositionsForAccount(incomingOrderSubmissionRequest.ClientAccountIdentifier)[incomingOrderSubmissionRequest.InstrumentSymbol]
-			unpledgedQuantity := netHoldingQuantity - int64(pledgedQuantity)
-			if unpledgedQuantity < 0 || incomingOrderSubmissionRequest.OrderQuantity > uint64(unpledgedQuantity) {
-				dependencies.auditTrail.Append(audittrail.Entry{
-					EventType:                           audittrail.EventOrderRejected,
-					ClientAccountIdentifier:             incomingOrderSubmissionRequest.ClientAccountIdentifier,
-					AuthenticatedActorAccountIdentifier: authenticatedActorAccountIdentifier,
-					InstrumentSymbol:                    incomingOrderSubmissionRequest.InstrumentSymbol,
-					DetailMessage:                       "PLEDGED_QUANTITY_UNAVAILABLE",
-				})
-				return orders.OrderAcknowledgementResponse{
-					WasOrderAccepted: false,
-					HumanReadableRejectionReason: fmt.Sprintf(
-						"This sell order needs %d shares, but %d of your %d %s shares are currently pledged as collateral and unavailable to sell. Unpledge them first via POST /margin-pledge/unpledge.",
-						incomingOrderSubmissionRequest.OrderQuantity, pledgedQuantity, netHoldingQuantity, incomingOrderSubmissionRequest.InstrumentSymbol,
-					),
-					MachineReadableRejectionReason: "PLEDGED_QUANTITY_UNAVAILABLE",
-				}
+		if reserveError != nil {
+			pledgedQuantity := dependencies.pledgeBook.PledgedQuantity(
+				incomingOrderSubmissionRequest.ClientAccountIdentifier,
+				incomingOrderSubmissionRequest.InstrumentSymbol,
+			)
+			dependencies.auditTrail.Append(audittrail.Entry{
+				EventType:                           audittrail.EventOrderRejected,
+				ClientAccountIdentifier:             incomingOrderSubmissionRequest.ClientAccountIdentifier,
+				AuthenticatedActorAccountIdentifier: authenticatedActorAccountIdentifier,
+				InstrumentSymbol:                    incomingOrderSubmissionRequest.InstrumentSymbol,
+				DetailMessage:                       "PLEDGED_QUANTITY_UNAVAILABLE",
+			})
+			return orders.OrderAcknowledgementResponse{
+				WasOrderAccepted: false,
+				HumanReadableRejectionReason: fmt.Sprintf(
+					"This sell order needs %d shares, but %d of your %d %s shares are currently pledged as collateral (or already reserved by another pending order) and unavailable to sell. Unpledge them first via POST /margin-pledge/unpledge.",
+					incomingOrderSubmissionRequest.OrderQuantity, pledgedQuantity, netHoldingQuantity, incomingOrderSubmissionRequest.InstrumentSymbol,
+				),
+				MachineReadableRejectionReason: "PLEDGED_QUANTITY_UNAVAILABLE",
 			}
 		}
+		pledgeSellReservationActive = true
 	}
 
 	// FEATURES.md §19 mandatory F&O risk disclosure + cooling-off gate —
@@ -1322,6 +1388,14 @@ func processOrderSubmission(
 		AssignedGlobalSequenceNumber: assignedGlobalSequenceNumber,
 		IsPaperTradingOrder:          incomingOrderSubmissionRequest.IsPaperTradingOrder,
 	}
+	// The order has genuinely passed every gate — the algoLimits/
+	// exposureLimits/pledge-sell reservations made above are no longer
+	// released by the deferred "downstream rejection" cleanup; from here
+	// on, releasing (or converting to a real settlement) is handled
+	// explicitly at each specific outcome below (paper-trading branch,
+	// matching-engine-handoff failure, or proportionally as real fills
+	// land).
+	orderReachedAcceptance = true
 
 	// The order has now genuinely passed every gate (including the F&O
 	// risk-disclosure gate above) and been sequenced — record this as
@@ -1346,6 +1420,18 @@ func processOrderSubmission(
 	// — a completely separate positions.PositionBook instance — instead
 	// of the real one, so paper P&L can never contaminate real holdings.
 	if incomingOrderSubmissionRequest.IsPaperTradingOrder {
+		// Paper trading never draws down real available margin or real
+		// pledged-holding capacity — the risk/pledge checks above still
+		// run for real (see this function's doc comment: "IDENTICAL...
+		// only the final hand-off differs"), but since a paper order
+		// never reaches real settlement or the real position book, the
+		// reservations those checks made must be released right away so
+		// a paper order's checks don't permanently and incorrectly lock
+		// real capacity that a paper "fill" never actually uses.
+		dependencies.preTradeRiskEngine.ReleaseReservedMargin(incomingOrderSubmissionRequest.ClientAccountIdentifier, orderNotionalValueInMinorUnits)
+		if pledgeSellReservationActive {
+			dependencies.pledgeBook.ReleaseSellReservation(incomingOrderSubmissionRequest.ClientAccountIdentifier, incomingOrderSubmissionRequest.InstrumentSymbol, incomingOrderSubmissionRequest.OrderQuantity)
+		}
 		// FEATURES.md §17 fractional share investing: a fractional paper
 		// order (MilliShareQuantity set — already validated as
 		// paper-only by fractionalshares.ValidateMilliShareQuantity in
@@ -1479,6 +1565,14 @@ func processOrderSubmission(
 			InstrumentSymbol:                    incomingOrderSubmissionRequest.InstrumentSymbol,
 			DetailMessage:                       handoffError.Error(),
 		})
+		// This order will NEVER settle now — release the margin
+		// reservation and pledge-sell reservation made when it was
+		// approved, mirroring fundingBook/loanBook's own
+		// approved-then-downstream-failure rollback pattern.
+		dependencies.preTradeRiskEngine.ReleaseReservedMargin(incomingOrderSubmissionRequest.ClientAccountIdentifier, orderNotionalValueInMinorUnits)
+		if pledgeSellReservationActive {
+			dependencies.pledgeBook.ReleaseSellReservation(incomingOrderSubmissionRequest.ClientAccountIdentifier, incomingOrderSubmissionRequest.InstrumentSymbol, incomingOrderSubmissionRequest.OrderQuantity)
+		}
 
 	case matchingEngineResponse.ErrorMessage != nil:
 		log.Printf(
@@ -1494,6 +1588,13 @@ func processOrderSubmission(
 			InstrumentSymbol:                    incomingOrderSubmissionRequest.InstrumentSymbol,
 			DetailMessage:                       *matchingEngineResponse.ErrorMessage,
 		})
+		// Explicitly rejected by matching-engine — same rationale as the
+		// handoffError case above: it will never settle, release both
+		// reservations.
+		dependencies.preTradeRiskEngine.ReleaseReservedMargin(incomingOrderSubmissionRequest.ClientAccountIdentifier, orderNotionalValueInMinorUnits)
+		if pledgeSellReservationActive {
+			dependencies.pledgeBook.ReleaseSellReservation(incomingOrderSubmissionRequest.ClientAccountIdentifier, incomingOrderSubmissionRequest.InstrumentSymbol, incomingOrderSubmissionRequest.OrderQuantity)
+		}
 
 	default:
 		if matchingEngineResponse.AssignedOrderSequenceNumber != nil {
@@ -1515,14 +1616,64 @@ func processOrderSubmission(
 				AuthenticatedActorAccountIdentifier: authenticatedActorAccountIdentifier,
 			})
 		}
+		// totalExecutedQuantityForThisOrder/totalExecutedNotionalForThisOrdersOwnSide
+		// accumulate only over SUCCESSFULLY-settled fills (see the
+		// settlementError branch below, finding 4's fix) — used after the
+		// loop to reconcile this order's OWN margin/pledge-sell
+		// reservations against what genuinely, successfully settled. Any
+		// unfilled remainder (still resting) or failed-settlement portion
+		// stays conservatively reserved.
+		var totalExecutedQuantityForThisOrder uint64
+		var totalExecutedNotionalForThisOrdersOwnSide int64
 		for _, tradeExecutionWireEvent := range matchingEngineResponse.TradeExecutionEvents {
+			// A real trade genuinely happened at matching-engine — record
+			// it in the response regardless of what happens next; hiding
+			// a real trade because its settlement posting later failed
+			// would be worse than surfacing the discrepancy.
 			acknowledgement.TradeExecutionEvents = append(acknowledgement.TradeExecutionEvents, orders.TradeExecutionSummary{
 				BuyingClientAccountId:     tradeExecutionWireEvent.BuyingClientAccountId,
 				SellingClientAccountId:    tradeExecutionWireEvent.SellingClientAccountId,
 				ExecutedPriceInMinorUnits: tradeExecutionWireEvent.ExecutedPriceInMinorUnits,
 				ExecutedQuantity:          tradeExecutionWireEvent.ExecutedQuantity,
 			})
-			settleTradeAgainstLedgerAndLocalCache(dependencies.preTradeRiskEngine, dependencies.ledgerClient, tradeExecutionWireEvent, assignedGlobalSequenceNumber)
+
+			settlementError := settleTradeAgainstLedgerAndLocalCache(
+				dependencies.preTradeRiskEngine, dependencies.ledgerClient, tradeExecutionWireEvent,
+				assignedGlobalSequenceNumber, incomingOrderSubmissionRequest.ClientAccountIdentifier,
+			)
+			if settlementError != nil {
+				// Ledger settlement failed for a trade that genuinely
+				// happened — do NOT apply it to positionBook/
+				// markToMarketEngine (that would silently drift the
+				// position book out of sync with an unsettled ledger).
+				// Record it loudly and surface it in the response instead
+				// (finding 4's fix) — see
+				// audittrail.EventSettlementFailedPositionNotApplied's own
+				// doc comment.
+				acknowledgement.SettlementFailures = append(
+					acknowledgement.SettlementFailures,
+					fmt.Sprintf("seq=%d buyer=%s seller=%s qty=%d price=%d: %v",
+						assignedGlobalSequenceNumber, tradeExecutionWireEvent.BuyingClientAccountId, tradeExecutionWireEvent.SellingClientAccountId,
+						tradeExecutionWireEvent.ExecutedQuantity, tradeExecutionWireEvent.ExecutedPriceInMinorUnits, settlementError),
+				)
+				dependencies.auditTrail.Append(audittrail.Entry{
+					EventType:                           audittrail.EventSettlementFailedPositionNotApplied,
+					ClientAccountIdentifier:             incomingOrderSubmissionRequest.ClientAccountIdentifier,
+					InstrumentSymbol:                    incomingOrderSubmissionRequest.InstrumentSymbol,
+					MatchingEngineOrderSequenceNumber:   acknowledgement.MatchingEngineOrderSequenceNumber,
+					DetailMessage:                       fmt.Sprintf("SETTLEMENT_FAILED_POSITION_NOT_APPLIED: %v", settlementError),
+					BuyingClientAccountIdentifier:       tradeExecutionWireEvent.BuyingClientAccountId,
+					SellingClientAccountIdentifier:      tradeExecutionWireEvent.SellingClientAccountId,
+					ExecutedPriceInMinorUnits:           tradeExecutionWireEvent.ExecutedPriceInMinorUnits,
+					ExecutedQuantity:                    tradeExecutionWireEvent.ExecutedQuantity,
+					AuthenticatedActorAccountIdentifier: authenticatedActorAccountIdentifier,
+				})
+				continue
+			}
+
+			totalExecutedQuantityForThisOrder += tradeExecutionWireEvent.ExecutedQuantity
+			totalExecutedNotionalForThisOrdersOwnSide += tradeExecutionWireEvent.ExecutedPriceInMinorUnits * int64(tradeExecutionWireEvent.ExecutedQuantity)
+
 			dependencies.positionBook.ApplyFill(
 				tradeExecutionWireEvent.BuyingClientAccountId,
 				tradeExecutionWireEvent.SellingClientAccountId,
@@ -1561,6 +1712,33 @@ func processOrderSubmission(
 				AuthenticatedActorAccountIdentifier: authenticatedActorAccountIdentifier,
 			})
 		}
+
+		// Reconcile this order's OWN margin reservation and pledge-sell
+		// reservation against what actually, successfully settled — see
+		// EvaluateOrderAgainstAvailableMargin's and
+		// ReserveUnpledgedQuantityForSell's own doc comments. Only the
+		// SETTLED portion (by quantity, proportional to the order's
+		// total reserved notional) is released/converted; any unfilled
+		// remainder (still resting) or failed-settlement portion stays
+		// conservatively reserved.
+		if totalExecutedQuantityForThisOrder > 0 && incomingOrderSubmissionRequest.OrderQuantity > 0 {
+			reservedPortionForFilledQuantity := orderNotionalValueInMinorUnits * int64(totalExecutedQuantityForThisOrder) / int64(incomingOrderSubmissionRequest.OrderQuantity)
+			dependencies.preTradeRiskEngine.ReleaseReservedMargin(incomingOrderSubmissionRequest.ClientAccountIdentifier, reservedPortionForFilledQuantity)
+			signedExecutedNotional := totalExecutedNotionalForThisOrdersOwnSide
+			if incomingOrderSubmissionRequest.OrderSideIsBuyNotSell {
+				signedExecutedNotional = -signedExecutedNotional
+			}
+			dependencies.preTradeRiskEngine.AdjustAvailableMarginInMinorUnits(incomingOrderSubmissionRequest.ClientAccountIdentifier, signedExecutedNotional)
+
+			if pledgeSellReservationActive {
+				// The filled quantity's pledge-sell reservation is now
+				// real: positionBook.ApplyFill already decremented the
+				// real net holding for it, so release that portion so it
+				// stops double-counting against the (now lower) real net
+				// holding.
+				dependencies.pledgeBook.ReleaseSellReservation(incomingOrderSubmissionRequest.ClientAccountIdentifier, incomingOrderSubmissionRequest.InstrumentSymbol, totalExecutedQuantityForThisOrder)
+			}
+		}
 	}
 
 	return acknowledgement
@@ -1574,12 +1752,33 @@ func processOrderSubmission(
 // risk-checked and routed the order. Kept synchronous and inline here
 // only because it's the simplest way to prove the three-service loop
 // (risk check -> match -> settle) actually closes.
+// settleTradeAgainstLedgerAndLocalCache posts the trade's settlement
+// journal entry to the ledger and, ONLY if that succeeds, reflects it in
+// the local risk cache — returning a non-nil error on a failed ledger
+// post so the caller (processOrderSubmission) can correctly NOT apply
+// this fill to positionBook/markToMarketEngine (see
+// audittrail.EventSettlementFailedPositionNotApplied's doc comment: a
+// failed settlement posting must never be silently treated as if the
+// position book is still in sync).
+//
+// accountAlreadyReservedByThisCall is incomingOrderSubmissionRequest.
+// ClientAccountIdentifier — the account whose order processOrderSubmission
+// is currently processing, and therefore whose margin was ALREADY
+// reserved at EvaluateOrderAgainstAvailableMargin approval time (see that
+// method's doc comment). This function applies the naive debit/credit
+// ONLY to whichever side of the trade is the COUNTERPARTY (a distinct,
+// separately-reserved order from a different processOrderSubmission call
+// this function has no visibility into) — the reserved side's margin is
+// reconciled ONCE, after every fill event this order got, by the caller
+// (see processOrderSubmission's post-trade-loop reconciliation), not
+// per-event here.
 func settleTradeAgainstLedgerAndLocalCache(
 	preTradeRiskEngine *riskengine.PreTradeRiskEngine,
 	ledgerClient *ledgerclient.LedgerClient,
 	tradeExecutionWireEvent matchingengineclient.TradeExecutionWireEvent,
 	assignedGlobalSequenceNumber uint64,
-) {
+	accountAlreadyReservedByThisCall string,
+) error {
 	executedNotionalValueInMinorUnits := tradeExecutionWireEvent.ExecutedPriceInMinorUnits * int64(tradeExecutionWireEvent.ExecutedQuantity)
 
 	settlementError := ledgerClient.PostTradeSettlementJournalEntry(
@@ -1592,16 +1791,19 @@ func settleTradeAgainstLedgerAndLocalCache(
 		// A failed settlement posting is a serious, non-silent problem in
 		// any real build (the ledger is now out of sync with a trade that
 		// genuinely happened) — logged loudly here since there's no
-		// reconciliation/retry job yet to catch it.
+		// reconciliation/retry job yet to catch it, AND returned so the
+		// caller doesn't silently apply this fill to the position book.
 		log.Printf("SETTLEMENT FAILED for seq=%d: %v — ledger is now out of sync with this trade", assignedGlobalSequenceNumber, settlementError)
-		return
+		return settlementError
 	}
 
-	preTradeRiskEngine.ApplyTradeSettlementToLocalCache(
-		tradeExecutionWireEvent.BuyingClientAccountId,
-		tradeExecutionWireEvent.SellingClientAccountId,
-		executedNotionalValueInMinorUnits,
-	)
+	if tradeExecutionWireEvent.BuyingClientAccountId != accountAlreadyReservedByThisCall {
+		preTradeRiskEngine.AdjustAvailableMarginInMinorUnits(tradeExecutionWireEvent.BuyingClientAccountId, -executedNotionalValueInMinorUnits)
+	}
+	if tradeExecutionWireEvent.SellingClientAccountId != accountAlreadyReservedByThisCall {
+		preTradeRiskEngine.AdjustAvailableMarginInMinorUnits(tradeExecutionWireEvent.SellingClientAccountId, executedNotionalValueInMinorUnits)
+	}
+	return nil
 }
 
 func buildPositionsHandler(positionBook *positions.PositionBook) http.HandlerFunc {
@@ -2187,6 +2389,10 @@ func buildSetSessionPhaseHandler(marketSession *marketsession.MarketSessionState
 
 func buildMarketSessionCloseHandler(marketSession *marketsession.MarketSessionState, auditTrail *audittrail.AuditTrail) http.HandlerFunc {
 	return func(responseWriter http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodPost {
+			http.Error(responseWriter, "only POST is supported", http.StatusMethodNotAllowed)
+			return
+		}
 		marketSession.SetMarketOpen(false)
 		log.Printf("market session CLOSED")
 		auditTrail.Append(audittrail.Entry{EventType: audittrail.EventMarketSessionClosed, AuthenticatedActorAccountIdentifier: authenticatedActorAccountIdentifierOrEmpty(request)})
@@ -2214,6 +2420,10 @@ func buildMarketSessionOpenHandler(
 	dependencies orderSubmissionDependencies,
 ) http.HandlerFunc {
 	return func(responseWriter http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodPost {
+			http.Error(responseWriter, "only POST is supported", http.StatusMethodNotAllowed)
+			return
+		}
 		marketSession.SetMarketOpen(true)
 		dependencies.auditTrail.Append(audittrail.Entry{EventType: audittrail.EventMarketSessionOpened, AuthenticatedActorAccountIdentifier: authenticatedActorAccountIdentifierOrEmpty(request)})
 
@@ -2228,14 +2438,36 @@ func buildMarketSessionOpenHandler(
 		// authenticated admin action replaying N previously-queued orders.
 		drainTriggeringActor := authenticatedActorAccountIdentifierOrEmpty(request)
 		processedAcknowledgements := make([]orders.OrderAcknowledgementResponse, 0, len(drainedRequests))
+		acceptedCount, rejectedCount := 0, 0
 		for _, queuedRequest := range drainedRequests {
 			acknowledgement := processOrderSubmission(dependencies, queuedRequest, drainTriggeringActor)
 			processedAcknowledgements = append(processedAcknowledgements, acknowledgement)
+			// Minimum-viable visibility fix (a confirmed audit finding): a
+			// drained AMO that gets rejected downstream (KYC/freeze/risk/
+			// matching-engine/etc) was previously just silently gone —
+			// no re-queue, no persisted link back to its submitter. A
+			// full re-queue/retry system is out of scope; the fix here is
+			// to make sure an operator can SEE it happened, the same
+			// "loudly logged" pattern this codebase already uses for
+			// settlement failures (see settleTradeAgainstLedgerAndLocalCache).
+			if acknowledgement.WasOrderAccepted {
+				acceptedCount++
+			} else {
+				rejectedCount++
+				log.Printf(
+					"AMO REJECTED on market-open drain: account=%s instrument=%s reason=%s (%s)",
+					queuedRequest.ClientAccountIdentifier, queuedRequest.InstrumentSymbol,
+					acknowledgement.MachineReadableRejectionReason, acknowledgement.HumanReadableRejectionReason,
+				)
+			}
 		}
 
 		respondWithJson(responseWriter, http.StatusOK, map[string]any{
 			"isMarketOpen":                     true,
 			"processedAfterMarketOrderResults": processedAcknowledgements,
+			"totalDrainedAfterMarketOrders":    len(drainedRequests),
+			"acceptedAfterMarketOrders":        acceptedCount,
+			"rejectedAfterMarketOrders":        rejectedCount,
 		})
 	}
 }

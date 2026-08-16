@@ -152,3 +152,22 @@ def testMismatchedLegTypeSetIsRejected():
     result = validateProposedCombinationAgainstSyntheticStructure(legs, SyntheticStructureName.SYNTHETIC_LONG_STOCK)
     assert result.isValidMatch is False
     assert "leg types" in result.explanation
+
+
+def testDuplicateCallLegsAreNotMisidentifiedAsSyntheticLongStock():
+    # Two CALL legs (aggregate quantity 2.0) + one PUT leg (quantity
+    # -1.0), all at the same strike. Validating leg TYPES as a set alone
+    # would see {CALL, PUT} and consider it a type-match against
+    # SYNTHETIC_LONG_STOCK's {CALL: 1.0, PUT: -1.0} definition, and
+    # checking quantities per-leg independently (rather than aggregated
+    # by type) would let EACH CALL leg individually satisfy the 1:1
+    # ratio — this must be correctly rejected, since the aggregated CALL
+    # exposure (2.0) does not correspond to the same "unit multiplier" as
+    # the aggregated PUT exposure (-1.0) implies.
+    legs = [
+        SyntheticPositionLeg(OptionLegType.CALL, 1.0, strikePrice=100.0),
+        SyntheticPositionLeg(OptionLegType.CALL, 1.0, strikePrice=100.0),
+        SyntheticPositionLeg(OptionLegType.PUT, -1.0, strikePrice=100.0),
+    ]
+    result = validateProposedCombinationAgainstSyntheticStructure(legs, SyntheticStructureName.SYNTHETIC_LONG_STOCK)
+    assert result.isValidMatch is False

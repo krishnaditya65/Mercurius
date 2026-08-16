@@ -66,6 +66,21 @@ const (
 	// gets one of these — surveillance is scoped to real, matching-
 	// engine-routed orders only.
 	EventOrderRoutedToMatchingEngine EventType = "ORDER_ROUTED_TO_MATCHING_ENGINE"
+
+	// EventSettlementFailedPositionNotApplied is appended when a REAL
+	// trade genuinely happened at matching-engine (a fill event came
+	// back) but posting its settlement journal entry to the ledger
+	// failed — see cmd/server/main.go's settleTradeAgainstLedgerAndLocalCache.
+	// Distinct from EventOrderMatchingEngineFailure (which means the
+	// order never reached/matched at matching-engine at all): this means
+	// it DID match, but the OMS deliberately did NOT apply the fill to
+	// positionBook/markToMarketEngine, to avoid the position book
+	// silently drifting out of sync with an unsettled ledger. This is
+	// the loud, non-silent record of that discrepancy — a real build
+	// would also drive a reconciliation/retry job off entries like this
+	// one, which this build does not implement (see that function's own
+	// doc comment).
+	EventSettlementFailedPositionNotApplied EventType = "SETTLEMENT_FAILED_POSITION_NOT_APPLIED"
 )
 
 // Entry is one immutable audit record. Every field is set at append time

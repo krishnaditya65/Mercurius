@@ -30,8 +30,22 @@ const quantEngineBaseUrl = process.env.NEXT_PUBLIC_QUANT_ENGINE_BASE_URL ?? "htt
 type FilterCondition = {
   field: string;
   operator: string;
-  value: number | string;
+  value: number | string | string[];
 };
+
+// Operators that mean list-membership — these need an ARRAY of values
+// (`{field, operator: "in", value: ["TECH", "ENERGY"]}`), not the bare
+// scalar every other operator sends.
+const LIST_MEMBERSHIP_OPERATORS = new Set(["in", "not_in"]);
+
+// Same comma/newline-parsed textarea convention as ivRank/page.tsx's
+// historical-series input, reused here for consistency.
+function parseListMembershipValues(rawText: string): string[] {
+  return rawText
+    .split(/[\n,]+/)
+    .map((token) => token.trim())
+    .filter((token) => token.length > 0);
+}
 
 type MatchingInstrument = {
   symbol: string;
@@ -230,7 +244,20 @@ export default function ScreenerPage() {
                 <select
                   className="rounded border px-2 py-1.5"
                   value={condition.operator}
-                  onChange={(e) => updateCondition(index, { operator: e.target.value })}
+                  onChange={(e) => {
+                    const nextOperator = e.target.value;
+                    const operatorIsListMembership = LIST_MEMBERSHIP_OPERATORS.has(nextOperator);
+                    const currentOperatorIsListMembership = LIST_MEMBERSHIP_OPERATORS.has(condition.operator);
+                    // Switching to/from "in"/"not_in" needs the value's
+                    // shape to switch between an array and a scalar too.
+                    if (operatorIsListMembership && !currentOperatorIsListMembership) {
+                      updateCondition(index, { operator: nextOperator, value: [] });
+                    } else if (!operatorIsListMembership && currentOperatorIsListMembership) {
+                      updateCondition(index, { operator: nextOperator, value: "" });
+                    } else {
+                      updateCondition(index, { operator: nextOperator });
+                    }
+                  }}
                 >
                   {AVAILABLE_OPERATORS.map((operator) => (
                     <option key={operator} value={operator}>
@@ -239,18 +266,30 @@ export default function ScreenerPage() {
                   ))}
                 </select>
               </label>
-              <label className="flex flex-col gap-1 text-sm">
-                Value
-                <input
-                  className="w-32 rounded border px-2 py-1.5"
-                  value={String(condition.value)}
-                  onChange={(e) => {
-                    const raw = e.target.value;
-                    const numeric = Number(raw);
-                    updateCondition(index, { value: raw !== "" && !Number.isNaN(numeric) ? numeric : raw });
-                  }}
-                />
-              </label>
+              {LIST_MEMBERSHIP_OPERATORS.has(condition.operator) ? (
+                <label className="flex flex-col gap-1 text-sm">
+                  Values (comma-separated)
+                  <input
+                    className="w-48 rounded border px-2 py-1.5"
+                    placeholder="TECH, ENERGY"
+                    value={Array.isArray(condition.value) ? condition.value.join(", ") : ""}
+                    onChange={(e) => updateCondition(index, { value: parseListMembershipValues(e.target.value) })}
+                  />
+                </label>
+              ) : (
+                <label className="flex flex-col gap-1 text-sm">
+                  Value
+                  <input
+                    className="w-32 rounded border px-2 py-1.5"
+                    value={String(condition.value)}
+                    onChange={(e) => {
+                      const raw = e.target.value;
+                      const numeric = Number(raw);
+                      updateCondition(index, { value: raw !== "" && !Number.isNaN(numeric) ? numeric : raw });
+                    }}
+                  />
+                </label>
+              )}
               <button
                 type="button"
                 className="rounded border px-2 py-1.5 text-xs text-red-600"

@@ -57,6 +57,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"sync"
 	"time"
 )
 
@@ -137,8 +138,16 @@ type OmsGatewayClient struct {
 	// calculator is unreachable, EstimateCharges short-circuits to the
 	// documented illustrative fallback for every subsequent call rather
 	// than retrying and failing on every single fill of a report.
-	chargesCalculatorReachable bool
-	chargesCalculatorProbed    bool
+	//
+	// mutexGuardingChargesCalculatorState guards both fields below —
+	// OmsGatewayClient is a single shared instance used concurrently
+	// across requests (e.g. concurrent /contract-notes/generate calls
+	// each looping over many fills), so unsynchronized writes here are a
+	// data race. Same "mutexGuarding<state>" naming convention as e.g.
+	// primarymarketbidding.Engine.mutexGuardingState.
+	mutexGuardingChargesCalculatorState sync.Mutex
+	chargesCalculatorReachable          bool
+	chargesCalculatorProbed             bool
 }
 
 func NewOmsGatewayClient(omsGatewayBaseUrl string) *OmsGatewayClient {
@@ -264,26 +273,44 @@ func (client *OmsGatewayClient) EstimateCharges(
 	requestUrl := fmt.Sprintf("%s/orders/estimate-charges", client.omsGatewayBaseUrl)
 	httpResponse, requestError := client.httpClient.Post(requestUrl, "application/json", bytes.NewReader(requestBody))
 	if requestError != nil {
-		client.chargesCalculatorProbed = true
-		client.chargesCalculatorReachable = false
+		client.recordChargesCalculatorProbeResult(false)
 		return ChargesBreakdownWireFormat{}, false
 	}
 	defer httpResponse.Body.Close()
 
 	if httpResponse.StatusCode != http.StatusOK {
-		client.chargesCalculatorProbed = true
-		client.chargesCalculatorReachable = false
+		client.recordChargesCalculatorProbeResult(false)
 		return ChargesBreakdownWireFormat{}, false
 	}
 
 	var wireResponse ChargesBreakdownWireFormat
 	if decodeError := json.NewDecoder(httpResponse.Body).Decode(&wireResponse); decodeError != nil {
-		client.chargesCalculatorProbed = true
-		client.chargesCalculatorReachable = false
+		client.recordChargesCalculatorProbeResult(false)
 		return ChargesBreakdownWireFormat{}, false
 	}
 
-	client.chargesCalculatorProbed = true
-	client.chargesCalculatorReachable = true
+	client.recordChargesCalculatorProbeResult(true)
 	return wireResponse, true
+}
+
+// recordChargesCalculatorProbeResult sets chargesCalculatorProbed and
+// chargesCalculatorReachable under mutexGuardingChargesCalculatorState.
+// OmsGatewayClient is a single shared instance called concurrently across
+// requests, so these two fields must never be written without holding
+// the mutex.
+func (client *OmsGatewayClient) recordChargesCalculatorProbeResult(isReachable bool) {
+	client.mutexGuardingChargesCalculatorState.Lock()
+	defer client.mutexGuardingChargesCalculatorState.Unlock()
+	client.chargesCalculatorProbed = true
+	client.chargesCalculatorReachable = isReachable
+}
+
+// ChargesCalculatorProbeState returns whether the live oms-gateway
+// charges calculator has been probed yet, and if so, whether it was
+// reachable — read under the same mutex EstimateCharges writes under, so
+// this is safe to call concurrently with in-flight EstimateCharges calls.
+func (client *OmsGatewayClient) ChargesCalculatorProbeState() (probed bool, reachable bool) {
+	client.mutexGuardingChargesCalculatorState.Lock()
+	defer client.mutexGuardingChargesCalculatorState.Unlock()
+	return client.chargesCalculatorProbed, client.chargesCalculatorReachable
 }

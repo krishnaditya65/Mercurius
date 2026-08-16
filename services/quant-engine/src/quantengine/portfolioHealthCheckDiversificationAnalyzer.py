@@ -275,6 +275,19 @@ def performPortfolioHealthCheck(holdings: list[PortfolioHoldingForHealthCheck]) 
 
     positionWeights = [holding.portfolioWeight for holding in holdings]
     positionHhi = calculateHerfindahlHirschmanIndex(positionWeights)
+    if positionHhi == 0:
+        # All holdings have exactly 0 portfolioWeight — individually valid
+        # per __post_init__ (only negative weights are rejected there),
+        # but there is no meaningful weight distribution to compute an
+        # "effective number of holdings" over here. Raise a clear,
+        # purpose-specific message instead of letting
+        # calculateEffectiveNumberOfHoldings's generic internal
+        # precondition message ("hhi must be strictly positive...") leak
+        # out of context.
+        raise ValueError(
+            "portfolio weights must sum to a positive total to compute a health check "
+            "(all supplied holdings have zero portfolioWeight)"
+        )
 
     weightsBySector = aggregatePortfolioWeightsBySector(holdings)
     sectorHhi = calculateHerfindahlHirschmanIndex(list(weightsBySector.values()))

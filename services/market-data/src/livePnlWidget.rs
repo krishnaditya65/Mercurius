@@ -99,15 +99,43 @@ pub struct LivePnlSnapshot {
     pub positions: Vec<LivePnlPositionSnapshot>,
 }
 
+/// Returned by `computeLivePnlSnapshot` when the P&L arithmetic for some
+/// position would overflow `i64`. Surfaced as a clean, reportable error
+/// rather than panicking (`*`/`-` in debug builds) or silently wrapping
+/// around to a nonsense P&L figure (release builds) — a live P&L widget
+/// must never show a fabricated number.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LivePnlOverflowError {
+    pub instrumentSymbol: String,
+}
+
+impl std::fmt::Display for LivePnlOverflowError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "unrealized P&L computation overflowed i64 for instrument {}",
+            self.instrumentSymbol
+        )
+    }
+}
+
 /// The real computation — deliberately pure (no I/O), taking oms-gateway's
 /// already-fetched cost-basis data and market-data's own candle aggregator
 /// as plain arguments, so it's trivially unit- and integration-testable
 /// with constructed data rather than a live oms-gateway process.
+///
+/// Uses checked arithmetic (`checked_sub`/`checked_mul`) for the
+/// per-position P&L and the running total: `netQuantity * (currentPrice -
+/// averageEntryPrice)` is a plain `i64` multiply of two values a caller
+/// (oms-gateway's response, or a market price) ultimately controls, and an
+/// extreme-but-constructible combination of the two can overflow `i64` —
+/// this must surface as `Err(LivePnlOverflowError)`, not a panic or a
+/// silently wrapped-around P&L figure.
 pub fn computeLivePnlSnapshot(
     accountIdentifier: &str,
     omsPositions: &[OmsPositionCostBasis],
     candleAggregator: &CandleAggregator,
-) -> LivePnlSnapshot {
+) -> Result<LivePnlSnapshot, LivePnlOverflowError> {
     let mut positions = Vec::with_capacity(omsPositions.len());
     let mut totalUnrealizedPnLInMinorUnits: i64 = 0;
 
@@ -126,9 +154,20 @@ pub fn computeLivePnlSnapshot(
             None => (omsPosition.averageEntryPriceInMinorUnits, false),
         };
 
-        let unrealizedPnLInMinorUnits =
-            omsPosition.netQuantity * (currentMarketPriceInMinorUnits - omsPosition.averageEntryPriceInMinorUnits);
-        totalUnrealizedPnLInMinorUnits += unrealizedPnLInMinorUnits;
+        let overflowError = || LivePnlOverflowError {
+            instrumentSymbol: omsPosition.instrumentSymbol.clone(),
+        };
+
+        let priceDeltaInMinorUnits = currentMarketPriceInMinorUnits
+            .checked_sub(omsPosition.averageEntryPriceInMinorUnits)
+            .ok_or_else(overflowError)?;
+        let unrealizedPnLInMinorUnits = omsPosition
+            .netQuantity
+            .checked_mul(priceDeltaInMinorUnits)
+            .ok_or_else(overflowError)?;
+        totalUnrealizedPnLInMinorUnits = totalUnrealizedPnLInMinorUnits
+            .checked_add(unrealizedPnLInMinorUnits)
+            .ok_or_else(overflowError)?;
 
         positions.push(LivePnlPositionSnapshot {
             instrumentSymbol: omsPosition.instrumentSymbol.clone(),
@@ -140,11 +179,11 @@ pub fn computeLivePnlSnapshot(
         });
     }
 
-    LivePnlSnapshot {
+    Ok(LivePnlSnapshot {
         accountIdentifier: accountIdentifier.to_string(),
         totalUnrealizedPnLInMinorUnits,
         positions,
-    }
+    })
 }
 
 /// Fetches oms-gateway's real `GET /mark-to-market?accountId=...` over a
@@ -203,7 +242,7 @@ mod tests {
             averageEntryPriceInMinorUnits: 10_000,
         }];
 
-        let snapshot = computeLivePnlSnapshot("acct-001", &omsPositions, &candleAggregator);
+        let snapshot = computeLivePnlSnapshot("acct-001", &omsPositions, &candleAggregator).expect("no overflow expected in this fixture");
 
         // 10 * (12_000 - 10_000) = 20_000, computed, not hardcoded.
         assert_eq!(snapshot.totalUnrealizedPnLInMinorUnits, 20_000);
@@ -221,7 +260,7 @@ mod tests {
             averageEntryPriceInMinorUnits: 10_000,
         }];
 
-        let snapshot = computeLivePnlSnapshot("acct-001", &omsPositions, &candleAggregator);
+        let snapshot = computeLivePnlSnapshot("acct-001", &omsPositions, &candleAggregator).expect("no overflow expected in this fixture");
 
         // -5 * (12_000 - 10_000) = -10_000: a short that's underwater as
         // price rises above entry.
@@ -247,7 +286,7 @@ mod tests {
             },
         ];
 
-        let snapshot = computeLivePnlSnapshot("acct-001", &omsPositions, &candleAggregator);
+        let snapshot = computeLivePnlSnapshot("acct-001", &omsPositions, &candleAggregator).expect("no overflow expected in this fixture");
 
         // DEMO-EQ: 10 * (11_000-10_000) = 10_000
         // SIM-AAPL: 2 * (19_500-19_000) = 1_000
@@ -266,7 +305,7 @@ mod tests {
             averageEntryPriceInMinorUnits: 10_000,
         }];
 
-        let snapshot = computeLivePnlSnapshot("acct-001", &omsPositions, &candleAggregator);
+        let snapshot = computeLivePnlSnapshot("acct-001", &omsPositions, &candleAggregator).expect("no overflow expected in this fixture");
         assert!(snapshot.positions.is_empty());
         assert_eq!(snapshot.totalUnrealizedPnLInMinorUnits, 0);
     }
@@ -280,7 +319,7 @@ mod tests {
             averageEntryPriceInMinorUnits: 5_000,
         }];
 
-        let snapshot = computeLivePnlSnapshot("acct-001", &omsPositions, &candleAggregator);
+        let snapshot = computeLivePnlSnapshot("acct-001", &omsPositions, &candleAggregator).expect("no overflow expected in this fixture");
 
         assert_eq!(snapshot.positions.len(), 1);
         assert!(!snapshot.positions[0].currentMarketPriceIsLive);
@@ -291,7 +330,7 @@ mod tests {
     #[test]
     fn emptyPositionListProducesAnEmptyZeroSnapshot() {
         let candleAggregator = CandleAggregator::newEmptyAggregator();
-        let snapshot = computeLivePnlSnapshot("acct-001", &[], &candleAggregator);
+        let snapshot = computeLivePnlSnapshot("acct-001", &[], &candleAggregator).expect("no overflow expected in this fixture");
         assert!(snapshot.positions.is_empty());
         assert_eq!(snapshot.totalUnrealizedPnLInMinorUnits, 0);
     }
@@ -309,9 +348,32 @@ mod tests {
             averageEntryPriceInMinorUnits: 10_000,
         }];
 
-        let snapshot = computeLivePnlSnapshot("acct-001", &omsPositions, &candleAggregator);
+        let snapshot = computeLivePnlSnapshot("acct-001", &omsPositions, &candleAggregator).expect("no overflow expected in this fixture");
         assert_eq!(snapshot.positions[0].currentMarketPriceInMinorUnits, 11_000);
         assert_eq!(snapshot.totalUnrealizedPnLInMinorUnits, 1_000);
+    }
+
+    #[test]
+    fn extremeButConstructibleInputsReturnACleanOverflowErrorInsteadOfPanickingOrWrapping() {
+        // netQuantity near i64::MAX and a huge positive price delta: the
+        // plain `netQuantity * (currentPrice - averageEntryPrice)` multiply
+        // this guards overflows i64 for this combination. Both `netQuantity`
+        // (oms-gateway-reported) and the prices (oms-gateway cost basis /
+        // market-data's own live tape) are attacker/upstream-influenced
+        // enough that this is a constructible real input, not a purely
+        // theoretical one.
+        let candleAggregator = buildCandleAggregatorWithLastTrade("DEMO-EQ", i64::MAX);
+        let omsPositions = vec![OmsPositionCostBasis {
+            instrumentSymbol: "DEMO-EQ".to_string(),
+            netQuantity: i64::MAX / 2,
+            averageEntryPriceInMinorUnits: -1,
+        }];
+
+        let result = computeLivePnlSnapshot("acct-001", &omsPositions, &candleAggregator);
+
+        let overflowError = result.expect_err("this combination is constructed to overflow i64");
+        assert_eq!(overflowError.instrumentSymbol, "DEMO-EQ");
+        assert!(overflowError.to_string().contains("overflowed"));
     }
 
     #[test]

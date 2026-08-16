@@ -140,3 +140,19 @@ def testSimulateRealisticMarketOrderFillComposesAllThreePieces():
     assert result.slippageAdjustedReferencePrice == pytest.approx(100.0 * (1.0 + expectedImpact))
     assert result.partialFillResult.filledQuantity == pytest.approx(90.0)
     assert result.partialFillResult.isFullyFilled is True
+
+
+def testFullyFilledOrderIsNotMisflaggedAsPartialDueToFloatAccumulationError():
+    # totalFilledQuantity is accumulated via repeated float `+=` across
+    # ten price levels of 0.1 each; summing ten 0.1s in double precision
+    # lands at 0.9999999999999999, not exactly 1.0 — an order that is
+    # genuinely, economically fully filled must still be reported as
+    # isFullyFilled=True despite that ~1e-16 float dust.
+    orderQuantity = 1.0
+    priceLevels = [(100.0, 0.1)] * 10
+
+    result = simulatePartialFillAgainstOrderBookLevels(orderQuantity, priceLevels)
+
+    assert result.filledQuantity == pytest.approx(1.0)
+    assert result.isFullyFilled is True
+    assert result.unfilledQuantity == pytest.approx(0.0, abs=1e-9)

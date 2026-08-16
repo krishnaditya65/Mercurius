@@ -63,10 +63,29 @@ func NewOmsGatewayClient(omsGatewayBaseUrl string) *OmsGatewayClient {
 // FetchPositions retrieves an account's real, current positions from
 // oms-gateway's positionBook — GET /positions?accountId=... This is a
 // pure read: nothing on this client can submit an order.
-func (client *OmsGatewayClient) FetchPositions(accountIdentifier string) (*PositionsWireResponse, error) {
+//
+// oms-gateway's /positions route requires authmiddleware.RequireAuth, so
+// callerAuthorizationHeaderValue must be the exact `Authorization` header
+// value (e.g. "Bearer <token>") from the incoming request this call is
+// acting on behalf of — this client forwards it verbatim rather than
+// minting its own service-level token, so oms-gateway sees the real
+// end-user identity making the request (same "acting as the
+// authenticated user" semantics as the request that reached backoffice
+// in the first place). Pass "" only for callers that genuinely have no
+// end-user request to act on behalf of (e.g. tests); oms-gateway will
+// then correctly reject the call with 401.
+func (client *OmsGatewayClient) FetchPositions(accountIdentifier string, callerAuthorizationHeaderValue string) (*PositionsWireResponse, error) {
 	requestUrl := fmt.Sprintf("%s/positions?accountId=%s", client.omsGatewayBaseUrl, url.QueryEscape(accountIdentifier))
 
-	httpResponse, requestError := client.httpClient.Get(requestUrl)
+	httpRequest, buildRequestError := http.NewRequest(http.MethodGet, requestUrl, nil)
+	if buildRequestError != nil {
+		return nil, fmt.Errorf("could not build request to oms-gateway at %s: %w", client.omsGatewayBaseUrl, buildRequestError)
+	}
+	if callerAuthorizationHeaderValue != "" {
+		httpRequest.Header.Set("Authorization", callerAuthorizationHeaderValue)
+	}
+
+	httpResponse, requestError := client.httpClient.Do(httpRequest)
 	if requestError != nil {
 		return nil, fmt.Errorf("could not reach oms-gateway at %s: %w", client.omsGatewayBaseUrl, requestError)
 	}

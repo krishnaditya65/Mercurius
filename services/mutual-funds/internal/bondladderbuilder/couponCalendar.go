@@ -1,6 +1,7 @@
 package bondladderbuilder
 
 import (
+	"fmt"
 	"math"
 	"sort"
 	"time"
@@ -34,6 +35,20 @@ type CouponReminder struct {
 //
 // Sorted by CouponDate ascending, then BondId, for a deterministic
 // response.
+//
+// PaymentsPerYear support is intentionally narrow: this function's coupon
+// schedule steps forward by a whole number of calendar months
+// (12/PaymentsPerYear) at a time, so it only supports frequencies that
+// evenly divide 12 (1, 2, 3, 4, 6, 12 — annual through monthly). Plain
+// integer division silently truncates for any value that doesn't evenly
+// divide 12 (e.g. 5, 7, 8, 9, 11), producing systematically wrong coupon
+// dates without any error. internal/fixedincome's static seed catalog
+// only ever uses 0 (T-Bill, handled above) or 2 (semi-annual) today, but
+// to stop a future catalog addition with a non-divisor frequency from
+// silently corrupting coupon dates, unsupportedPaymentsPerYear below
+// panics loudly instead. If a genuinely non-divisor frequency is ever
+// needed, this function must be rewritten to compute period boundaries
+// from an explicit per-frequency month list rather than 12/PaymentsPerYear.
 func (builder *Builder) UpcomingCoupons(catalog *fixedincome.BondCatalog, accountIdentifier string, asOf time.Time) []CouponReminder {
 	holdings := builder.HoldingsForAccount(accountIdentifier)
 
@@ -47,7 +62,7 @@ func (builder *Builder) UpcomingCoupons(catalog *fixedincome.BondCatalog, accoun
 			continue
 		}
 
-		monthsPerPeriod := 12 / bond.PaymentsPerYear
+		monthsPerPeriod := monthsPerCouponPeriodOrPanic(bond)
 		couponAmount := int64(math.Round(float64(heldFaceValueInMinorUnits) * (bond.CouponRatePercent / 100) / float64(bond.PaymentsPerYear)))
 
 		couponDate := bond.IssueDate
@@ -74,4 +89,24 @@ func (builder *Builder) UpcomingCoupons(catalog *fixedincome.BondCatalog, accoun
 		return reminders[i].BondId < reminders[j].BondId
 	})
 	return reminders
+}
+
+// monthsPerCouponPeriodOrPanic returns 12/bond.PaymentsPerYear months, the
+// calendar-month step UpcomingCoupons advances by each period. It panics
+// for any PaymentsPerYear that does not evenly divide 12 — see
+// UpcomingCoupons' doc comment for why: plain integer division would
+// otherwise silently truncate (e.g. 12/5 == 2, not 2.4), producing
+// systematically wrong coupon dates with no error at all. Callers must
+// only reach this with bond.PaymentsPerYear > 0 (T-Bills are filtered out
+// before this is called).
+func monthsPerCouponPeriodOrPanic(bond fixedincome.Bond) int {
+	if 12%bond.PaymentsPerYear != 0 {
+		panic(fmt.Sprintf(
+			"bondladderbuilder: bond %s has PaymentsPerYear=%d, which does not evenly divide 12 — "+
+				"UpcomingCoupons' 12/PaymentsPerYear month-stepping schedule only supports frequencies "+
+				"that evenly divide 12 (1, 2, 3, 4, 6, 12); see this function's doc comment",
+			bond.BondId, bond.PaymentsPerYear,
+		))
+	}
+	return 12 / bond.PaymentsPerYear
 }

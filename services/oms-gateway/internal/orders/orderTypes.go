@@ -310,6 +310,20 @@ type OrderAcknowledgementResponse struct {
 	// for every non-fractional order (the overwhelming majority) —
 	// fully backward compatible.
 	FractionalTradeExecutionEvents []FractionalTradeExecutionSummary `json:"fractionalTradeExecutionEvents,omitempty"`
+
+	// SettlementFailures records every real fill (a genuine
+	// matching-engine trade — NOT a rejection) whose ledger settlement
+	// posting failed. When this is non-empty, the corresponding trade is
+	// still recorded in TradeExecutionEvents (a trade genuinely happened
+	// in the market — hiding that would be worse), but that trade was
+	// deliberately NOT applied to the position book or mark-to-market
+	// engine, to avoid the position book silently drifting out of sync
+	// with an unsettled ledger — see
+	// cmd/server/main.go's settleTradeAgainstLedgerAndLocalCache and
+	// audittrail.EventSettlementFailedPositionNotApplied. Nil/omitted
+	// for the overwhelming majority of orders (ledger posting almost
+	// always succeeds).
+	SettlementFailures []string `json:"settlementFailures,omitempty"`
 }
 
 // OvertradingNudge mirrors overtradingdetection.Nudge but is its own

@@ -60,6 +60,15 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
+# Tolerance for "is this order fully filled?" comparisons.
+# totalFilledQuantity is accumulated via repeated float `+=` across
+# price levels (see simulatePartialFillAgainstOrderBookLevels below), so
+# a genuinely fully-filled order can land at something like
+# orderQuantity - 1e-14 instead of exactly orderQuantity due to ordinary
+# float accumulation error — an exact `==` comparison there would
+# mis-flag it as a partial fill.
+_FULLY_FILLED_QUANTITY_EPSILON = 1e-9
+
 
 def calculateSquareRootMarketImpactCostFraction(
     orderQuantity: float,
@@ -163,7 +172,7 @@ def simulatePartialFillAgainstOrderBookLevels(
         filledQuantity=totalFilledQuantity,
         unfilledQuantity=orderQuantity - totalFilledQuantity,
         volumeWeightedAverageFillPrice=volumeWeightedAverageFillPrice,
-        isFullyFilled=(totalFilledQuantity == orderQuantity),
+        isFullyFilled=(abs(totalFilledQuantity - orderQuantity) < _FULLY_FILLED_QUANTITY_EPSILON),
         fillsByLevel=fillsByLevel,
     )
 

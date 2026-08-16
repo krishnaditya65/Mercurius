@@ -4134,3 +4134,507 @@ is scoped to a single machine and does not prove cross-region failover
 either — `docs/SETUP.md` §9(b) says this explicitly rather than implying
 otherwise.
 
+## Entry 87 — full-codebase correctness audit + fix cycle, 10 services/apps
+
+Not a new feature round — a deliberate stop to hunt for bugs in
+everything built across entries 1-86. Two waves: 7 parallel finder
+agents, each scoped to a non-overlapping slice of the repo and told to
+read adversarially (races, overflow, silent-failure, off-by-one, wire-
+shape mismatches — not "does the happy path work"), surfaced findings
+across 10 services/apps; 8 parallel fix agents, one per service group,
+each independently wrote a FAILING test reproducing the exact bug
+first, fixed the minimal real cause, confirmed the same test now
+passes, then ran that service's full test suite for regressions before
+reporting done. This entry itself is a separate, third pass: every
+fix agent's self-report was independently checked against the actual
+`git diff` (not trusted at face value) before being written down here
+— several counts below were corrected as a result; see each service's
+paragraph for exactly what didn't match the self-report and why.
+
+### `services/ledger` — 5 distinct fixes (self-reported as 6)
+
+`internal/fundsegregation/clientFundSegregation.go`: `PostClientMoneyMovement`
+internally doubles the transfer amount for its external-cash-suspense
+leg; a value near `math.MaxInt64` overflowed `int64` on that multiply
+and silently wrapped negative. Fixed with a new `maxMovementAmountInMinorUnits
+= math.MaxInt64 / 2` bound and `ErrMovementAmountTooLarge`, tested
+directly against `math.MaxInt64`.
+
+`internal/withdrawalworkflow/withdrawalWorkflow.go`: `RequestWithdrawal`
+previously called `AvailableBalanceInMinorUnits` (which took and
+released `mutexGuardingRequests` internally) and only THEN separately
+locked to insert the hold — two critical sections, letting two
+concurrent withdrawal requests both read the same available balance
+and both succeed. Fixed by widening the lock to span the whole
+lookup-check-insert sequence via a new lock-already-held helper,
+`heldAmountInMinorUnitsLocked`. `TestConcurrentWithdrawalRequestsCannotOverdrawTheAccount`
+runs 200 trials of two real goroutines racing 60,000-unit withdrawals
+against a 100,000 balance, asserting at most one wins — passes under
+`go test -race`.
+
+`internal/multicurrencywallet/multiCurrencyWallet.go`: two fixes in one
+file, sharing one new field, `mutexGuardingBalanceMutations sync.Mutex`
+(distinct from the pre-existing `mutexGuardingOpenedWallets`), now
+locked around the check-then-post sequence in both
+`WithdrawFromCurrencyWallet` and `ConvertBetweenCurrencyWallets` —
+closing the same TOCTOU pattern as the withdrawal-workflow race above,
+in this file's two money-moving entry points. Race-tested with 100
+trials × two goroutines each for both methods, race-clean. Separately,
+`FxRateTable` moved from `map[string]float64` rates to
+`map[string]int64` (`fxRateScale = 100_000_000`) with a new
+`convertMinorUnitsRoundHalfUp` doing exact `math/big` round-half-up
+arithmetic, replacing `int64(math.Round(float64(amount)*rate))` —
+`TestConvertBetweenCurrencyWalletsUsesExactRoundHalfUpNotFloat64Drift`
+uses 50 units @ 0.29 (exactly 14.5) to distinguish float64 drift (14)
+from the correct round-half-up result (15).
+
+`internal/paymentmandate/paymentMandate.go`: `SweepDueMandates`
+previously advanced `NextDebitDate` unconditionally regardless of
+whether the debit actually succeeded — a mandate whose account could
+never be debited would silently "complete" its schedule forever
+without ever moving money. Fixed with a new `MandateStatusSuspended`,
+a `ConsecutiveFailureCount`/`LastFailureReason` pair, and a 3-strikes
+suspension that excludes the mandate from future sweeps and only
+advances the due date on real success.
+
+**Count correction:** the self-report claimed "6 fixes: withdrawal/
+wallet/conversion races, custody-pool overflow, float64→fixed-point
+money math, SIP mandate silent-failure." Read literally that's 6 line
+items, but the wallet race and the conversion race are the SAME mutex
+in the SAME file closing the SAME TOCTOU pattern against two sibling
+methods — one fix, two call sites, not two fixes. The actual work is
+5 distinct root-cause fixes across 4 files, all real and well-tested;
+the "6" count is a mild overstatement of the fix count, not of the
+underlying work.
+
+### `services/oms-gateway` — 9/9 confirmed exactly as reported
+
+`internal/fractionalshares/fractionalShares.go`: `ValidateMilliShareQuantity`
+gained `MaxReasonableMilliShareQuantity = 1_000_000_000_000` and
+`ErrMilliShareQuantityExceedsMaximum`, checked before the uint64→int64
+conversion in `NotionalInMinorUnits` that would otherwise silently wrap
+negative; tested at the exact boundary and at `math.MaxInt64`.
+
+`internal/riskengine/preTradeRiskEngine.go`: `EvaluateOrderAgainstAvailableMargin`
+changed `RLock`→`Lock` and now atomically debits `availableMargin`
+within the same locked operation it approves in (previously read-only,
+a genuine TOCTOU letting two concurrent orders both pass the same
+margin check). New `ReleaseReservedMargin` for the rejection path.
+`TestConcurrentEvaluateOrderAgainstAvailableMargin_NeverOverApproves`
+fires 200 concurrent goroutines against a 100k balance and asserts
+exact non-overapproval, race-clean; reproduced end-to-end in the new
+`main_test.go` too.
+
+`internal/algolimits/strategyLimiter.go` + `exposurelimits` (a real,
+pre-existing package — not a misnomer, confirmed unmodified in this
+diff): `strategyLimiter.go` gained `Release()`, reversing both the
+rate-limit token and the daily-notional consumption a rejected order
+had provisionally reserved; `cmd/server/main.go`'s
+`processOrderSubmission` now `defer`s a call to `Release` /
+`exposureLimitsRegistry.ReleaseExposure` / `pledgeBook.ReleaseSellReservation`
+whenever a reservation was taken but the order is later rejected
+downstream — the actual bug was the missing release wiring in
+`main.go`, not the reservation logic itself, which already existed.
+
+Ledger-settlement rollback: `settleTradeAgainstLedgerAndLocalCache` now
+returns an `error`; on settlement failure, `processOrderSubmission` no
+longer calls `positionBook.ApplyFill` or updates mark-to-market — a
+failed ledger settlement used to still silently mutate the position
+book as if the trade had cleared. New
+`orders.OrderAcknowledgementResponse.SettlementFailures` and audit
+event `EventSettlementFailedPositionNotApplied` surface it instead of
+hiding it.
+
+`internal/marginpledge/marginPledgeBook.go`: pledged-holding sell
+reservation race — the old check read `PledgedQuantity()` and
+`PositionsForAccount()` as two INDEPENDENT reads, letting concurrent
+sell attempts against the same unpledged remainder both pass. New
+`reservedForPendingSellByAccountAndSymbol` map plus an atomic
+`ReserveUnpledgedQuantityForSell` closes it; 3 concurrent goroutines
+each trying to sell 60 of a 100-share holding correctly leave exactly
+1 winner, both at the package level and end-to-end.
+
+`cmd/server/main.go`: `buildMarketSessionCloseHandler`/
+`buildMarketSessionOpenHandler` now reject non-POST methods with 405
+(previously any HTTP method silently opened/closed the market). The
+AMO-drain response gained `totalDrainedAfterMarketOrders`/
+`acceptedAfterMarketOrders`/`rejectedAfterMarketOrders` counts plus a
+per-rejection log line — the drain previously executed correctly but
+gave an operator no visibility into how many queued orders silently
+failed re-submission at market open.
+
+`internal/autoliquidation/liquidationEngine.go`: `SubmitReducingOrderFunc`'s
+signature changed to return the REAL executed notional from
+`TradeExecutionEvents`, not the caller's ASSUMED `quantityToSell * price`
+— `EvaluateAndLiquidateIfBreached` now decrements the shortfall by
+what actually filled, closing a gap where a partially-filled or
+differently-priced liquidation order could understate remaining risk.
+
+`internal/algolimits/strategyLimiter.go`: sub-1 orders/sec rate limits
+(e.g. 0.5/sec) previously capped token refill at `maxOrdersPerSecond`
+itself, so a bucket could never accumulate even one full token and
+would permanently block. New `bucketCapacity = max(1.0, rate)` fixes
+the floor; tested with 0.5/sec (succeeds after 2s) and 0.1/sec
+(capacity stays exactly 1, not unbounded).
+
+The new `services/oms-gateway/cmd/server/main_test.go` (untracked, 444
+lines) is a genuine integration harness, not a description mismatch:
+real `httptest.Server`s faking KYC and backoffice, a configurable fake
+ledger server (toggleable success/failure), and a real TCP listener
+speaking oms-gateway's actual matching-engine wire protocol (matching-
+engine isn't HTTP, so this is a hand-rolled fake, not an `httptest`
+one) — 10 tests directly exercising `processOrderSubmission` and the
+market-session handlers end-to-end against these fakes, several
+labeled by the finding number they reproduce.
+
+`go build ./...`, `go vet ./...`, and `go test -race ./...` all clean
+across every package touched by these 9 fixes.
+
+### `services/backoffice` + `services/api-gateway` — 5/5 confirmed exactly as reported
+
+Two of the five are genuine regressions from this repo's OWN entry-84
+auth/RBAC pass, not pre-existing bugs: `services/api-gateway/cmd/server/main.go`'s
+account-aggregator handler and `services/backoffice/cmd/server/main.go`'s
+family-access and referral-qualification handlers all called
+oms-gateway with a bare, unauthenticated `httpClient.Get(...)` after
+entry 84 put `authmiddleware.RequireAuth` in front of oms-gateway's
+`/positions` — meaning family-access, referral-qualification, and the
+account-aggregator had all been silently broken (401s from oms-gateway)
+since entry 84 shipped, not since whenever these features were
+originally built. Fixed by forwarding the caller's own `Authorization`
+header verbatim on the outbound request in both services (api-gateway's
+new `fetchOmsGatewayPositions`/`fetchMutualFundsHoldings`; backoffice's
+`omsgatewayclient.FetchPositions` gained a `callerAuthorizationHeaderValue`
+parameter, threaded through from both call sites in `main.go`).
+
+Proxy-auth bypass gap: api-gateway's catch-all reverse-proxy route
+(`httpRequestMultiplexer.Handle("/", backendProxy)`) had NO
+authentication at all while every other route on the service required
+`RequireAuth`/`RequireRole` — fixed with a new `buildProxyAccessGate`
+that accepts a rate-limiter-validated `X-Api-Key` OR a valid bearer
+token, closing the one route that had silently stayed open through
+entry 84's pass.
+
+Wire-shape mismatch, found while fixing the account-aggregator's auth
+bug: `omsPositionsWireResponse` was typed as
+`[]struct{InstrumentSymbol string; MarketValueInMinorUnits int64}` — a
+shape oms-gateway's real `/positions` response has never actually
+been. Decoding a map-shaped real payload (`{AccountIdentifier,
+NetQuantityByInstrumentSymbol}`) into that wrong slice-of-struct type
+silently zero-valued instead of erroring, so the account-aggregator's
+oms-gateway-sourced numbers were wrong even before the auth bug
+existed. This is the "bonus pre-existing oms-gateway/positions
+wire-shape bug" — genuinely pre-existing, genuinely caught as a side
+effect of the auth fix, not invented for the count. The mutual-funds
+`/holdings` wire shape had the identical class of bug and was fixed
+the same way in the same pass.
+
+Shared rate-limit bucket: `buildRateLimitingMiddleware` keyed every
+anonymous (no `X-Api-Key`) request under one constant `"anonymous"`
+bucket — any single anonymous client could exhaust the bucket for
+every other anonymous client. Fixed to key by caller IP
+(`remoteAddressKey`, stripping the port, mirroring `services/auth`'s
+existing helper — same documented caveat about needing real
+`X-Forwarded-For` handling behind a real proxy, not fixed here).
+
+### `services/kyc-onboarding` + `services/reporting` + `services/mutual-funds` — 4/4 confirmed exactly as reported
+
+kyc-onboarding's `requireOwnAccountFromJsonBody` (`cmd/server/main.go`):
+on a body that failed `json.Unmarshal` (e.g. a valid JSON object
+followed by trailing garbage), the wrapper fell through and called the
+wrapped handler anyway, assuming the handler's OWN decode would also
+fail. False assumption — most handlers use
+`json.NewDecoder(...).Decode(...)`, which reads only the first JSON
+value and silently ignores trailing bytes, so a body like
+`{"accountIdentifier":"someone-elses-account",...}<garbage>` skipped
+the ownership check entirely (fail-open) while still decoding
+successfully downstream — a real, exploitable authorization bypass,
+not a theoretical one. This is genuinely why the task's framing
+("turned out sharper than initially scoped") is accurate: it started
+as a look at a generic fail-open pattern and turned into a concrete
+bypass. Fixed by returning 400 instead of falling through to `next`.
+
+reporting's `internal/omsgatewayclient/omsGatewayClient.go`: a real
+data race — `chargesCalculatorReachable`/`chargesCalculatorProbed`
+were plain, unsynchronized `bool` fields written from `EstimateCharges`,
+which is called concurrently across concurrent `/contract-notes/generate`
+requests. Fixed with a new `mutexGuardingChargesCalculatorState
+sync.Mutex`, routing every write through `recordChargesCalculatorProbeResult`
+and every read through the new `ChargesCalculatorProbeState()`.
+
+mutual-funds' `internal/bondladderbuilder/couponCalendar.go`:
+`monthsPerPeriod := 12 / bond.PaymentsPerYear` silently truncated for
+any payment frequency that doesn't evenly divide 12 (5, 7, 8, 9, 11
+payments/year), producing wrong coupon dates with no error. The fix
+(`monthsPerCouponPeriodOrPanic`) does NOT make those frequencies
+compute correctly — the month-stepping design can't support a
+non-divisor frequency without a larger rewrite — it panics loudly
+instead of silently corrupting a schedule. Worth being precise about:
+this converts silent wrong output into a loud, honest failure; it does
+not close the underlying gap for those frequencies.
+
+mutual-funds' `internal/primarymarketbidding/primaryAuctionEngine.go`:
+`CloseAuction`'s pro-rata allotment computed
+`int64(float64(bid.Qty) / float64(groupTotal) * float64(remaining))`
+— loses exactness once values exceed float64's 52-bit mantissa (large
+G-Sec auctions in the trillions of paise). New
+`proRataAllotmentInMinorUnits` uses `math/big.Int` (multiply-then-divide,
+not divide-then-multiply) for an exact result without float64 drift or
+int64 overflow from a naive `bidQty*remaining` product.
+
+### `services/market-data` (Rust) — 4/4 confirmed exactly as reported, tests 147/147 confirmed by direct run
+
+`httpQueryServer.rs`: unbounded-allocation DoS — `readRequestLineAndBody`
+allocated `vec![0u8; contentLength]` directly off a client-supplied
+`Content-Length` header with no cap. Fixed with `MAX_REQUEST_BODY_SIZE_BYTES
+= 1024 * 1024`, rejecting an oversized `Content-Length` with a 413
+BEFORE allocating or blocking on the body.
+
+`udpMulticastPublisher.rs`: wire-format desync — `writeLengthPrefixedString`
+wrote a `u8` length prefix (max 255) while still writing the FULL
+string bytes for anything longer, so the decoded length silently
+diverged from the actual bytes written and desynced every field after
+it in the datagram. Fixed by widening the prefix to little-endian
+`u16` on both the encode and decode side; a new test round-trips a
+300-byte symbol.
+
+`livePnlWidget.rs`: P&L overflow — `computeLivePnlSnapshot` now returns
+`Result<LivePnlSnapshot, LivePnlOverflowError>`, replacing plain `i64`
+arithmetic with `checked_sub`/`checked_mul`/`checked_add` throughout;
+an overflow returns a clean error (mapped to HTTP 500 by the one
+caller) instead of panicking or silently wrapping.
+
+`volumeProfileAggregator.rs`: Value Area calculation bug — actually two
+compounding bugs in `computeValueAreaRange`, not one: (1) `bucketStep`
+was inferred from the minimum gap between OCCUPIED bucket keys, which
+understates the real step whenever an intervening bucket has zero
+volume and is therefore absent from the map — now threaded through
+explicitly from the caller's real `priceBucketSizeInMinorUnits`; (2)
+the expansion loop only checked the single immediate neighbor bucket
+on each side and gave up on that side entirely if the neighbor was
+empty, even when a farther occupied bucket existed — new
+`nextOccupiedBucketOutward` walks past empty buckets to find it. A new
+test reproduces the exact scenario (ticks at 100/130/140, empty at
+110/120) and asserts the value area correctly reaches down to 100
+instead of stopping short at the POC.
+
+`cargo test` run directly in this environment: **147 passed, 0
+failed** — matches the self-report exactly.
+
+### `services/quant-engine` (Python) — 11 fixes, two counts corrected
+
+`httpServer.py`: the `bool("false")` gotcha is real and fixed at both
+sites that had it (`_handlePriceAndGreeksRequest`,
+`_handleImpliedVolatilityRequest`) — `bool(requestBody["isCallOptionNotPut"])`
+turned the JSON string `"false"` into Python `True` silently; both now
+require an actual JSON boolean via `isinstance` and raise otherwise.
+The null-field crash guard (`_requireDictField`, new) is called 6
+times, but across only **5 distinct endpoint handlers**
+(`_handleFactorRiskRequest` calls it twice, for two separate dict
+fields) — the self-report's "6 endpoints" should read "6 call sites
+across 5 endpoints."
+
+`portfolioHealthCheckDiversificationAnalyzer.py`: an all-zero-weight
+portfolio drove `calculateHerfindahlHirschmanIndex` to exactly 0,
+which then crashed a downstream precondition in
+`calculateEffectiveNumberOfHoldings`. New explicit `if positionHhi ==
+0: raise ValueError(...)` guard turns that into a clean 422 instead of
+an opaque 500.
+
+`arbitrageScanner.py`: `scanManyLivePricesForDeviationAlerts` previously
+let one symbol's bad (non-positive) theoretical price raise and abort
+the ENTIRE batch scan; now wraps each symbol in `try/except ValueError:
+continue`, so one bad input no longer takes down every other symbol's
+result.
+
+`syntheticPositionBuilder.py`: `validateProposedCombinationAgainstSyntheticStructure`
+previously validated each leg's ratio independently, so two DUPLICATE
+legs of the same type could each individually pass a per-leg check
+while the combined exposure was actually double the structure's
+definition. Rewritten to aggregate quantity BY leg type before
+comparing against the expected ratio.
+
+`regimeDetectionHmm.py`: the HMM's forward algorithm materialized raw
+probabilities and divided to normalize, which underflowed to a hard
+`ZeroDivisionError`/`math domain error` for a converged, very-tight-
+variance state paired with a distant outlier observation. Rewritten to
+a genuine log-space accumulation (new `_logSumExp` helper,
+log-space transition/emission throughout) — the underflow is
+structurally impossible in log-space, not just less likely.
+
+Shared tolerance module: new `backtesting/positionTolerance.py`
+(`POSITION_FLAT_EPSILON = 1e-9`, `isPositionFlat(quantity)`). The
+self-report's "3 float-equality sites via a new shared tolerance
+module" undercounts the module's own usage and overstates its reach at
+the same time: `backtestRunner.py` imports it at 3 sites
+(`calculateUnrealizedProfitAndLoss`'s flat check,
+`applySignedQuantityChangeToPortfolio`'s same-direction check, and its
+`newPositionQuantity == 0` check) and `pairsTradingStrategy.py` imports
+it at 1 more (`isFlat`/`isLong`/`isShort` in the entry rule) — 4 sites
+across 2 files genuinely route through the shared module. The THIRD
+float-equality fix, in `realisticBacktestCostModel.py`
+(`isFullyFilled=(totalFilledQuantity == orderQuantity)` →
+`abs(totalFilledQuantity - orderQuantity) < _FULLY_FILLED_QUANTITY_EPSILON`),
+is real and fixes the same class of bug, but does NOT import
+`positionTolerance` — it defines its own local, duplicate
+`_FULLY_FILLED_QUANTITY_EPSILON = 1e-9` constant instead. So: 3
+float-equality bugs really were fixed, but only 2 of the 3 files
+actually route through the new shared module; the third quietly
+duplicates it. Worth fixing in a follow-up, not fixed here.
+
+Test count: `pytest -q` run directly in this environment currently
+passes **588**. The pre-fix baseline (574) could not be directly
+re-run without a disallowed mutating checkout, but the 8 touched test
+files gained exactly 14 new `def test_*` functions between HEAD and
+the working tree, and 588 − 14 = 574 — consistent with, though not a
+direct re-run confirmation of, the claimed 574→588.
+
+### `apps/terminal` — 4/4 confirmed exactly as reported, tests confirmed by direct run (73 total, +9 new)
+
+`src-tauri/src/lib.rs`: `.run(tauri::generate_context!()).expect(...)`
+was a bare panic on any Tauri startup failure (missing WebView2 on
+Windows, missing webkit2gtk on Linux, etc.). Now matches on the
+`Result`, prints an actionable message naming the likely missing
+runtime dependency, and calls `std::process::exit(1)` instead of
+panicking.
+
+Raw-minor-units display: new `src/shared/minorUnitsPriceFormatting.ts`
+(`formatMinorUnitsAsDisplayPrice`, `/100` + 2 decimals) applied in
+`src/domLadder/DomLadderWidget.tsx`, which had been rendering raw
+minor-units integers directly in both the price-ladder cells and the
+order-acknowledgement toast.
+
+Fibonacci-overlay crash: `calculateFibonacciRetracementLevels` throws
+when `swingHigh <= swingLow` (a flat or inverted price range in the
+visible candle window). `CandlestickChartCanvas.tsx` gained an
+exported guard, `shouldRenderFibonacciOverlay`, checked before ever
+calling the calculator, with a small on-canvas note ("Fib unavailable
+for flat price range") when skipped instead of a crash.
+
+2 poll races: `ChartTileContainer.tsx`'s `refreshChartData` and
+`DomLadderWidget.tsx`'s `refreshLadder` both gained a
+`latestRequestSequenceNumberRef`, incremented per request; a response
+handler now checks it was still the most recent request before
+applying state, on top of the pre-existing unmount guard — a slower,
+older in-flight response can no longer overwrite a newer one. This is
+a sequence-counter mechanism, not `AbortController`.
+
+Confirmed true, not assumed: `apps/terminal` genuinely has no
+component-rendering test infrastructure — `vitest`/`jsdom` are present
+but `@testing-library/react` (or any equivalent) is not, and all 9
+`*.test.ts` files are pure-logic unit tests, none rendering a
+component tree. `npm run test` run directly: **9 test files, 73 tests,
+all passed** — matches the self-report exactly (5 new tests for the
+Fibonacci guard + 4 for the price formatter = the claimed +9).
+
+### `apps/web` — 6/6 confirmed exactly as reported
+
+New `app/hooks/useSequencedFetch.ts` (untracked): a pure incrementing-
+sequence-counter hook, `() => () => boolean` — call once per component
+to get `startNextRequest`, call that at the start of each async
+request to get back `isStillMostRecentRequest`, checked after each
+`await` before applying state. Not an `AbortController` wrapper and
+not a generic fetch client — deliberately just the sequence-bookkeeping
+factored out of what would otherwise be 3 duplicated poll loops.
+Genuinely used at exactly 3 sites: `homeScreenLivePnlWidget.tsx`'s
+`refreshPnl`, `page.tsx`'s `PriceChartSection.refreshChartData`, and
+`watchlist/page.tsx`'s `refreshFullWatchlist` — each was previously
+vulnerable to a slower, stale response (a stale account's P&L, a stale
+instrument's chart, a stale account's watchlist) overwriting a newer
+one.
+
+Idempotency-key auto-regeneration: `page.tsx`'s order-submission
+success path now calls `setIdempotencyKey(generateIdempotencyKey())`
+immediately after a successful submission, instead of relying on the
+user to manually click "generate a new key" — previously a second,
+genuinely distinct order submitted before that manual click would
+reuse the already-consumed key and get back oms-gateway's cached
+response for the FIRST order instead of actually submitting.
+
+React index-key bug: `app/notificationCenter/notificationCenterSection.tsx`
+rendered a prepended, truncated-to-20 `string[]` log via `key={logIndex}`
+— since every entry's index shifts on each new arrival, this is a
+textbook stale-key bug (React reusing/misapplying DOM nodes across
+reorders). Fixed with a real `logEntryId: number` (monotonic counter)
+per entry, keyed on that instead.
+
+Screener list-operator UI gap: `app/screener/page.tsx` already had
+`"in"`/`"not_in"` in its list of available filter operators, but the
+value input was a single scalar text field with numeric coercion —
+there was no way to actually enter a list. Fixed with a
+comma/newline-separated text input (switched in based on the selected
+operator) and a `parseListMembershipValues` splitter, widening
+`FilterCondition.value` to `number | string | string[]`.
+
+`npm run test` run directly: 9 test files, 73 tests, all passed
+(`apps/terminal`'s count — `apps/web` still has no test runner
+configured, see below).
+
+### Known limitations / explicitly out-of-scope follow-ups from this pass
+
+- **reporting's `ChargesCalculatorProbeState()` is dead code** — the
+  new mutex correctly fixes the data race on
+  `chargesCalculatorReachable`/`chargesCalculatorProbed`, and the
+  reader is exported, but nothing anywhere in `services/reporting`
+  actually CALLS `ChargesCalculatorProbeState()` (confirmed by grep) to
+  short-circuit a retry or skip a doomed call when oms-gateway's
+  charges calculator is known-unreachable. The race is closed; the
+  probe result still isn't used for anything. Separate, pre-existing
+  gap, not fixed in this pass.
+- **`realisticBacktestCostModel.py`'s float-equality fix bypasses the
+  new shared `positionTolerance` module** it should logically use —
+  see the quant-engine section above. A real follow-up should route
+  `_FULLY_FILLED_QUANTITY_EPSILON` through `positionTolerance.py`
+  instead of duplicating the constant.
+- **`apps/terminal`'s poll-race fixes have no rendering-test proof** —
+  this app has no component-rendering test harness
+  (`@testing-library/react` or equivalent) at all, so the two
+  sequence-counter fixes were verified by logic trace plus a clean
+  `tsc`/`vite build`, not by a test that actually mounts the component
+  and races two responses against each other. Same honest gap this
+  app's DOCUMENTATION.md section already flagged for its OTHER
+  untested surfaces (multi-monitor window placement); now also true
+  here.
+- **mutual-funds' `couponCalendar.go` still cannot compute correct
+  coupon dates for non-divisor payment frequencies** (5, 7, 8, 9, 11
+  payments/year) — this pass converted silent wrong output into a
+  loud panic, which is strictly better (nothing downstream can now
+  trust a wrong schedule without noticing), but the underlying
+  month-stepping design still needs a real rewrite to support those
+  frequencies correctly, not just fail loudly on them.
+- **api-gateway's per-IP rate-limit fix doesn't handle a real reverse
+  proxy** — `remoteAddressKey` reads `RemoteAddr` directly; behind a
+  real load balancer/CDN, every request would key off the proxy's own
+  address unless `X-Forwarded-For` handling is added, which this pass
+  didn't do (mirrors the exact caveat `services/auth`'s pre-existing
+  equivalent helper already carried).
+- **oms-gateway's idempotency and concurrent-duplicate-collapsing
+  limitations from entry 85 are unchanged** — this pass fixed
+  RESERVATION races (risk-engine margin, pledge-book sell quantity,
+  algo-limits token bucket), not the idempotency store's own
+  documented single-process-only scope.
+
+### Verification summary
+
+Every fix in this entry was checked against the actual `git diff`
+(not the fix agent's self-report) before being written down: 6
+independent read-only investigations covering ledger,
+oms-gateway, backoffice/api-gateway/kyc-onboarding/reporting/
+mutual-funds, market-data, quant-engine, and apps/terminal/apps/web.
+Direct test runs were re-executed where the sandbox allowed it and
+matched the self-reports exactly for market-data (147/147),
+apps/terminal (73 total, 9 files), and quant-engine's current total
+(588, with the 574 baseline corroborated arithmetically rather than
+re-run). oms-gateway's `go build`/`go vet`/`go test -race` were
+re-run clean across every touched package. Two count discrepancies
+were found and are recorded above, not smoothed over: ledger's
+claimed "6 fixes" is 5 distinct root causes (wallet-race and
+conversion-race share one mutex/one fix), and quant-engine's claimed
+"6 endpoints"/"3 float-equality sites via the shared module" are
+more precisely "6 call sites across 5 endpoints" and "4 sites across
+2 files use the module, with a 3rd fix that duplicates its constant
+instead of importing it." No fix agent's core claim (the bug existed,
+the described mechanism caused it, the described change fixes it, a
+real test proves it) was found to be false — every discrepancy found
+was in COUNTING, not in the substance of the fix.
+

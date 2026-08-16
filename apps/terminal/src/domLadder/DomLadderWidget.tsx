@@ -13,12 +13,13 @@
 // Naming convention: long, descriptive camelCase identifiers throughout,
 // per project convention.
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   submitLadderClickToTradeOrder,
   type LadderOrderSide,
   type OrderAcknowledgementResponse,
 } from "./domLadderOrderSubmission";
+import { formatMinorUnitsAsDisplayPrice } from "../shared/minorUnitsPriceFormatting";
 
 type DomReplaySnapshot = {
   epochMillis: number;
@@ -55,22 +56,33 @@ export function DomLadderWidget(props: {
   const [lastOrderStatusMessage, setLastOrderStatusMessage] = useState<string | null>(null);
   const [isSubmittingPriceLevel, setIsSubmittingPriceLevel] = useState<number | null>(null);
 
+  // Per-request sequence number: incremented before each fetch starts, and
+  // captured locally at that same instant. A response is only applied if
+  // its captured sequence number still matches the ref's current value at
+  // resolve-time — i.e. no newer request has been kicked off since. This
+  // guards against out-of-order poll responses (a slow earlier request
+  // resolving after a faster later one) overwriting fresher data with
+  // stale data. Kept in addition to, not instead of, the `cancelled`
+  // unmount guard below.
+  const latestRequestSequenceNumberRef = useRef(0);
+
   useEffect(() => {
     let cancelled = false;
 
     async function refreshLadder() {
+      const thisRequestSequenceNumber = ++latestRequestSequenceNumberRef.current;
       try {
         const httpResponse = await fetch(
           `${matchingEngineDomReplayBaseUrl}/domReplay?instrumentSymbol=${encodeURIComponent(instrumentSymbol)}`
         );
         if (!httpResponse.ok) throw new Error(`HTTP ${httpResponse.status}`);
         const snapshots: DomReplaySnapshot[] = await httpResponse.json();
-        if (cancelled) return;
+        if (cancelled || thisRequestSequenceNumber !== latestRequestSequenceNumberRef.current) return;
         const latestSnapshot = snapshots.length > 0 ? snapshots[snapshots.length - 1] : null;
         setLadderRows(latestSnapshot ? buildLadderRowsFromSnapshot(latestSnapshot) : []);
         setErrorMessage(null);
       } catch (thrownError) {
-        if (cancelled) return;
+        if (cancelled || thisRequestSequenceNumber !== latestRequestSequenceNumberRef.current) return;
         setErrorMessage(
           thrownError instanceof Error
             ? `Couldn't reach matching-engine: ${thrownError.message}. Is it running on ${matchingEngineDomReplayBaseUrl}?`
@@ -104,7 +116,7 @@ export function DomLadderWidget(props: {
       );
       setLastOrderStatusMessage(
         acknowledgement.wasOrderAccepted
-          ? `${side} ${defaultOrderQuantity} @ ${priceInMinorUnits} accepted (seq ${acknowledgement.assignedGlobalSequenceNumber ?? "?"}).`
+          ? `${side} ${defaultOrderQuantity} @ ${formatMinorUnitsAsDisplayPrice(priceInMinorUnits)} accepted (seq ${acknowledgement.assignedGlobalSequenceNumber ?? "?"}).`
           : `Rejected: ${acknowledgement.humanReadableRejectionReason ?? "unknown reason"}`
       );
     } catch (thrownError) {
@@ -144,7 +156,7 @@ export function DomLadderWidget(props: {
                 >
                   {isSubmittingPriceLevel === row.priceInMinorUnits ? "…" : row.bidQuantity ?? ""}
                 </td>
-                <td className="domLadderWidget__priceCell">{row.priceInMinorUnits}</td>
+                <td className="domLadderWidget__priceCell">{formatMinorUnitsAsDisplayPrice(row.priceInMinorUnits)}</td>
                 <td
                   className="domLadderWidget__askCell"
                   onClick={() => row.askQuantity !== null && handleLadderClick(row.priceInMinorUnits, "BUY")}
